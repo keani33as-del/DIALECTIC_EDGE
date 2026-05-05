@@ -1,0 +1,1621 @@
+"""
+Paper auto trader:
+1. Reads the latest 2-3 digest contexts saved from reports.
+2. Builds a consensus verdict plus per-asset trade plans.
+3. Confirms crypto trades with /signals market bias.
+4. Opens and closes simulated trades in the backtest ledger.
+"""
+
+import asyncio
+import json
+import logging
+import os
+from datetime import datetime, timedelta
+
+from config import (
+    AUTOTRADE_CONTEXT_MAX_AGE_HOURS,
+    AUTOTRADE_ENTRY_TOLERANCE_PCT,
+    AUTOTRADE_FOLLOW_SIGNALS_WHEN_NEUTRAL,
+    AUTOTRADE_INTERVAL_SEC,
+    AUTOTRADE_NEUTRAL_MIN_BIAS_SCORE,
+    AUTOTRADE_NEUTRAL_SL_PCT,
+    AUTOTRADE_NEUTRAL_TP_PCT,
+    AUTOTRADE_OPEN_SCORE_THRESHOLD,
+    AUTOTRADE_RECENT_CONTEXT_LIMIT,
+    AUTOTRADE_REVERSAL_SCORE_THRESHOLD,
+    AUTOTRADE_SIGNAL_BIAS_CACHE_SEC,
+    DATA_SOURCE_BINANCE_SIGNALS,
+    FEATURE_AUTOTRADE,
+    LOG_AUTOTRADE_SKIPS,
+)
+from database import (
+    add_backtest_signal,
+    append_trade_decision_log,
+    close_backtest_signal,
+    get_backtest_config,
+    get_backtest_signals,
+    get_backtest_stats,
+    get_recent_daily_contexts,
+    get_recent_trade_decisions,
+    update_backtest_capital,
+)
+from session_manager import session_manager, SESSION_START_CAPITAL
+from core.regime_detector import RegimeDetector, MarketRegime
+from core.dynamic_risk import DynamicRiskManager
+from core.multi_tf import MultiTimeframeAnalyzer
+from core.whale_detector import WhaleDetector
+from core.correlation import CorrelationMatrix
+from core.event_defense import EventDefense
+from core.confluence import ConfluenceEngine
+from core.economic_calendar import EconomicCalendar
+
+logger = logging.getLogger(__name__)
+
+INTERVAL_SECONDS = AUTOTRADE_INTERVAL_SEC
+RECENT_CONTEXT_LIMIT = AUTOTRADE_RECENT_CONTEXT_LIMIT
+CONTEXT_MAX_AGE_HOURS = AUTOTRADE_CONTEXT_MAX_AGE_HOURS
+ENTRY_TOLERANCE_PCT = AUTOTRADE_ENTRY_TOLERANCE_PCT
+OPEN_SCORE_THRESHOLD = AUTOTRADE_OPEN_SCORE_THRESHOLD
+SIGNAL_FOLLOW_SCORE_THRESHOLD = 12.0  # Lower threshold for signal-follow mode (no digest)
+REVERSAL_SCORE_THRESHOLD = AUTOTRADE_REVERSAL_SCORE_THRESHOLD
+CRYPTO_SIGNAL_SYMBOLS = {"BTC", "ETH", "SOL", "BNB"}
+
+_trade_lock = asyncio.Lock()
+
+_regime_detector = RegimeDetector()
+_risk_manager = DynamicRiskManager()
+_tf_analyzer = MultiTimeframeAnalyzer()
+_whale_detector = WhaleDetector()
+_correlation = CorrelationMatrix(threshold=0.85)
+_event_defense = EventDefense()
+_confluence = ConfluenceEngine()
+_econ_calendar = EconomicCalendar()
+
+_signal_cache: dict = {}
+_signal_cache_time: datetime | None = None
+_signal_cache_meta: tuple[str, bool] | None = None
+
+
+def _direction_to_int(direction: str) -> int:
+    direction = (direction or "").upper()
+    if direction in {"BUY", "LONG", "BULLISH"}:
+        return 1
+    if direction in {"SELL", "SHORT", "BEARISH"}:
+        return -1
+    return 0
+
+
+def _int_to_trade_direction(score: int) -> str:
+    if score > 0:
+        return "BUY"
+    if score < 0:
+        return "SELL"
+    return "NEUTRAL"
+
+
+def _consensus_to_signal_verdict(verdict: str) -> dict | None:
+    if verdict == "BUY":
+        return {"verdict": "BULLISH"}
+    if verdict == "SELL":
+        return {"verdict": "BEARISH"}
+    return None
+
+
+def _parse_context_dt(raw: str) -> datetime | None:
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00")).replace(tzinfo=None)
+    except Exception:
+        return None
+
+
+def is_daily_context_fresh(context: dict | None) -> bool:
+    """Whether the latest saved digest context is still recent enough for trading."""
+    if not context:
+        return False
+    created = _parse_context_dt(context.get("created_at", ""))
+    if not created:
+        return False
+    return (datetime.now() - created) < timedelta(hours=CONTEXT_MAX_AGE_HOURS)
+
+
+def _infer_plan_direction(context: dict, symbol: str) -> str:
+    entries = context.get("entries", {}) or {}
+    targets = context.get("targets", {}) or {}
+    stops = context.get("stop_losses", {}) or {}
+
+    entry = float(entries.get(symbol) or 0)
+    target = float(targets.get(symbol) or 0)
+    stop = float(stops.get(symbol) or 0)
+
+    if entry and target and stop:
+        if stop < entry < target:
+            return "BUY"
+        if target < entry < stop:
+            return "SELL"
+
+    verdict = (context.get("verdict") or "").upper()
+    if verdict in {"BUY", "SELL"}:
+        return verdict
+    return "NEUTRAL"
+
+
+def build_digest_consensus(contexts: list[dict]) -> dict:
+    """Aggregate the latest digest contexts into a tradeable consensus."""
+    contexts = contexts[:RECENT_CONTEXT_LIMIT]
+    weights = [3, 2, 1]
+    verdict_score = 0
+    raw_candidates: dict[tuple[str, str], dict] = {}
+    context_rows = []
+
+    for idx, context in enumerate(contexts):
+        weight = weights[idx] if idx < len(weights) else 1
+        verdict = (context.get("verdict") or "NEUTRAL").upper()
+        verdict_score += _direction_to_int(verdict) * weight
+        context_rows.append({
+            "created_at": context.get("created_at", ""),
+            "verdict": verdict,
+            "symbols": sorted(set(context.get("symbols", []) or [])),
+            "summary": context.get("news_summary", ""),
+        })
+
+        symbols = sorted(set(context.get("symbols", []) or []))
+        symbols.extend(list((context.get("entries", {}) or {}).keys()))
+        symbols.extend(list((context.get("targets", {}) or {}).keys()))
+        symbols.extend(list((context.get("stop_losses", {}) or {}).keys()))
+        symbols = sorted(set(symbols))
+
+        for symbol in symbols:
+            direction = _infer_plan_direction(context, symbol)
+            if direction not in {"BUY", "SELL"}:
+                continue
+
+            entry = float((context.get("entries", {}) or {}).get(symbol) or 0)
+            target = float((context.get("targets", {}) or {}).get(symbol) or 0)
+            stop = float((context.get("stop_losses", {}) or {}).get(symbol) or 0)
+            timeframe = (context.get("timeframes", {}) or {}).get(symbol) or "1w"
+
+            key = (symbol, direction)
+            bucket = raw_candidates.setdefault(key, {
+                "symbol": symbol,
+                "direction": direction,
+                "support": 0,
+                "weighted_support": 0,
+                "entry_values": [],
+                "target_values": [],
+                "stop_values": [],
+                "timeframes": [],
+                "context_dates": [],
+                "latest_created_at": context.get("created_at", ""),
+                "latest_news_summary": context.get("news_summary", ""),
+            })
+
+            bucket["support"] += 1
+            bucket["weighted_support"] += weight
+            bucket["context_dates"].append(context.get("created_at", ""))
+            if entry > 0:
+                bucket["entry_values"].append(entry)
+            if target > 0:
+                bucket["target_values"].append(target)
+            if stop > 0:
+                bucket["stop_values"].append(stop)
+            if timeframe:
+                bucket["timeframes"].append(timeframe)
+
+    consensus_verdict = "NEUTRAL"
+    if verdict_score >= 2:
+        consensus_verdict = "BUY"
+    elif verdict_score <= -2:
+        consensus_verdict = "SELL"
+
+    required_support = 2 if len(contexts) >= 2 else 1
+    candidates = []
+
+    for plan in raw_candidates.values():
+        if plan["support"] < required_support:
+            continue
+
+        digest_score = plan["weighted_support"] * 4.0
+        if consensus_verdict in {"BUY", "SELL"}:
+            digest_score += 4.0 if plan["direction"] == consensus_verdict else -6.0
+
+        candidate = {
+            "symbol": plan["symbol"],
+            "direction": plan["direction"],
+            "support": plan["support"],
+            "weighted_support": plan["weighted_support"],
+            "digest_score": round(digest_score, 2),
+            "entry": round(sum(plan["entry_values"]) / len(plan["entry_values"]), 4) if plan["entry_values"] else 0.0,
+            "target": round(sum(plan["target_values"]) / len(plan["target_values"]), 4) if plan["target_values"] else 0.0,
+            "stop": round(sum(plan["stop_values"]) / len(plan["stop_values"]), 4) if plan["stop_values"] else 0.0,
+            "timeframe": plan["timeframes"][0] if plan["timeframes"] else "1w",
+            "context_dates": plan["context_dates"][:],
+            "latest_created_at": plan["latest_created_at"],
+            "news_summary": plan["latest_news_summary"],
+        }
+        candidates.append(candidate)
+
+    candidates.sort(key=lambda item: (item["digest_score"], item["weighted_support"]), reverse=True)
+
+    return {
+        "consensus_verdict": consensus_verdict,
+        "verdict_score": verdict_score,
+        "contexts": context_rows,
+        "candidates": candidates,
+    }
+
+
+def _markets_bundle_audit(bundle: dict) -> dict:
+    v = bundle.get("verdict") or {}
+    sigs = bundle.get("signals") or []
+    return {
+        "github_digest_verdict": v.get("verdict"),
+        "signals": [
+            {
+                "symbol": s.get("symbol"),
+                "direction": s.get("direction"),
+                "confidence": s.get("confidence"),
+            }
+            for s in sigs[:10]
+        ],
+    }
+
+
+def _bias_raw_from_bundle(markets_bundle: dict, crypto_symbols: list[str]) -> dict:
+    full = markets_bundle.get("binance_data") or {}
+    out = {}
+    for sym in crypto_symbols:
+        key = f"{sym}USDT"
+        if key in full:
+            out[key] = full[key]
+    return out
+
+
+async def _fetch_crypto_signal_bias(
+    symbols: list[str],
+    consensus_verdict: str,
+    *,
+    neutral_follow: bool = False,
+    markets_bundle: dict | None = None,
+) -> dict:
+    global _signal_cache, _signal_cache_time, _signal_cache_meta
+
+    crypto_symbols = [symbol for symbol in symbols if symbol in CRYPTO_SIGNAL_SYMBOLS]
+    if not crypto_symbols:
+        return {}
+
+    if not DATA_SOURCE_BINANCE_SIGNALS:
+        return {}
+
+    now = datetime.now()
+    meta_key = (consensus_verdict or "", neutral_follow)
+
+    if markets_bundle is None:
+        if (
+            _signal_cache_time
+            and (now - _signal_cache_time).total_seconds() < AUTOTRADE_SIGNAL_BIAS_CACHE_SEC
+            and _signal_cache_meta == meta_key
+        ):
+            return {symbol: _signal_cache.get(symbol, {}) for symbol in crypto_symbols}
+
+    try:
+        from signals import build_signal_bias_map, fetch_binance_signals, fetch_verdict
+
+        if markets_bundle is not None:
+            raw = _bias_raw_from_bundle(markets_bundle, crypto_symbols)
+            if not raw:
+                raw = await fetch_binance_signals([f"{symbol}USDT" for symbol in crypto_symbols])
+        else:
+            raw = await fetch_binance_signals([f"{symbol}USDT" for symbol in crypto_symbols])
+
+        sig_verdict = None
+        if consensus_verdict in ("BUY", "SELL"):
+            sig_verdict = _consensus_to_signal_verdict(consensus_verdict)
+        elif neutral_follow:
+            vr = None
+            if markets_bundle is not None:
+                vr = markets_bundle.get("verdict")
+            if vr is None or not vr.get("verdict"):
+                try:
+                    repo = os.getenv("GITHUB_REPO", "borzenkovandrej07-alt/DIALECTIC_EDg")
+                    vr = await fetch_verdict(repo)
+                except Exception as e:
+                    logger.debug("fetch_verdict for neutral_follow: %s", e)
+                    vr = None
+            if vr and vr.get("verdict") in ("BULLISH", "BEARISH"):
+                sig_verdict = vr
+
+        bias = build_signal_bias_map(raw, sig_verdict)
+        if markets_bundle is None:
+            _signal_cache = bias
+            _signal_cache_time = now
+            _signal_cache_meta = meta_key
+        return {symbol: bias.get(symbol, {}) for symbol in crypto_symbols}
+    except Exception as e:
+        logger.warning(f"Binance signal bias fetch error: {e}")
+        # Fallback: try multiple sources
+        bias = {}
+        try:
+            from signals import fetch_binance_signals
+            raw = await fetch_binance_signals([f"{symbol}USDT" for symbol in crypto_symbols])
+            if raw:
+                from signals import build_signal_bias_map
+                bias = build_signal_bias_map(raw)
+        except Exception as e2:
+            logger.warning(f"Bybit/Spot fallback also failed: {e2}")
+
+        # Final fallback: CoinGecko prices
+        if not bias:
+            try:
+                import aiohttp
+                ids = []
+                for s in crypto_symbols:
+                    cg_id = {"BTC": "bitcoin", "ETH": "ethereum", "BNB": "binancecoin", "SOL": "solana"}.get(s)
+                    if cg_id:
+                        ids.append(cg_id)
+                if ids:
+                    url = f"https://api.coingecko.com/api/v3/simple/price"
+                    params = {"ids": ",".join(ids), "vs_currencies": "usd", "include_24hr_change": "true"}
+                    async with aiohttp.ClientSession() as session:
+                        async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                            data = await resp.json()
+                            for s in crypto_symbols:
+                                cg_id = {"BTC": "bitcoin", "ETH": "ethereum", "BNB": "binancecoin", "SOL": "solana"}.get(s)
+                                if cg_id and cg_id in data:
+                                    change = data[cg_id].get("usd_24h_change", 0)
+                                    price = data[cg_id].get("usd", 0)
+                                    bias[s] = {
+                                        "symbol": s,
+                                        "score": -abs(change) if change < 0 else abs(change),
+                                        "direction": "SHORT" if change < 0 else "LONG",
+                                        "strength": abs(change),
+                                        "reasons": [f"CoinGecko 24h {change:+.2f}%"],
+                                        "last_price": price,
+                                    }
+            except Exception as e3:
+                logger.warning(f"CoinGecko fallback also failed: {e3}")
+
+        # Last resort: assume SHORT (price falling = buy opportunity)
+        if not bias:
+            for symbol in crypto_symbols:
+                price = prices.get(symbol) or 0
+                if price > 0:
+                    bias[symbol] = {
+                        "symbol": symbol,
+                        "score": -15.0,
+                        "direction": "SHORT",
+                        "strength": 15.0,
+                        "reasons": ["Fallback — price falling"],
+                        "last_price": price,
+                    }
+
+        return {symbol: bias.get(symbol, {}) for symbol in crypto_symbols}
+
+
+def _signal_follow_active(
+    consensus_verdict: str,
+    candidates: list,
+) -> bool:
+    return (
+        AUTOTRADE_FOLLOW_SIGNALS_WHEN_NEUTRAL
+        and DATA_SOURCE_BINANCE_SIGNALS
+        and (consensus_verdict == "NEUTRAL" or not candidates)
+    )
+
+
+def _append_signal_follow_candidates(
+    consensus: dict,
+    prices: dict,
+    signal_bias: dict,
+    *,
+    open_positions: list[dict] | None = None,
+) -> dict:
+    if not _signal_follow_active(
+        consensus.get("consensus_verdict", "NEUTRAL"),
+        consensus.get("candidates") or [],
+    ):
+        return consensus
+
+    # Build set of assets we currently hold (open BUY positions)
+    held_symbols = set()
+    for pos in (open_positions or []):
+        if (pos.get("direction") or "").upper() == "BUY":
+            held_symbols.add(pos["symbol"])
+
+    existing = {c["symbol"] for c in consensus.get("candidates", [])}
+    add = []
+    for symbol in sorted(CRYPTO_SIGNAL_SYMBOLS):
+        if symbol in existing:
+            continue
+        b = signal_bias.get(symbol) or {}
+        direction = (b.get("direction") or "NEUTRAL").upper()
+        score = float(b.get("score") or 0.0)
+        if direction not in ("LONG", "SHORT") or abs(score) < AUTOTRADE_NEUTRAL_MIN_BIAS_SCORE:
+            continue
+        price = float(prices.get(symbol) or 0)
+        if price <= 0:
+            continue
+
+        if direction == "SHORT":
+            # Price falling — BUY the dip
+            trade_dir = "BUY"
+            tp = AUTOTRADE_NEUTRAL_TP_PCT
+            sl = AUTOTRADE_NEUTRAL_SL_PCT
+            entry = price
+            target = price * (1 + tp)
+            stop = price * (1 - sl)
+        else:
+            # Price rising — SELL if we hold it
+            if symbol not in held_symbols:
+                logger.debug(f"LONG signal for {symbol} but not held — skipping")
+                continue
+            trade_dir = "SELL"
+            tp = AUTOTRADE_NEUTRAL_TP_PCT
+            sl = AUTOTRADE_NEUTRAL_SL_PCT
+            entry = price
+            target = price * (1 - tp)
+            stop = price * (1 + sl)
+
+        digest_score = 12.0 + min(abs(score), 35.0) * 0.35
+        add.append({
+            "symbol": symbol,
+            "direction": trade_dir,
+            "support": 0,
+            "weighted_support": 0,
+            "digest_score": round(digest_score, 2),
+            "entry": round(entry, 6),
+            "target": round(target, 6),
+            "stop": round(stop, 6),
+            "timeframe": "signal_follow",
+            "context_dates": [],
+            "latest_created_at": "",
+            "news_summary": "",
+            "signal_follow_only": True,
+        })
+    out = dict(consensus)
+    out["candidates"] = list(consensus.get("candidates", [])) + add
+    if add:
+        out["signal_follow_augmented"] = len(add)
+    return out
+
+
+async def _export_backtest_snapshot():
+    try:
+        from github_export import _github_get, _github_put, BACKTEST_FILE
+        from datetime import datetime
+
+        signals = await get_backtest_signals()
+        stats = await get_backtest_stats()
+        config = await get_backtest_config()
+
+        # Use session manager to format BACKTEST.md
+        content = session_manager.format_backtest_md(signals, stats, config)
+
+        _, sha = await _github_get(BACKTEST_FILE)
+        await _github_put(
+            BACKTEST_FILE, content, sha,
+            f"📊 Update backtest {datetime.now().strftime('%Y-%m-%d %H:%M')} [skip ci]"
+        )
+        logger.info("✅ BACKTEST.md updated on GitHub")
+    except Exception as e:
+        logger.warning(f"Backtest export error: {e}")
+
+
+async def fetch_current_prices(symbols: list[str]) -> dict:
+    """Fetch current prices + trend data + regime for crypto assets."""
+    prices = {}
+    symbols = sorted(set(symbols))
+    if not symbols:
+        return prices
+
+    signal_bias = await _fetch_crypto_signal_bias(symbols, "NEUTRAL")
+    for symbol, data in signal_bias.items():
+        last_price = float(data.get("last_price") or 0.0)
+        if last_price > 0:
+            prices[symbol] = last_price
+
+    missing = [symbol for symbol in symbols if symbol not in prices]
+    if not missing:
+        pass
+    else:
+        try:
+            from tracker import get_current_price
+            results = await asyncio.gather(*(get_current_price(symbol) for symbol in missing), return_exceptions=True)
+            for symbol, result in zip(missing, results):
+                if isinstance(result, Exception) or result in (None, 0):
+                    continue
+                try:
+                    prices[symbol] = float(result)
+                except Exception:
+                    continue
+        except Exception as e:
+            logger.warning(f"Fallback price fetch error: {e}")
+
+    # Обогащаем signal_bias тренд-данными из Binance klines (MA50/MA200/change_7d)
+    crypto_syms = [s for s in symbols if s in CRYPTO_SIGNAL_SYMBOLS]
+    if crypto_syms:
+        try:
+            import aiohttp as _aiohttp
+            from web_search import _fetch_trend_data, TIMEOUT as _WS_TIMEOUT, HEADERS as _WS_HEADERS
+            async with _aiohttp.ClientSession(headers=_WS_HEADERS) as _session:
+                trend_tasks = [
+                    _fetch_trend_data(_session, f"{sym}USDT", sym)
+                    for sym in crypto_syms
+                ]
+                trend_results = await asyncio.gather(*trend_tasks, return_exceptions=True)
+                for sym, tr in zip(crypto_syms, trend_results):
+                    if isinstance(tr, Exception) or not tr:
+                        continue
+                    if sym not in _signal_cache:
+                        _signal_cache[sym] = {}
+                    _signal_cache[sym].update(tr)
+                    logger.info(
+                        f"Trend {sym}: {tr.get('trend','?')} | "
+                        f"MA50={'выше' if tr.get('above_ma50') else 'ниже'} | "
+                        f"7d={tr.get('change_7d',0):+.1f}%"
+                    )
+        except ImportError:
+            pass
+        except Exception as e:
+            logger.debug(f"Trend fetch error: {e}")
+
+    # ═══ REGIME DETECTION ═══
+    # Определяем режим рынка для каждого крипто-актива
+    for sym in crypto_syms:
+        try:
+            candles = await get_candles(sym, timeframe_hours=24, limit=200)
+            if candles:
+                regime = _regime_detector.detect(candles)
+                if regime:
+                    if sym not in _signal_cache:
+                        _signal_cache[sym] = {}
+                    _signal_cache[sym]["regime"] = regime.regime
+                    _signal_cache[sym]["regime_confidence"] = regime.confidence
+                    _signal_cache[sym]["volatility_pct"] = regime.volatility_pct
+                    _signal_cache[sym]["rsi"] = regime.rsi
+                    _signal_cache[sym]["trend_strength"] = regime.trend_strength
+                    _signal_cache[sym]["regime_recommendation"] = regime.recommendation
+                    logger.info(
+                        f"Regime {sym}: {regime.regime} | "
+                        f"Conf: {regime.confidence:.2f} | "
+                        f"Vol: {regime.volatility_pct:.1f}% | "
+                        f"RSI: {regime.rsi:.0f} | "
+                        f"ADX: {regime.trend_strength:.0f}"
+                    )
+        except Exception as e:
+            logger.debug(f"Regime detection error for {sym}: {e}")
+
+    return prices
+
+
+def _score_candidate(candidate: dict, current_price: float, signal_bias: dict) -> dict:
+    direction = candidate["direction"]
+    entry = float(candidate.get("entry") or 0)
+    stop = float(candidate.get("stop") or 0)
+    target = float(candidate.get("target") or 0)
+    signal = signal_bias.get(candidate["symbol"], {})
+
+    proximity_score = 0.0
+    blocked_reason = ""
+
+    if entry > 0:
+        delta = (current_price - entry) / entry
+        if direction == "BUY":
+            if stop and current_price <= stop:
+                blocked_reason = "price_below_stop"
+            elif target and current_price >= target:
+                blocked_reason = "price_at_target"
+            elif current_price <= entry * (1 + ENTRY_TOLERANCE_PCT):
+                proximity_score = max(0.0, 6.0 - abs(delta) * 150)
+            else:
+                proximity_score = -6.0
+        else:
+            if stop and current_price >= stop:
+                blocked_reason = "price_above_stop"
+            elif target and current_price <= target:
+                blocked_reason = "price_at_target"
+            elif current_price >= entry * (1 - ENTRY_TOLERANCE_PCT):
+                proximity_score = max(0.0, 6.0 - abs(delta) * 150)
+            else:
+                proximity_score = -6.0
+
+    signal_score = 0.0
+    signal_direction = signal.get("direction", "NEUTRAL")
+    if candidate["symbol"] in CRYPTO_SIGNAL_SYMBOLS:
+        raw_signal_score = float(signal.get("score") or 0.0)
+        signal_score = raw_signal_score * 0.35
+        if signal_direction == "NEUTRAL":
+            signal_score -= 2.0
+        elif (direction == "BUY" and signal_direction == "SHORT") or (direction == "SELL" and signal_direction == "LONG"):
+            signal_score -= 5.0
+    else:
+        signal_score = -2.0
+
+    # ─── ТРЕНД-СКОР: учитываем MA50/MA200 и 7-дневное изменение ─────────────
+    # Данные тренда приходят из web_search.py fetch_trend_data (Binance klines)
+    trend_score = 0.0
+    trend_label = ""
+    trend_blocked = ""
+
+    # Берём тренд из signal_bias (там есть last_price + тренд из web_search)
+    # Или из prices_with_trend если передан
+    sym_bias = signal_bias.get(candidate["symbol"], {})
+    trend = (sym_bias.get("trend") or "").upper()
+    above_ma50 = sym_bias.get("above_ma50")
+    change_7d = float(sym_bias.get("change_7d") or 0.0)
+    change_30d = float(sym_bias.get("change_30d") or 0.0)
+
+    if trend or above_ma50 is not None:
+        if direction == "BUY":
+            if trend == "UPTREND":
+                trend_score += 5.0   # торгуем по тренду — бонус
+                trend_label = "📈 UPTREND подтверждает BUY"
+            elif trend == "DOWNTREND":
+                trend_score -= 8.0   # против тренда — жёсткий штраф
+                trend_label = "📉 DOWNTREND против BUY"
+                if abs(trend_score) >= 8:
+                    trend_blocked = "against_downtrend"
+            elif trend == "SIDEWAYS":
+                trend_score -= 2.0   # боковик — небольшой штраф
+                trend_label = "↔️ SIDEWAYS — осторожно"
+
+            # MA50: выше = хорошо для BUY, ниже = плохо
+            if above_ma50 is True:
+                trend_score += 3.0
+            elif above_ma50 is False:
+                trend_score -= 4.0
+
+            # 7-дневное изменение: против ветра
+            if change_7d < -10:
+                trend_score -= 3.0   # сильное падение за неделю — риск
+            elif change_7d > 5:
+                trend_score += 2.0   # рост за неделю подтверждает
+
+        elif direction == "SELL":
+            if trend == "DOWNTREND":
+                trend_score += 5.0
+                trend_label = "📉 DOWNTREND подтверждает SELL"
+            elif trend == "UPTREND":
+                trend_score -= 8.0
+                trend_label = "📈 UPTREND против SELL"
+                if abs(trend_score) >= 8:
+                    trend_blocked = "against_uptrend"
+            elif trend == "SIDEWAYS":
+                trend_score -= 2.0
+                trend_label = "↔️ SIDEWAYS — осторожно"
+
+            if above_ma50 is False:
+                trend_score += 3.0
+            elif above_ma50 is True:
+                trend_score -= 4.0
+
+            if change_7d > 10:
+                trend_score -= 3.0
+            elif change_7d < -5:
+                trend_score += 2.0
+
+    # В боковике используем меньший размер позиции (через флаг)
+    is_sideways = trend == "SIDEWAYS"
+
+    # Если нет данных о тренде — нейтрально (не штрафуем)
+    if not trend and above_ma50 is None:
+        trend_score = 0.0
+
+    if not blocked_reason and trend_blocked:
+        blocked_reason = trend_blocked
+
+    # ─── REGIME SCORE: учитываем режим рынка ────────────────────────────────
+    regime_score = 0.0
+    regime_label = ""
+    sym_cache = _signal_cache.get(candidate["symbol"], {})
+    regime = (sym_cache.get("regime") or "").upper()
+    regime_conf = float(sym_cache.get("regime_confidence") or 0.5)
+    volatility = float(sym_cache.get("volatility_pct") or 0.0)
+    rsi_val = float(sym_cache.get("rsi") or 50.0)
+
+    if regime:
+        if direction == "BUY":
+            if regime == "UPTREND":
+                regime_score += 6.0 * regime_conf
+                regime_label = f"📈 UPTREND (conf {regime_conf:.1f})"
+            elif regime == "DOWNTREND":
+                regime_score -= 10.0 * regime_conf
+                regime_label = f"📉 DOWNTREND против BUY"
+                if regime_conf > 0.7:
+                    blocked_reason = blocked_reason or "against_downtrend"
+            elif regime == "HIGH_VOL":
+                regime_score -= 3.0
+                regime_label = f"⚡ HIGH VOL ({volatility:.1f}%)"
+            elif regime == "SIDEWAYS":
+                regime_score -= 2.0
+                regime_label = f"↔️ SIDEWAYS"
+
+            # RSI фильтрация
+            if rsi_val > 75:
+                regime_score -= 4.0  # Перекупленность
+            elif rsi_val > 70:
+                regime_score -= 2.0
+            elif rsi_val < 30:
+                regime_score += 2.0  # Перепроданность — хороший вход
+
+        elif direction == "SELL":
+            if regime == "DOWNTREND":
+                regime_score += 6.0 * regime_conf
+                regime_label = f"📉 DOWNTREND (conf {regime_conf:.1f})"
+            elif regime == "UPTREND":
+                regime_score -= 10.0 * regime_conf
+                regime_label = f"📈 UPTREND против SELL"
+                if regime_conf > 0.7:
+                    blocked_reason = blocked_reason or "against_uptrend"
+            elif regime == "HIGH_VOL":
+                regime_score -= 3.0
+                regime_label = f"⚡ HIGH VOL ({volatility:.1f}%)"
+            elif regime == "SIDEWAYS":
+                regime_score -= 2.0
+                regime_label = f"↔️ SIDEWAYS"
+
+            if rsi_val < 25:
+                regime_score -= 4.0  # Перепроданность
+            elif rsi_val < 30:
+                regime_score -= 2.0
+            elif rsi_val > 70:
+                regime_score += 2.0  # Перекупленность — хороший вход для шорта
+
+    total_score = float(candidate.get("digest_score") or 0.0) + proximity_score + signal_score + trend_score + regime_score
+    # Use lower threshold for signal-follow mode
+    threshold = SIGNAL_FOLLOW_SCORE_THRESHOLD if candidate.get("signal_follow_only") else OPEN_SCORE_THRESHOLD
+    ready = not blocked_reason and total_score >= threshold
+
+    scored = dict(candidate)
+    scored.update({
+        "current_price": current_price,
+        "signal_direction": signal_direction,
+        "signal_strength": float(signal.get("strength") or 0.0),
+        "signal_score_component": round(signal_score, 2),
+        "proximity_score": round(proximity_score, 2),
+        "trend_score": round(trend_score, 2),
+        "regime_score": round(regime_score, 2),
+        "regime_label": regime_label,
+        "regime": regime,
+        "volatility_pct": volatility,
+        "rsi": rsi_val,
+        "trend_label": trend_label,
+        "trend": trend,
+        "above_ma50": above_ma50,
+        "change_7d": change_7d,
+        "is_sideways": is_sideways,
+        "total_score": round(total_score, 2),
+        "ready": ready,
+        "blocked_reason": blocked_reason,
+        "signal_reasons": signal.get("reasons", []),
+    })
+    return scored
+
+
+def rank_trade_candidates(consensus: dict, prices: dict, signal_bias: dict) -> list[dict]:
+    ranked = []
+    for candidate in consensus.get("candidates", []):
+        price = float(prices.get(candidate["symbol"]) or 0.0)
+        if price <= 0:
+            continue
+        ranked.append(_score_candidate(candidate, price, signal_bias))
+
+    ranked.sort(key=lambda item: item["total_score"], reverse=True)
+    return ranked
+
+
+def _parse_trade_meta(position: dict) -> dict:
+    raw = position.get("trade_log") or ""
+    if not raw:
+        return {}
+    try:
+        return json.loads(raw)
+    except Exception:
+        return {}
+
+
+async def _close_position_if_needed(position: dict, prices: dict, signal_bias: dict, consensus: dict) -> dict | None:
+    symbol = position["symbol"]
+    current_price = float(prices.get(symbol) or 0.0)
+    if current_price <= 0:
+        return None
+
+    meta = _parse_trade_meta(position)
+    direction = (position.get("direction") or "").upper()
+    target = float(meta.get("target") or 0.0)
+    stop = float(meta.get("stop") or 0.0)
+    entry_price = float(position.get("entry_price") or 0.0)
+    reason = ""
+
+    # ИСПРАВЛЕНО: если target/stop не были сохранены — применяем дефолты
+    if entry_price > 0:
+        if not target:
+            target = entry_price * 1.04   # +4% по умолчанию
+        if not stop:
+            stop   = entry_price * 0.98   # -2% по умолчанию
+
+    if direction == "BUY":
+        if target and current_price >= target:
+            reason = "Target hit — фиксация прибыли"
+        elif stop and current_price <= stop:
+            reason = "Stop loss hit"
+    elif direction == "SELL":
+        if target and current_price <= target:
+            reason = "Target hit — фиксация прибыли"
+        elif stop and current_price >= stop:
+            reason = "Stop loss hit"
+
+    if not reason:
+        return None
+
+    signal_id = position.get("id", -1)
+
+    if signal_id and signal_id > 0:
+        # Позиция есть в SQLite — закрываем через БД
+        result = await close_backtest_signal(signal_id, current_price, reason=reason)
+        if not result:
+            return None
+        new_capital = float(result.get("new_capital") or 0.0)
+        pnl = float(result.get("pnl") or 0.0)
+        pnl_pct = float(result.get("pnl_pct") or 0.0)
+    else:
+        # In-memory позиция (после редеплоя) — считаем PnL вручную
+        qty = float(position.get("quantity") or 0.0)
+        if direction == "BUY":
+            pnl_per_unit = current_price - entry_price
+        else:
+            pnl_per_unit = entry_price - current_price
+        pnl_pct = (pnl_per_unit / entry_price * 100) if entry_price > 0 else 0.0
+        pnl = pnl_per_unit * qty
+        config = await get_backtest_config()
+        capital = float(config.get("capital") or 100.0)
+        new_capital = max(capital + pnl, 0.0)
+        await update_backtest_capital(new_capital)
+        logger.info(f"In-memory close: {symbol} pnl={pnl:+.2f} new_capital={new_capital:.2f}")
+
+    session_manager.record_trade({
+        "symbol": symbol,
+        "direction": direction,
+        "entry_price": entry_price,
+        "exit_price": current_price,
+        "pnl": pnl,
+        "pnl_pct": pnl_pct,
+        "reason": reason,
+    })
+    session_manager.update_capital(new_capital)
+
+    # Сразу пишем в BACKTEST.md после каждого закрытия
+    try:
+        await _export_backtest_snapshot()
+    except Exception as _e:
+        logger.warning("export after close error: %s", _e)
+
+    return {
+        "event": "closed",
+        "symbol": symbol,
+        "direction": direction,
+        "entry_price": entry_price,
+        "exit_price": current_price,
+        "reason": reason,
+        "pnl": pnl,
+        "pnl_pct": pnl_pct,
+        "capital": new_capital,
+    }
+
+
+async def _close_on_signal_reversal(position: dict, prices: dict, signal_bias: dict) -> dict | None:
+    """
+    Close position if market signal reversed against our direction.
+    E.g., we bought (BUY), but now signal shows SHORT (price falling) — close and cut loss.
+    """
+    symbol = position["symbol"]
+    if symbol not in CRYPTO_SIGNAL_SYMBOLS:
+        return None
+    
+    current_price = float(prices.get(symbol) or 0.0)
+    if current_price <= 0:
+        return None
+    
+    meta = _parse_trade_meta(position)
+    direction = (position.get("direction") or "").upper()
+    signal_direction = (signal_bias.get(symbol, {}).get("direction") or "NEUTRAL").upper()
+    
+    reversal_threshold = REVERSAL_SCORE_THRESHOLD
+    signal = signal_bias.get(symbol, {})
+    signal_score = abs(float(signal.get("score") or 0.0))
+    
+    reason = ""
+    
+    if direction == "BUY" and signal_direction == "SHORT" and signal_score >= reversal_threshold:
+        reason = f"Signal reversal: {signal_direction} (score={signal_score:.1f})"
+    elif direction == "SELL" and signal_direction == "LONG" and signal_score >= reversal_threshold:
+        reason = f"Signal reversal: {signal_direction} (score={signal_score:.1f})"
+    
+    if not reason:
+        return None
+    
+    signal_id = position.get("id", -1)
+    entry_price_rev = float(position.get("entry_price") or 0.0)
+    qty_rev = float(position.get("quantity") or 0.0)
+
+    if signal_id and signal_id > 0:
+        result = await close_backtest_signal(signal_id, current_price, reason=reason)
+        if not result:
+            return None
+        new_capital_rev = float(result.get("new_capital") or 0.0)
+        pnl_rev = float(result.get("pnl") or 0.0)
+        pnl_pct_rev = float(result.get("pnl_pct") or 0.0)
+    else:
+        if direction == "BUY":
+            pnl_per_unit_rev = current_price - entry_price_rev
+        else:
+            pnl_per_unit_rev = entry_price_rev - current_price
+        pnl_pct_rev = (pnl_per_unit_rev / entry_price_rev * 100) if entry_price_rev > 0 else 0.0
+        pnl_rev = pnl_per_unit_rev * qty_rev
+        config_rev = await get_backtest_config()
+        capital_rev = float(config_rev.get("capital") or 100.0)
+        new_capital_rev = max(capital_rev + pnl_rev, 0.0)
+        await update_backtest_capital(new_capital_rev)
+        logger.info(f"In-memory reversal close: {symbol} pnl={pnl_rev:+.2f}")
+
+    session_manager.record_trade({
+        "symbol": symbol,
+        "direction": direction,
+        "entry_price": entry_price_rev,
+        "exit_price": current_price,
+        "pnl": pnl_rev,
+        "pnl_pct": pnl_pct_rev,
+        "reason": reason,
+    })
+    session_manager.update_capital(new_capital_rev)
+
+    try:
+        await _export_backtest_snapshot()
+    except Exception as _e:
+        logger.warning("export after reversal close error: %s", _e)
+
+    return {
+        "event": "closed",
+        "symbol": symbol,
+        "direction": direction,
+        "entry_price": entry_price_rev,
+        "exit_price": current_price,
+        "reason": reason,
+        "pnl": pnl_rev,
+        "pnl_pct": pnl_pct_rev,
+        "capital": new_capital_rev,
+    }
+
+
+async def _notify_admins(bot, admin_ids: list[int], event: dict):
+    if not bot or not admin_ids:
+        return
+
+    if event["event"] == "opened":
+        emoji = "🟢" if event["direction"] == "BUY" else "🔴"
+        trend_str = ""
+        if event.get("trend"):
+            t = event["trend"]
+            te = "📈" if t == "UPTREND" else "📉" if t == "DOWNTREND" else "↔️"
+            trend_str = f"\nТренд: `{te} {t}`"
+            if event.get("change_7d") is not None:
+                trend_str += f" | 7д: `{event['change_7d']:+.1f}%`"
+        msg = (
+            f"🎯 *AUTO TRADE OPEN*\n"
+            f"{emoji} *{event['symbol']}* {event['direction']}\n"
+            f"Вход: `${event['entry_price']:,.2f}`\n"
+            f"План: `{event['support']} digest(s)` | Score `{event['score']:.1f}`\n"
+            f"Сигнал: `{event['signal_direction']}`{trend_str}\n"
+            f"Тейк: `${event['target']:,.2f}` | Стоп: `${event['stop']:,.2f}`\n"
+            f"Баланс: `${event['capital']:,.2f}`"
+        )
+    elif event["event"] == "partial_closed":
+        emoji = "🟢" if event.get("pnl", 0) >= 0 else "🔴"
+        msg = (
+            f"🎯 *ЧАСТИЧНАЯ ФИКСАЦИЯ*\n"
+            f"{emoji} *{event['symbol']}* {event['direction']}\n"
+            f"Вход: `${event['entry_price']:,.2f}` | Выход: `${event['exit_price']:,.2f}`\n"
+            f"Закрыто: {event.get('quantity_closed', 0):.6f} шт | Осталось: {event.get('quantity_remaining', 0):.6f} шт\n"
+            f"PnL: `{event.get('pnl', 0):+,.2f}` ({event.get('pnl_pct', 0):+.2f}%)\n"
+            f"Причина: {event['reason']}\n"
+            f"Баланс: `${event.get('capital', 0):,.2f}`"
+        )
+    else:
+        emoji = "🟢" if event["pnl"] >= 0 else "🔴"
+        msg = (
+            f"🎯 *AUTO TRADE CLOSE*\n"
+            f"{emoji} *{event['symbol']}* {event['direction']}\n"
+            f"Выход: `${event['exit_price']:,.2f}`\n"
+            f"PnL: `{event['pnl']:+,.2f}` ({event['pnl_pct']:+.2f}%)\n"
+            f"Причина: {event['reason']}\n"
+            f"Баланс: `${event['capital']:,.2f}`"
+        )
+
+    for admin_id in admin_ids:
+        try:
+            await bot.send_message(admin_id, msg, parse_mode="Markdown")
+        except Exception:
+            continue
+
+
+def _scoring_legend() -> dict:
+    return {
+        "digest_context_weights_newest_first": [3, 2, 1],
+        "digest_score": "weighted_support * 4 + (aligned consensus +4 | opposite -6)",
+        "signal_crypto": "build_signal_bias_map.score * 0.35; NEUTRAL -2; direction clash -5",
+        "signal_non_crypto": "-2 (plan from digest; weak external confirmation)",
+        "proximity": "near planned entry within ENTRY_TOLERANCE_PCT else penalty",
+        "open_total_score_min": OPEN_SCORE_THRESHOLD,
+        "reversal_signal_abs_score_min": REVERSAL_SCORE_THRESHOLD,
+    }
+
+
+async def check_and_trade(bot, admin_ids: list[int]) -> list[dict]:
+    """Run one paper-trading cycle with session management."""
+    if not FEATURE_AUTOTRADE:
+        return []
+    async with _trade_lock:
+        return await _check_and_trade_locked(bot, admin_ids)
+
+
+async def _check_and_trade_locked(bot, admin_ids: list[int]) -> list[dict]:
+    """Actual trading logic — always called under lock."""
+    events = []
+
+    # Load session state from BACKTEST.md on first run
+    if not session_manager._loaded:
+        try:
+            from github_export import _github_get, BACKTEST_FILE
+            backtest_content, _ = await _github_get(BACKTEST_FILE)
+            if backtest_content:
+                session_manager._load_from_backtest(backtest_content)
+        except Exception as e:
+            logger.debug("Failed to load session state from GitHub: %s", e)
+
+    # Check if current session should be closed
+    if session_manager.should_close_session():
+        closed_session = session_manager.close_session()
+        await update_backtest_capital(SESSION_START_CAPITAL)
+        session_manager.update_capital(SESSION_START_CAPITAL)
+        events.append({
+            "event": "session_closed",
+            "session_id": closed_session["session_id"],
+            "pnl": closed_session["pnl"],
+            "lesson": closed_session["lesson"],
+        })
+        logger.info(f"Session #{closed_session['session_id']} closed. PnL: ${closed_session['pnl']:+.2f}")
+
+    config = await get_backtest_config()
+    if not config.get("enabled", 1):
+        return events
+
+    current_capital = config.get("capital", 100.0)
+
+    # ═══ ГЛАВНЫЙ ФИХ: загружаем открытые позиции из GitHub как источник правды ═══
+    # SQLite на Railway сбрасывается при каждом редеплое — GitHub всегда актуален
+    import re as _re
+    gh_open_positions = []
+    try:
+        from github_export import _github_get, BACKTEST_FILE
+        bt_content, _ = await _github_get(BACKTEST_FILE)
+        if bt_content:
+            # Капитал из GitHub
+            cap_m = _re.search(r'Текущий:\s*\*\*\$([\d,\.]+)\*\*', bt_content)
+            if cap_m:
+                current_capital = float(cap_m.group(1).replace(',', ''))
+                config["capital"] = current_capital
+                await update_backtest_capital(current_capital)
+
+            # Открытые позиции из секции BACKTEST.md
+            idx = bt_content.find('Открытые позиции')
+            if idx != -1:
+                section = bt_content[idx:]
+                next_h = section.find('\n## ', 10)
+                section = section[:next_h] if next_h != -1 else section
+
+                for line in section.split('\n'):
+                    if '**' in line and 'qty' in line:
+                        m = _re.search(
+                            r'\*\*(\w+)\*\*\s+(\w+)\s+@\s*\$\s*([\d,\.]+)\s+\(qty:\s*([\d\.]+)\)',
+                            line
+                        )
+                        if m:
+                            sym, direction, entry_s, qty_s = m.groups()
+                            entry = float(entry_s.replace(',', ''))
+                            qty   = float(qty_s)
+                            tp_m  = _re.search(r'tp:\s*\$([\d,\.]+)', line)
+                            sl_m  = _re.search(r'sl:\s*\$([\d,\.]+)', line)
+                            target = float(tp_m.group(1).replace(',','')) if tp_m else entry * 1.04
+                            stop   = float(sl_m.group(1).replace(',','')) if sl_m else entry * 0.98
+                            # Ищем id в SQLite, если нет — создаём временную запись
+                            db_signals = await get_backtest_signals()
+                            db_open = [s for s in db_signals
+                                       if s.get("status") == "open"
+                                       and s.get("symbol") == sym
+                                       and s.get("direction","").upper() == direction.upper()]
+                            if db_open:
+                                pos = db_open[0]
+                                # Обновляем target/stop из GitHub если они были дефолтными
+                                pos["trade_log"] = json.dumps({
+                                    "target": target, "stop": stop, "entry_plan": entry
+                                })
+                            else:
+                                # Позиция есть на GitHub но нет в SQLite — восстанавливаем
+                                restore = await add_backtest_signal(
+                                    symbol=sym,
+                                    direction=direction,
+                                    entry_price=entry,
+                                    source="restored_from_github",
+                                    quantity_pct=0.0,  # без списания капитала
+                                    notes="Restored after redeploy",
+                                    trade_log=json.dumps({
+                                        "target": target, "stop": stop, "entry_plan": entry
+                                    }),
+                                )
+                                # Если открылось — берём из БД
+                                db_signals2 = await get_backtest_signals()
+                                db_open2 = [s for s in db_signals2
+                                            if s.get("status") == "open"
+                                            and s.get("symbol") == sym]
+                                if db_open2:
+                                    pos = db_open2[0]
+                                    pos["trade_log"] = json.dumps({
+                                        "target": target, "stop": stop, "entry_plan": entry
+                                    })
+                                else:
+                                    # Создаём in-memory запись для этого цикла
+                                    pos = {
+                                        "id": -1,
+                                        "symbol": sym,
+                                        "direction": direction,
+                                        "entry_price": entry,
+                                        "quantity": qty,
+                                        "status": "open",
+                                        "trade_log": json.dumps({
+                                            "target": target, "stop": stop, "entry_plan": entry
+                                        }),
+                                        "created_at": "",
+                                        "notes": "in-memory",
+                                    }
+                                    logger.warning(f"Position {sym} only in memory this cycle")
+                            gh_open_positions.append(pos)
+                            logger.info(f"Loaded position: {sym} {direction} @ ${entry} tp=${target:.0f} sl=${stop:.0f}")
+
+    except Exception as _e:
+        logger.warning(f"GitHub positions load error: {_e}")
+
+    session_manager.update_capital(current_capital)
+
+    # Step 1: открытые позиции — GitHub как источник правды, SQLite как fallback
+    if gh_open_positions:
+        open_positions = gh_open_positions
+        logger.info(f"Using {len(open_positions)} positions from GitHub")
+    else:
+        open_positions = [row for row in await get_backtest_signals() if row.get("status") == "open"]
+        logger.info(f"Using {len(open_positions)} positions from SQLite")
+
+    # Step 2: Build consensus and signals
+    contexts = await get_recent_daily_contexts(limit=RECENT_CONTEXT_LIMIT, max_age_hours=None)
+    if not contexts:
+        consensus = {
+            "consensus_verdict": "NEUTRAL",
+            "verdict_score": 0,
+            "contexts": [],
+            "candidates": [],
+        }
+    else:
+        consensus = build_digest_consensus(contexts)
+        if not consensus.get("candidates"):
+            consensus = {
+                "consensus_verdict": "NEUTRAL",
+                "verdict_score": 0,
+                "contexts": [],
+                "candidates": [],
+            }
+
+    cv = consensus.get("consensus_verdict", "NEUTRAL")
+    use_follow = _signal_follow_active(cv, consensus.get("candidates") or [])
+
+    symbols = {candidate["symbol"] for candidate in consensus.get("candidates", [])}
+    symbols.update(position["symbol"] for position in open_positions)
+    if use_follow:
+        symbols |= set(CRYPTO_SIGNAL_SYMBOLS)
+
+    from signals import fetch_markets_bundle
+    gh_repo = os.getenv("GITHUB_REPO", "borzenkovandrej07-alt/DIALECTIC_EDg")
+    markets_bundle = await fetch_markets_bundle(gh_repo)
+
+    # ═══ EVENT DEFENSE CHECK ═══
+    # Сканируем контекст на красные флаги
+    defense_active = False
+    if contexts:
+        latest_text = contexts[0].get("news_summary", "") + " " + contexts[0].get("verdict_reason", "")
+        defense_events = _event_defense.scan_text(latest_text)
+        if _event_defense.is_defense_mode:
+            defense_active = True
+            logger.warning(f"🚨 DEFENSE MODE: {_event_defense.get_defense_recommendation()}")
+
+    # ═══ WHALE DETECTION ═══
+    # Проверяем китовые сделки для крипто-символов
+    whale_signals = {}
+    crypto_syms_in_candidates = {c["symbol"] for c in consensus.get("candidates", [])} & CRYPTO_SIGNAL_SYMBOLS
+    for sym in crypto_syms_in_candidates:
+        whales = await _whale_detector.check_for_whales(f"{sym}USDT")
+        if whales:
+            whale_signals[sym] = _whale_detector.get_whale_sentiment(f"{sym}USDT")
+            logger.info(f"🐋 Whale sentiment {sym}: {whale_signals[sym]}")
+
+    # ═══ CORRELATION CHECK ═══
+    corr_matrix = {}
+    if len(symbols) >= 2:
+        corr_matrix = await _correlation.calculate(list(symbols), timeframe_hours=24, limit=30)
+
+    prices = await fetch_current_prices(list(symbols))
+    signal_bias = await _fetch_crypto_signal_bias(
+        list(symbols), cv, neutral_follow=use_follow, markets_bundle=markets_bundle,
+    )
+    if use_follow:
+        consensus = _append_signal_follow_candidates(consensus, prices, signal_bias, open_positions=open_positions)
+
+    # Step 3: Close positions that hit target/stop OR signal reversal
+    for position in open_positions:
+        closed_event = await _close_position_if_needed(position, prices, signal_bias, consensus)
+        if closed_event:
+            events.append(closed_event)
+            await _notify_admins(bot, admin_ids, closed_event)
+            continue
+        
+        signal_reversal_event = await _close_on_signal_reversal(position, prices, signal_bias)
+        if signal_reversal_event:
+            events.append(signal_reversal_event)
+            await _notify_admins(bot, admin_ids, signal_reversal_event)
+
+    # Refresh open positions after closes
+    open_positions = [row for row in await get_backtest_signals() if row.get("status") == "open"]
+    if len(open_positions) >= 5:
+        if events:
+            await _export_backtest_snapshot()
+        return events
+
+    # Step 4: Open new positions (up to 5 total)
+    ranked = rank_trade_candidates(consensus, prices, signal_bias)
+    held_symbols = {p["symbol"] for p in open_positions}
+
+    for candidate in ranked:
+        if len(open_positions) >= 5:
+            break
+        if candidate["symbol"] in held_symbols:
+            logger.info(f"⏭ {candidate['symbol']}: уже в позиции")
+            continue
+        if not candidate.get("ready"):
+            reason = candidate.get("blocked_reason") or f"score={candidate.get('total_score',0):.1f}<{OPEN_SCORE_THRESHOLD}"
+            logger.info(f"⏭ {candidate['symbol']} {candidate['direction']}: не готов — {reason}")
+            continue
+
+        # ═══ DEFENSE MODE BLOCK ═══
+        if defense_active:
+            logger.info(f"⏭ {candidate['symbol']}: blocked by DEFENSE MODE")
+            continue
+
+        # ═══ CORRELATION FILTER ═══
+        sym = candidate["symbol"]
+        if corr_matrix:
+            conflict = _correlation.check_conflict(sym, list(held_symbols), corr_matrix)
+            if conflict:
+                logger.info(f"⏭ {sym}: blocked — high correlation with {conflict}")
+                continue
+
+        # ═══ WHALE SENTIMENT BONUS ═══
+        whale_sent = whale_signals.get(sym, "NEUTRAL")
+        whale_bonus = 0.0
+        if whale_sent == "BULLISH" and candidate["direction"] == "BUY":
+            whale_bonus = 3.0
+            logger.info(f"🐋 {sym}: Whale BUY signal confirmed — bonus +3.0")
+        elif whale_sent == "BEARISH" and candidate["direction"] == "SELL":
+            whale_bonus = 3.0
+            logger.info(f"🐋 {sym}: Whale SELL signal confirmed — bonus +3.0")
+        elif (whale_sent == "BEARISH" and candidate["direction"] == "BUY") or \
+             (whale_sent == "BULLISH" and candidate["direction"] == "SELL"):
+            whale_bonus = -5.0
+            logger.info(f"🐋 {sym}: Whale signal AGAINST trade — penalty -5.0")
+
+        # ═══ DYNAMIC RISK MANAGEMENT ═══
+        entry = float(candidate["current_price"])
+        regime = candidate.get("regime", "")
+        volatility = float(candidate.get("volatility_pct") or 0.0)
+        rsi_val = float(candidate.get("rsi") or 50.0)
+
+        # Проверяем не пора ли остановить торговлю
+        should_stop, stop_reason = _risk_manager.should_stop_trading()
+        if should_stop:
+            logger.warning(f"🛑 Trading halted: {stop_reason}")
+            break
+
+        # Рассчитываем динамические стопы и размер позиции
+        base_stop = candidate.get("stop") or entry * 0.98
+        base_target = candidate.get("target") or entry * 1.04
+
+        risk_calc = _risk_manager.calculate_position_size(
+            capital=current_capital,
+            entry_price=entry,
+            stop_price=base_stop,
+            atr=entry * volatility / 100 if volatility > 0 else 0,
+            regime=regime,
+            correlation_count=len(held_symbols & CRYPTO_SIGNAL_SYMBOLS),
+        )
+
+        # Defense mode: уменьшаем размер позиции
+        if defense_active:
+            risk_calc["risk_pct"] = risk_calc.get("risk_pct", 2.0) * 0.3
+            risk_calc["quantity"] = risk_calc.get("quantity", 0) * 0.3
+
+        # Используем динамические стопы если они лучше базовых
+        final_stop = risk_calc.get("stop_price", base_stop)
+        final_target = risk_calc.get("take_profit", base_target)
+        quantity_pct = risk_calc.get("risk_pct", 0.02) / 100  # Convert to fraction
+
+        # Минимальный R/R 1.5
+        rr = abs(final_target - entry) / abs(entry - final_stop) if entry != final_stop else 0
+        if rr < 1.5:
+            logger.info(f"⏭ {sym}: R/R {rr:.2f} < 1.5 — пропускаем")
+            continue
+
+        support = candidate.get("support") or 0
+        notes = f"Signal-follow | {candidate['direction']} | {regime or 'N/A'}"
+        trade_meta = json.dumps({
+            "target": final_target,
+            "stop": final_stop,
+            "entry_plan": entry,
+            "support": support,
+            "consensus_verdict": cv,
+            "signal_direction": candidate.get("signal_direction", "NEUTRAL"),
+            "regime": regime,
+            "volatility_pct": volatility,
+            "rsi": rsi_val,
+            "rr_ratio": round(rr, 2),
+            "kelly_pct": risk_calc.get("kelly_pct", 0),
+            "risk_pct": risk_calc.get("risk_pct", 0),
+            "whale_sentiment": whale_sent,
+            "defense_mode": defense_active,
+        }, ensure_ascii=False)
+
+        try:
+            result = await add_backtest_signal(
+                symbol=sym,
+                direction=candidate["direction"],
+                entry_price=entry,
+                source="auto_trader",
+                quantity_pct=quantity_pct,
+                notes=notes,
+                trade_log=trade_meta,
+            )
+            if result.get("status") == "opened":
+                events.append({
+                    "event": "opened",
+                    "symbol": sym,
+                    "direction": candidate["direction"],
+                    "entry_price": entry,
+                    "target": final_target,
+                    "stop": final_stop,
+                    "support": support,
+                    "score": float(candidate.get("total_score") or 0.0),
+                    "signal_direction": candidate.get("signal_direction", "NEUTRAL"),
+                    "trend": candidate.get("trend", ""),
+                    "trend_label": candidate.get("trend_label", ""),
+                    "regime": regime,
+                    "volatility_pct": volatility,
+                    "rsi": rsi_val,
+                    "rr_ratio": round(rr, 2),
+                    "whale_sentiment": whale_sent,
+                    "defense_mode": defense_active,
+                    "change_7d": candidate.get("change_7d"),
+                    "above_ma50": candidate.get("above_ma50"),
+                    "capital": float(result.get("capital_after", 0.0)),
+                })
+                held_symbols.add(sym)
+                open_positions.append(result)
+                logger.info(
+                    f"Opened {sym} {candidate['direction']} at {entry} | "
+                    f"TP: {final_target:.0f} SL: {final_stop:.0f} | "
+                    f"R/R: {rr:.2f} | Regime: {regime} | Whale: {whale_sent}"
+                )
+        except Exception as e:
+            logger.error(f"Failed to open {sym}: {e}")
+            continue
+
+    # Send one summary notification if any positions were opened
+    opened_events = [e for e in events if e.get("event") == "opened"]
+    if opened_events and bot and admin_ids:
+        lines = ["🎯 *НОВЫЕ ПОЗИЦИИ*\n"]
+        for ev in opened_events:
+            lines.append(f"{'🟢' if ev['direction'] == 'BUY' else '🔴'} *{ev['symbol']}* {ev['direction']}")
+            lines.append(f"  Вход: ${ev['entry_price']:,.2f}")
+            lines.append(f"  Тейк: ${ev['target']:,.2f} | Стоп: ${ev['stop']:,.2f}")
+            lines.append(f"  Score: {ev['score']:.1f} | Сигнал: {ev.get('signal_direction', 'NEUTRAL')}")
+            lines.append("")
+        lines.append(f"💵 Баланс: ${opened_events[-1]['capital']:,.2f}")
+        msg = "\n".join(lines)
+        for admin_id in admin_ids:
+            try:
+                await bot.send_message(admin_id, msg, parse_mode="Markdown")
+            except Exception:
+                pass
+
+    return events
+
+
+async def run_signal_trader(bot, admin_ids: list[int]):
+    """Run the paper autotrader forever."""
+    logger.info("🤖 Auto trader started, interval=%s sec", INTERVAL_SECONDS)
+    cycle = 0
+    while True:
+        try:
+            cycle += 1
+            logger.info(f"🔄 Автотрейд цикл #{cycle}")
+            events = await check_and_trade(bot, admin_ids)
+            if events:
+                logger.info(f"✅ Цикл #{cycle}: {len(events)} событий")
+            else:
+                logger.info(f"😴 Цикл #{cycle}: нет событий")
+        except Exception as e:
+            logger.error(f"Auto trader error: {e}", exc_info=True)
+        await asyncio.sleep(INTERVAL_SECONDS)
+
+
+async def get_signal_trader_status() -> dict:
+    """Return a richer status payload for /signalstatus."""
+    # ФИХ: сначала грузим из БД, потом перезаписываем с GitHub
+    config = await get_backtest_config()
+    stats = await get_backtest_stats()
+    signals = await get_backtest_signals()
+
+    # Загружаем состояние из GitHub BACKTEST.md (надёжнее SQLite на Railway)
+    try:
+        from github_export import _github_get, BACKTEST_FILE
+        backtest_content, _ = await _github_get(BACKTEST_FILE)
+        if backtest_content:
+            import re
+
+            # Капитал
+            cap_m = re.search(r'Текущий:\s*\*\*\$([\d,\.]+)\*\*', backtest_content)
+            if cap_m:
+                config["capital"] = float(cap_m.group(1).replace(',', ''))
+
+            # Открытые позиции из BACKTEST.md (source of truth после редеплоя)
+            idx = backtest_content.find('Открытые позиции')
+            if idx != -1:
+                section = backtest_content[idx:]
+                next_h = section.find('\n## ', 10)
+                section = section[:next_h] if next_h != -1 else section
+
+                gh_signals = []
+                for line in section.split('\n'):
+                    if '**' in line and 'qty' in line:
+                        m = re.search(r'\*\*(\w+)\*\*\s+(\w+)\s+@\s*\$\s*([\d,\.]+)\s+\(qty:\s*([\d\.]+)\)', line)
+                        if m:
+                            sym, direction, entry_s, qty_s = m.groups()
+                            entry = float(entry_s.replace(',', ''))
+                            qty = float(qty_s)
+                            # ФИХ: правильные target/stop из строки (если записаны) иначе defaults
+                            tp_m = re.search(r'tp:\s*\$([\d,\.]+)', line)
+                            sl_m = re.search(r'sl:\s*\$([\d,\.]+)', line)
+                            target = float(tp_m.group(1).replace(',','')) if tp_m else entry * 1.04
+                            stop   = float(sl_m.group(1).replace(',','')) if sl_m else entry * 0.98
+                            gh_signals.append({
+                                "id": 0,
+                                "symbol": sym,
+                                "direction": direction,
+                                "entry_price": entry,
+                                "quantity": qty,
+                                "status": "open",
+                                "trade_log": json.dumps({"target": target, "stop": stop, "entry_plan": entry}),
+                                "created_at": "",
+                                "notes": "",
+                            })
+                if gh_signals:
+                    signals = gh_signals  # используем GitHub как источник
+                    logger.info(f"Loaded {len(gh_signals)} open positions from GitHub")
+
+            # Подгружаем session_manager
+            if not session_manager._loaded:
+                session_manager._load_from_backtest(backtest_content)
+    except Exception as e:
+        logger.warning(f"GitHub status load error: {e}")
+
+    open_positions = [row for row in signals if row.get("status") == "open"]
+
+    # Контексты дайджеста
+    contexts = await get_recent_daily_contexts(limit=RECENT_CONTEXT_LIMIT, max_age_hours=None)
+    if not contexts:
+        try:
+            from github_export import _github_get, DIGEST_CACHE_FILE
+            digest_content, _ = await _github_get(DIGEST_CACHE_FILE)
+            if digest_content:
+                import re
+                for match in re.finditer(r'## 📊 (\d{2}\.\d{2}\.\d{4})', digest_content):
+                    date_str = match.group(1)
+                    snippet = digest_content[match.start():match.start()+800].upper()
+                    verdict = "NEUTRAL"
+                    if any(w in snippet for w in ["БЫЧ", "BUY", "LONG", "BULLISH"]):
+                        verdict = "BUY"
+                    elif any(w in snippet for w in ["МЕДВ", "SELL", "SHORT", "BEARISH"]):
+                        verdict = "SELL"
+                    contexts.append({"created_at": date_str, "verdict": verdict, "symbols": []})
+        except Exception as e:
+            logger.debug(f"Digest context GitHub load: {e}")
+
+    latest_context = contexts[0] if contexts else None
+    consensus = build_digest_consensus(contexts) if contexts else {
+        "consensus_verdict": "NEUTRAL", "verdict_score": 0, "contexts": [], "candidates": [],
+    }
+
+    cv_status = consensus.get("consensus_verdict", "NEUTRAL")
+    use_follow_status = _signal_follow_active(cv_status, consensus.get("candidates") or [])
+
+    symbols_set = {c["symbol"] for c in consensus.get("candidates", [])[:8]}
+    if use_follow_status:
+        symbols_set |= set(CRYPTO_SIGNAL_SYMBOLS)
+    symbols_set.update(p["symbol"] for p in open_positions)
+    symbols = sorted(symbols_set)
+
+    candidate_rows = []
+    prices = {}
+    signal_bias = {}
+    if symbols:
+        prices = await fetch_current_prices(symbols)
+        signal_bias = await _fetch_crypto_signal_bias(symbols, cv_status, neutral_follow=use_follow_status)
+        consensus_display = _append_signal_follow_candidates(consensus, prices, signal_bias, open_positions=open_positions)
+        if consensus_display.get("candidates"):
+            candidate_rows = rank_trade_candidates(consensus_display, prices, signal_bias)[:3]
+    
+    active_positions = []
+    for position in open_positions:
+        meta = _parse_trade_meta(position)
+        current_price = float(prices.get(position["symbol"]) or 0.0)
+        entry_price = float(position.get("entry_price") or 0.0)
+        pnl_pct = 0.0
+        if current_price > 0 and entry_price > 0:
+            direction = (position.get("direction") or "").upper()
+            if direction == "BUY":
+                pnl_pct = (current_price - entry_price) / entry_price * 100
+            elif direction == "SELL":
+                pnl_pct = (entry_price - current_price) / entry_price * 100
+        active_positions.append({
+            "symbol": position["symbol"],
+            "direction": position["direction"],
+            "entry_price": entry_price,
+            "current_price": current_price,
+            "quantity": float(position.get("quantity") or 0.0),
+            "target": float(meta.get("target") or 0.0),
+            "stop": float(meta.get("stop") or 0.0),
+            "pnl_pct": round(pnl_pct, 2),
+            "support": int(meta.get("support") or 0),
+        })
+
+    recent_decisions = await get_recent_trade_decisions(4)
+    adaptive_params = session_manager.get_adaptive_params()
+
+    return {
+        "enabled": config.get("enabled", 1),
+        "capital": float(config.get("capital", 100.0) or 100.0),
+        "total_trades": stats.get("total", 0),
+        "total_pnl": float(stats.get("total_pnl", 0.0) or 0.0),
+        "open_positions": len(open_positions),
+        "active_positions": active_positions,
+        "tracked_symbols": symbols,
+        "signal_follow_active": use_follow_status,
+        "daily_context_fresh": is_daily_context_fresh(latest_context),
+        "consensus_verdict": cv_status,
+        "recent_contexts": consensus.get("contexts", []),
+        "top_candidates": candidate_rows,
+        "recent_decisions": recent_decisions,
+        "autotrade_feature_on": FEATURE_AUTOTRADE,
+        "binance_signals_enabled": DATA_SOURCE_BINANCE_SIGNALS,
+        "session_id": session_manager.current_session.session_id,
+        "session_start": session_manager.current_session.start_time,
+        "session_pnl": round(session_manager.current_session.total_pnl, 2),
+        "session_trades": len(session_manager.current_session.trades),
+        "past_sessions": len(session_manager.past_sessions),
+        "adaptive_params": adaptive_params,
+    }

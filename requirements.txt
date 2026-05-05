@@ -1,0 +1,34 @@
+# Dialectic Edge v3.0 — зависимости
+# Установка: pip install -r requirements.txt
+
+# Telegram бот
+aiogram==3.13.1
+
+# HTTP клиент (async запросы)
+aiohttp==3.10.5
+
+# CA bundle для HTTPS (Росстат / slim Docker без полного ca-certificates)
+certifi>=2024.0.0
+
+# RSS парсер
+feedparser==6.0.11
+
+# Google Gemini (бесплатный tier)
+google-generativeai==0.8.3
+
+# База данных
+aiosqlite==0.20.0
+
+# Переменные окружения
+python-dotenv==1.0.1
+
+matplotlib
+
+# Redis (опционально: REDIS_URL для дебатов при нескольких воркерах/рестартах)
+redis>=5.0
+
+# v4
+
+# Trading CLI + dashboard (optional)
+pandas>=2.0
+streamlit>=1.28
