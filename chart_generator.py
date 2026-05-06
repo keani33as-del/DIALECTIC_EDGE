@@ -107,36 +107,34 @@ def _keyword_bull_bear_ratio(report: str) -> tuple[float, float]:
 def _extract_synth_verdict(report: str) -> str | None:
     """
     Итог дебатов обычно в хвосте отчёта (Synth / судья).
-    Возвращает 'bear' | 'bull' | 'neutral' или None.
+    Ищем ВЕРДИКТ СУДЬИ или ИТОГОВЫЙ СИНТЕЗ.
     """
-    tail = report[-25000:] if len(report) > 25000 else report
-    t = tail.lower()
-    # Судья / итог (порядок важен: сначала явные метки)
-    patterns_bear = [
-        r"вердикт\s+судьи[^\n]{0,160}медвеж",
-        r"🏆[^\n]{0,200}медвеж",
-        r"итог[^\n]{0,120}медвеж",
-        r"вердикт[^\n]{0,100}🐻",
+    text = (report or "").upper()
+
+    # Проверяем бычий/медвежий уклон
+    patterns = [
+        r"ВЕРДИКТ\s+СУДЬИ[^\n]*?[:：]\s*\*?БЫЧИЙ(?:\s*\([^)]+\))?\*?",     # БЫЧИЙ
+        r"ВЕРДИКТ\s+СУДЬИ[^\n]*?[:：]\s*\*?МЕДВЕЖИЙ(?:\s*\([^)]+\))?\*?",  # МЕДВЕЖИЙ
+        r"ВЕРДИКТ\s+СУДЬИ[^\n]*?[:：]\s*\*?НЕЙТРАЛЬНЫЙ\s*\([^)]+\)\*?",    # НЕЙТРАЛЬНЫЙ (с уклоном...)
+        r"ВЕРДИКТ\s+СУДЬИ[^\n]*?[:：]\s*\*?НЕЙТРАЛЬНЫЙ\*?",               # НЕЙТРАЛЬНЫЙ
+        r"ИТОГОВЫЙ\s+СИНТЕЗ[^\n]*?[:：]\s*\*?БЫЧИЙ",                       # ИТОГОВЫЙ СИНТЕЗ БЫЧИЙ
+        r"ИТОГОВЫЙ\s+СИНТЕЗ[^\n]*?[:：]\s*\*?МЕДВЕЖИЙ",                   # ИТОГОВЫЙ СИНТЕЗ МЕДВЕЖИЙ
+        r"ИТОГОВЫЙ\s+СИНТЕЗ[^\n]*?[:：]\s*\*?НЕЙТРАЛЬНЫЙ",                # ИТОГОВЫЙ СИНТЕЗ НЕЙТРАЛЬНЫЙ
+        r"ВЕРДИКТ[^\n]*?БЫЧИЙ",
+        r"ВЕРДИКТ[^\n]*?МЕДВЕЖИЙ",
     ]
-    patterns_bull = [
-        r"вердикт\s+судьи[^\n]{0,160}быч",
-        r"🏆[^\n]{0,200}быч",
-        r"итог[^\n]{0,120}быч",
-        r"вердикт[^\n]{0,100}🐂",
-    ]
-    patterns_neutral = [
-        r"вердикт\s+судьи[^\n]{0,160}нейтрал",
-        r"🏆[^\n]{0,200}нейтрал",
-    ]
-    for p in patterns_bear:
-        if re.search(p, t, re.IGNORECASE | re.DOTALL):
-            return "bear"
-    for p in patterns_bull:
-        if re.search(p, t, re.IGNORECASE | re.DOTALL):
-            return "bull"
-    for p in patterns_neutral:
-        if re.search(p, t, re.IGNORECASE | re.DOTALL):
-            return "neutral"
+
+    for pat in patterns:
+        m = re.search(pat, text)
+        if m:
+            matched = m.group(0)
+            if "БЫЧИЙ" in matched:
+                return "bull"
+            elif "МЕДВЕЖИЙ" in matched:
+                return "bear"
+            elif "НЕЙТРАЛЬНЫЙ" in matched:
+                return "neutral"
+
     return None
 
 
@@ -162,17 +160,30 @@ def _parse_bull_bear_score(report: str, prices: dict | None = None) -> tuple[flo
     """
     Полоса «баланс аргументов»: не дословный подсчёт слов по всему логу дебатов,
     а опора на итоговый вердикт + корректировка по Fear & Greed (если есть).
+    
+    Поддерживает уклоны: "НЕЙТРАЛЬНЫЙ (с уклоном в бычий)" → bull=55%, bear=45%
     """
     kw_bull, kw_bear = _keyword_bull_bear_ratio(report)
     verdict = _extract_synth_verdict(report)
     fng = _fear_greed_value(prices)
 
-    if verdict == "bear":
+    # Проверяем уклоны в тексте
+    text = (report or "").upper()
+    has_bull_bias = "УКЛОН В БЫЧИЙ" in text or "УКЛОН В БЫЧЬЮ" in text or "БЫЧИЙ УКЛОН" in text
+    has_bear_bias = "УКЛОН В МЕДВЕЖИЙ" in text or "УКЛОН В МЕДВЕЖЬЮ" in text or "МЕДВЕЖИЙ УКЛОН" in text
+
+    if verdict == "bear" and not has_bull_bias:
         bull, bear = 36.0, 64.0
-    elif verdict == "bull":
+    elif verdict == "bull" and not has_bear_bias:
         bull, bear = 64.0, 36.0
-    elif verdict == "neutral":
-        bull, bear = 48.0, 52.0
+    elif verdict == "neutral" or verdict is None:
+        # Учитываем уклоны
+        if has_bull_bias:
+            bull, bear = 55.0, 45.0
+        elif has_bear_bias:
+            bull, bear = 45.0, 55.0
+        else:
+            bull, bear = 48.0, 52.0
     else:
         bull, bear = kw_bull, kw_bear
 
