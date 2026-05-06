@@ -101,14 +101,12 @@ from refactor.handlers import (
 )
 
 # Phase 4 Provider Imports — AI, Cache, Database, Market Data, News, Storage
+# ВАЖНО: build_short_report, parse_report_parts, extract_signal_pct_and_stars,
+# hydrate_debate_from_report, main_report_keyboard ОПРЕДЕЛЕНЫ ЛОКАЛЬНО НИЖЕ (после импортов).
+# Импорты из utils.py НЕ используются т.к. локальные определения перекрывают их.
 from refactor.handlers.utils import (
-    build_short_report,
     clean_markdown,
     debate_plain_text,
-    extract_signal_pct_and_stars,
-    hydrate_debate_from_report,
-    main_report_keyboard,
-    parse_report_parts,
     split_message,
     strip_digest_summary_text,
 )
@@ -427,28 +425,12 @@ def extract_symbols_from_report(report: str, prices: dict) -> tuple[dict, dict, 
 def build_short_report(parts: dict, stars: str, pct: int) -> list:
     """
     Возвращает СПИСОК сообщений для отправки.
-    ПЕРВОЕ сообщение — короткое (вердикт + торговый план + простыми словами + эффекты 2-го порядка).
+    ПЕРВОЕ сообщение — полное (вердикт + торговый план + простыми словами + эффекты 2-го порядка).
     Полные дебаты — в .txt файле.
     """
     now = datetime.now().strftime("%d.%m.%Y %H:%M")
     full = parts.get("full", "")
-    digest_context = build_digest_context(full)
-    header_msg = format_digest_telegram_summary(
-        digest_context,
-        stars=stars,
-        pct=pct,
-        timestamp=now,
-    )
-    messages = [header_msg]
-    synth_start_idx = full.find("рџЋЇ РЎР¦Р•РќРђР РР" if "рџЋЇ РЎР¦Р•РќРђР РР" in full else "РЎР¦Р•РќРђР РР")
-    if synth_start_idx == -1:
-        synth_start_idx = full.find("рџЋЇ Р‘РђР—РћР’Р«Р™" if "рџЋЇ Р‘РђР—РћР’Р«Р™" in full else "Р‘РђР—РћР’Р«Р™")
-    if synth_start_idx != -1:
-        scenarios = full[synth_start_idx:synth_start_idx + 900]
-        if scenarios.strip():
-            messages.append(scenarios.strip()[:2600])
-    return messages
-
+    
     # ─── Парсим вердикт и торговый план ───
     verdict = extract_verdict_from_report(full) or "NEUTRAL"
     verdict_emoji = {"BUY": "🟢", "SELL": "🔴", "NEUTRAL": "⚪️"}.get(verdict, "⚪️")
@@ -457,9 +439,9 @@ def build_short_report(parts: dict, stars: str, pct: int) -> list:
     # Парсим торговые планы
     entries, stop_losses, targets, timeframes = extract_symbols_from_report(full, {})
 
-    # ─── Краткое первое сообщение ───
+    # ─── Собираем полное сообщение ───
     lines = [
-        f"📊 DIALECTIC EDGE — ЕЖЕДНЕВНЫЙ ДАЙДЖЕСТ",
+        f"📊 *DIALECTIC EDGE — ЕЖЕДНЕВНЫЙ ДАЙДЖЕСТ*",
         f"🕐 {now}",
         "",
         f"🎯 *ВЕРДИКТ:* {verdict_emoji} *{verdict_text}*",
@@ -469,33 +451,62 @@ def build_short_report(parts: dict, stars: str, pct: int) -> list:
         "",
     ]
 
-    # Добавляем торговые планы если есть
-    if entries:
-        lines.append("📋 *ТОРГОВЫЙ ПЛАН:*")
-        for sym in sorted(entries.keys())[:5]:
-            entry = entries.get(sym, 0)
-            target = targets.get(sym, 0)
-            stop = stop_losses.get(sym, 0)
-            tf = timeframes.get(sym, "—")
-            if entry and target and stop:
-                risk = abs(entry - stop) / entry * 100
-                reward = abs(target - entry) / entry * 100
-                rr = reward / risk if risk > 0 else 0
-                lines.append(f"• {sym}: ${entry:,.0f} → ${target:,.0f} (R/R 1:{rr:.1f})")
-                lines.append(f"  Стоп: ${stop:,.0f} | {tf}")
-        lines.append("")
-
+    # ─── Парсим context для плана и причин ───
+    digest_context = build_digest_context(full)
+    verdict_reason = digest_context.get("verdict_reason", "")
+    plans = digest_context.get("plans", [])
+    key_trigger = digest_context.get("key_trigger", "")
+    monitoring_level = digest_context.get("monitoring_level", "")
+    monitoring_points = digest_context.get("monitoring_points", [])
+    
+    # Почему
+    if verdict_reason:
+        lines.extend([f"🧠 *Почему:* {verdict_reason}", ""])
+    
+    # Торговый план
+    lines.append("📋 *ТОРГОВЫЙ ПЛАН:*")
+    if plans:
+        for plan in plans[:5]:
+            direction = plan.get("direction", "")
+            symbol = plan.get("symbol") or plan.get("label", "Актив")
+            entry = plan.get("entry")
+            target = plan.get("target")
+            stop = plan.get("stop")
+            horizon = plan.get("horizon", "")
+            
+            chunks = [f"• *{symbol}* {direction}"]
+            if entry:
+                chunks.append(f"вход ${entry:,.0f}")
+            if target:
+                chunks.append(f"цель ${target:,.0f}")
+            if stop:
+                chunks.append(f"стоп ${stop:,.0f}")
+            if horizon:
+                chunks.append(f"горизонт {horizon}")
+            lines.append(" ".join(chunks))
+    elif key_trigger:
+        lines.append(f"⏳ {key_trigger}")
+        if monitoring_level:
+            lines.append(f"👀 Уровень мониторинга: {monitoring_level}")
+        if monitoring_points:
+            lines.append("")
+            for point in monitoring_points[:3]:
+                lines.append(f"• {point}")
+    else:
+        lines.append("⏳ Ждём подтверждения по триггерам")
+    
+    lines.append("")
+    
     # ─── ПРОСТЫМИ СЛОВАМИ ───
-    simple_block_start = full.find("🗣 ПРОСТЫМИ СЛОВАМИ" if "🗣 ПРОСТЫМИ СЛОВАМИ" in full else "ПРОСТЫМИ СЛОВАМИ")
+    simple_block_start = full.find("ПРОСТЫМИ СЛОВАМИ" if "ПРОСТЫМИ СЛОВАМИ" in full else "💬")
     if simple_block_start == -1:
-        simple_block_start = full.find("───\n🗣" if "───\n🗣" in full else "🗣")
+        simple_block_start = full.find("───\n💬" if "───\n💬" in full else "💬")
     if simple_block_start != -1:
-        simple_block = full[simple_block_start:simple_block_start+500]
-        # Extract just the summary text
+        simple_block = full[simple_block_start:simple_block_start+600]
         simple_lines = []
         for line in simple_block.split("\n"):
             if len(line.strip()) > 10 and len(line.strip()) < 200:
-                if not line.startswith("─") and not line.startswith("🗣"):
+                if not line.startswith("─") and not line.startswith("💬"):
                     simple_lines.append(line.strip())
             if len(simple_lines) >= 3:
                 break
@@ -513,16 +524,16 @@ def build_short_report(parts: dict, stars: str, pct: int) -> list:
         for line in effects_block.split("\n"):
             if "→" in line and len(line.strip()) < 150:
                 effect_lines.append(line.strip())
-            if len(effect_lines) >= 4:
+            if len(effect_lines) >= 3:
                 break
         if effect_lines:
             lines.append("🔗 *ЭФФЕКТЫ 2-ГО ПОРЯДКА:*")
-            for el in effect_lines[:4]:
+            for el in effect_lines[:3]:
                 lines.append(f"▫️ {el}")
             lines.append("")
 
     # ─── РЕЖИМ РЫНКА ───
-    for marker in ["📡 РЕЖИМ РЫНКА:", "РЕЖИМ РЫНКА:", "VIX"]:
+    for marker in ["📡 РЕЖИМ РЫНКА:", "РЕЖИМ РЫНКА:"]:
         idx = full.find(marker)
         if idx != -1:
             mode_section = full[idx:idx+300]
@@ -530,7 +541,7 @@ def build_short_report(parts: dict, stars: str, pct: int) -> list:
             if mode_lines:
                 lines.append("📈 *РЕЖИМ РЫНКА:*")
                 for ml in mode_lines:
-                    if "VIX" in ml or "Fear" in ml or "Risk" in ml:
+                    if any(w in ml for w in ["VIX", "Fear", "Risk", "SPX", "BTC"]):
                         lines.append(f"▫️ {ml}")
             break
 
@@ -538,18 +549,31 @@ def build_short_report(parts: dict, stars: str, pct: int) -> list:
     lines.append("")
     lines.append("📎 Полные дебаты — в файле ниже")
 
-    header_msg = "\n".join(lines)
-    messages = [header_msg]
-
-    # ─── Второе сообщение — сценарии ───
-    synth_start_idx = full.find("🎯 СЦЕНАРИИ" if "🎯 СЦЕНАРИИ" in full else "СЦЕНАРИИ")
+    messages = ["\n".join(lines)]
+    
+    # ─── Второе сообщение — Synth секция (вердикт + план) ───
+    # Ищем секцию Synth начиная с "⚖️"
+    synth_markers = ["⚖️ *ВЕРДИКТ И ТОРГОВЫЙ ПЛАН*", "⚖️ ВЕРДИКТ И ТОРГОВЫЙ ПЛАН", 
+                     "⚖️ *ИТОГОВЫЙ СИНТЕЗ*", "🏆 ВЕРДИКТ"]
+    
+    synth_start_idx = -1
+    for marker in synth_markers:
+        synth_start_idx = full.find(marker)
+        if synth_start_idx != -1:
+            break
+    
     if synth_start_idx == -1:
-        synth_start_idx = full.find("🎯 БАЗОВЫЙ" if "🎯 БАЗОВЫЙ" in full else "БАЗОВЫЙ")
+        # Fallback на поиск любой секции Synth
+        for marker in ["ПОТОМУ ЧТО", "ИТОГОВЫЙ", "СИНТЕЗ"]:
+            synth_start_idx = full.find(marker)
+            if synth_start_idx != -1:
+                break
     
     if synth_start_idx != -1:
-        scenarios = full[synth_start_idx:synth_start_idx+600]
-        if scenarios.strip():
-            messages.append(scenarios.strip()[:2000])
+        # Берём до 3500 символов (второе сообщение в Telegram)
+        synth_section = full[synth_start_idx:synth_start_idx + 3500]
+        if synth_section.strip():
+            messages.append(synth_section.strip())
 
     return messages
 
