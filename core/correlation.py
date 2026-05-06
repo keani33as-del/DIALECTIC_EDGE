@@ -7,6 +7,7 @@ correlation.py — Матрица корреляций активов.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Dict, List, Optional
 

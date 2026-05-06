@@ -71,7 +71,7 @@ async def fetch_bybit_long_short_ratio(symbols: list[str] = ["BTCUSDT", "ETHUSDT
             params = {
                 "category": "linear",
                 "symbol": symbol,
-                "interval": "15",  # 15 минут
+                "interval": "15min",  # 15 минут
                 "limit": 1
             }
             

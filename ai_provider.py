@@ -32,7 +32,9 @@ MISTRAL_MODEL      = os.getenv("MISTRAL_MODEL", "mistral-small-latest")
 MISTRAL_URL        = "https://api.mistral.ai/v1/chat/completions"
 
 OPENROUTER_API_KEY   = os.getenv("OPENROUTER_API_KEY", "")
-OPENROUTER_API_KEY_2 = os.getenv("OPENROUTER_API_KEY_2", "")  # резервный OpenRouter
+OPENROUTER_API_KEY_2 = os.getenv("OPENROUTER_API_KEY_2", "")
+OPENROUTER_API_KEY_3 = os.getenv("OPENROUTER_API_KEY_3", "")  # резервный OpenRouter #3
+OPENROUTER_API_KEY_4 = os.getenv("OPENROUTER_API_KEY_4", "")  # резервный OpenRouter #4
 OPENROUTER_URL       = "https://openrouter.ai/api/v1/chat/completions"
 
 TOGETHER_API_KEY   = os.getenv("TOGETHER_API_KEY", "")
@@ -91,7 +93,7 @@ def _can_use_primary(name: str) -> bool:
     if name == "groq":
         return bool(GROQ_API_KEY or GROQ_API_KEY_2 or GROQ_API_KEY_3)
     if name == "openrouter":
-        return bool(OPENROUTER_API_KEY or OPENROUTER_API_KEY_2)
+        return bool(OPENROUTER_API_KEY or OPENROUTER_API_KEY_2 or OPENROUTER_API_KEY_3 or OPENROUTER_API_KEY_4)
     if name == "together":
         return bool(TOGETHER_API_KEY or TOGETHER_API_KEY_2)
     if name == "gemini":
@@ -158,12 +160,14 @@ def _resolve_agent_models() -> dict:
              "bear": {"provider": "gemini", "model": GEMINI_MODEL},
              "synth": {"provider": "gemini", "model": GEMINI_MODEL}}
     elif want == "mixed":
+        # Лучшие бесплатные модели для каждой роли:
         bull_p = "groq"       if _can_use_primary("groq")       else "cerebras" if _can_use_primary("cerebras") else "mistral"
         bear_p = "groq"       if _can_use_primary("groq")       else "cerebras" if _can_use_primary("cerebras") else "mistral"
         ver_p  = "cerebras"   if _can_use_primary("cerebras")   else "openrouter" if _can_use_primary("openrouter") else "groq"
-        syn_p  = "mistral"    if _can_use_primary("mistral")    else "groq" if _can_use_primary("groq") else "cerebras"
+        # Synth — самая важная роль, используем Gemini 2.5 Pro через OpenRouter!
+        syn_p  = "openrouter" if _can_use_primary("openrouter") else "mistral" if _can_use_primary("mistral") else "groq"
     
-        def _model_for(p):
+        def _model_for(p, agent_key=None):
             if p == "cerebras":
                 return CEREBRAS_MODEL
             if p == "groq":
@@ -171,16 +175,19 @@ def _resolve_agent_models() -> dict:
             if p == "together":
                 return TOGETHER_MODEL
             if p == "openrouter":
+                # Для Synth используем Gemini 2.5 Pro — самая мощная!
+                if agent_key == "synth":
+                    return "google/gemini-2.5-pro"
                 return OPENROUTER_MODEL
             if p == "mistral":
                 return mm
             return GROQ_MODEL
     
         m = {
-            "bull":     {"provider": bull_p, "model": _model_for(bull_p)},
-            "bear":     {"provider": bear_p, "model": _model_for(bear_p)},
-            "verifier": {"provider": ver_p,  "model": _model_for(ver_p)},
-            "synth":    {"provider": syn_p,  "model": syn_m if syn_p == "mistral" else _model_for(syn_p)},
+            "bull":     {"provider": bull_p, "model": _model_for(bull_p, "bull")},
+            "bear":     {"provider": bear_p, "model": _model_for(bear_p, "bear")},
+            "verifier": {"provider": ver_p,  "model": _model_for(ver_p, "verifier")},
+            "synth":    {"provider": syn_p,  "model": _model_for(syn_p, "synth")},
         }
     else:
         m = {"bull": {"provider": "mistral", "model": mm},
@@ -380,12 +387,16 @@ async def _call_openrouter_model(
     model: str,
     agent_key: str = None,
 ) -> str:
-    """OpenRouter: KEY_1 → KEY_2 при 429/402."""
+    """OpenRouter: KEY_1 → KEY_2 → KEY_3 → KEY_4 при 429/402."""
     keys_try = []
     if OPENROUTER_API_KEY:
         keys_try.append(("OpenRouter", OPENROUTER_API_KEY))
     if OPENROUTER_API_KEY_2:
         keys_try.append(("OpenRouter#2", OPENROUTER_API_KEY_2))
+    if OPENROUTER_API_KEY_3:
+        keys_try.append(("OpenRouter#3", OPENROUTER_API_KEY_3))
+    if OPENROUTER_API_KEY_4:
+        keys_try.append(("OpenRouter#4", OPENROUTER_API_KEY_4))
     if not keys_try:
         raise ValueError("Нет OPENROUTER_API_KEY")
     last_err = None
@@ -426,6 +437,31 @@ async def _call_openrouter_gemma(prompt: str, system: str, temperature: float,
         "google/gemma-3-27b-it:free",
         agent_key,
     )
+
+
+async def _call_openrouter_gemini(prompt: str, system: str, temperature: float,
+                                  agent_key: str = None) -> str:
+    """Gemini через OpenRouter — используем 2.5 Pro для Synth, 2.0 Flash для остальных."""
+    # 2.5 Pro для Synth (самая мощная), 2.0 Flash для остальных
+    model = "google/gemini-2.5-pro" if agent_key == "synth" else "google/gemini-2.0-flash-001"
+    
+    # Для Gemini Pro через OpenRouter ограничиваем токены (бесплатный лимит ~3300)
+    original_max = _AGENT_MAX_TOKENS.get(agent_key, MAX_TOKENS_PER_AGENT)
+    if agent_key == "synth" and original_max > 3000:
+        # Временно меняем лимит для этого вызова
+        _AGENT_MAX_TOKENS["synth"] = 3000
+    
+    try:
+        result = await _call_openrouter_model(
+            prompt, system, temperature,
+            model,
+            agent_key,
+        )
+        return result
+    finally:
+        # Восстанавливаем оригинальный лимит
+        if agent_key == "synth":
+            _AGENT_MAX_TOKENS["synth"] = original_max
 
 
 async def _call_gemini(
@@ -539,9 +575,15 @@ async def _call_for_agent(agent_key: str, prompt: str, system: str, temperature:
             elif provider == "groq":
                 result = await _call_groq(prompt, system, temperature, model, agent_key=agent_key)
             elif provider == "openrouter":
-                result = await _call_openrouter_model(
-                    prompt, system, temperature, model, agent_key=agent_key
-                )
+                # Если модель Gemini — используем специализированную функцию
+                if model and "gemini" in model.lower():
+                    result = await _call_openrouter_gemini(
+                        prompt, system, temperature, agent_key=agent_key
+                    )
+                else:
+                    result = await _call_openrouter_model(
+                        prompt, system, temperature, model, agent_key=agent_key
+                    )
             elif provider == "together":
                 result = await _call_together(
                     prompt, system, temperature, model, agent_key=agent_key
@@ -605,11 +647,14 @@ async def _call_best_available(
         providers.append(("Mistral Small",
             lambda p, s, t: _call_mistral_throttled(p, s, t, agent_key=agent_name)))
 
-    if "openrouter" not in skip and (OPENROUTER_API_KEY or OPENROUTER_API_KEY_2):
+    if "openrouter" not in skip and (OPENROUTER_API_KEY or OPENROUTER_API_KEY_2 or OPENROUTER_API_KEY_3 or OPENROUTER_API_KEY_4):
         providers.append(("OpenRouter/Llama",
             lambda p, s, t: _call_openrouter_llama(p, s, t, agent_key=agent_name)))
         providers.append(("OpenRouter/Gemma",
             lambda p, s, t: _call_openrouter_gemma(p, s, t, agent_key=agent_name)))
+        # Gemini через OpenRouter — лучше для Synth!
+        providers.append(("OpenRouter/Gemini",
+            lambda p, s, t: _call_openrouter_gemini(p, s, t, agent_key=agent_name)))
 
     if "together" not in skip and (TOGETHER_API_KEY or TOGETHER_API_KEY_2):
         providers.append(("Together/Llama",
