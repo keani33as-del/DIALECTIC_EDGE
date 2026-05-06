@@ -422,10 +422,10 @@ def format_digest_telegram_summary(
     verdict_emoji = context.get("verdict_emoji", VERDICT_EMOJIS["NEUTRAL"])
 
     lines = [
-        "📊 DIALECTIC EDGE — ЕЖЕДНЕВНЫЙ ДАЙДЖЕСТ",
+        "📊 *DIALECTIC EDGE — ЕЖЕДНЕВНЫЙ ДАЙДЖЕСТ*",
         f"🕒 {timestamp}",
         "",
-        f"🎯 *Вердикт:* {verdict_emoji} *{verdict_label}*",
+        f"🎯 *ВЕРДИКТ:* {verdict_emoji} *{verdict_label}*",
         f"📊 Сигнал: {stars} ({pct}%)",
     ]
 
@@ -433,25 +433,39 @@ def format_digest_telegram_summary(
     if reason:
         lines.extend(["", f"🧠 *Почему:* {reason}"])
 
+    # Торговый план
     plans = context.get("plans") or []
     lines.append("")
-    lines.append("📋 *Торговый план:*")
+    lines.append("📋 *ТОРГОВЫЙ ПЛАН:*")
+    
     if plans:
         for plan in plans[:max_plans]:
             lines.append(f"• {_plan_line(plan)}")
     else:
-        lines.append("• Явной сделки нет, ждём подтверждения по триггерам ниже.")
+        # Если планов нет — показываем точки наблюдения и ключевые уровни
+        key_trigger = context.get("key_trigger")
+        monitoring_level = context.get("monitoring_level")
+        monitoring_points = context.get("monitoring_points") or []
+        
+        if key_trigger:
+            lines.append(f"⏳ {key_trigger}")
+        
+        if monitoring_level:
+            lines.append(f"👀 Уровень мониторинга: {monitoring_level}")
+        
+        if monitoring_points:
+            lines.append("")
+            lines.append("*Точки наблюдения:*")
+            for point in monitoring_points[:3]:
+                lines.append(f"• {point}")
+        
+        if not plans and not key_trigger and not monitoring_level and not monitoring_points:
+            lines.append("⏳ Ждём подтверждения по триггерам")
 
-    monitoring_points = context.get("monitoring_points") or []
-    if monitoring_points:
-        lines.append("")
-        lines.append("👀 *Точки наблюдения:*")
-        for point in monitoring_points[:3]:
-            lines.append(f"• {point}")
-
+    # Макро данные из plain_language если нет планов
     plain_language = context.get("plain_language")
     if plain_language:
-        lines.extend(["", f"💬 *Простыми словами:* {plain_language}"])
+        lines.extend(["", f"💬 *Простыми словами:* {plain_language[:300]}"])
 
-    lines.extend(["", "📜 Полный raw-ответ модели и полные дебаты доступны кнопками ниже."])
+    lines.extend(["", "📎 Полный анализ + дебаты — в файлах ниже."])
     return "\n".join(lines)
