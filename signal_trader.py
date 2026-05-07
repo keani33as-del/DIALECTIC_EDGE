@@ -530,6 +530,7 @@ async def fetch_current_prices(symbols: list[str]) -> dict:
         if last_price > 0:
             prices[symbol] = last_price
 
+    missing = [s for s in symbols if s not in prices]
     if not missing:
         return prices
     else:
