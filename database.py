@@ -433,6 +433,7 @@ async def import_forecasts_from_markdown():
 
     if predictions:
         async with aiosqlite.connect(DB_PATH) as db:
+            # DATA MIGRATION: clear old predictions before re-import from FORECASTS.md
             await db.execute("DELETE FROM predictions WHERE created_at LIKE '2026-03-%'")
             await db.commit()
             for p in predictions:

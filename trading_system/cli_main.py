@@ -47,7 +47,7 @@ async def _analyze_one(
         ttl_seconds=ttl,
     )
     feats = build_features(candles)
-    repo = os.getenv("GITHUB_REPO", "borzenkovandrej07-alt/DIALECTIC_EDg")
+    repo = os.getenv("GITHUB_REPO", "ANAEHY/dialectic_edge")
     bundle = await fetch_markets_bundle(repo)
 
     last = feats.get("last_close") or 0.0

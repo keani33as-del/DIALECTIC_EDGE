@@ -28,6 +28,10 @@ BINANCE_SPOT_URL = "https://api.binance.com"
 BYBIT_URL = "https://api.bybit.com"
 COINGECKO_URL = "https://api.coingecko.com/api/v3"
 
+# GitHub URLs
+GITHUB_REPO = os.getenv("GITHUB_REPO", "ANAEHY/dialectic_edge")
+DIGEST_CACHE_URL = "https://raw.githubusercontent.com/{repo}/main/DIGEST_CACHE.md"
+
 # CoinGecko ID для криптовалют
 COINGECKO_IDS = {
     "BTCUSDT": "bitcoin",
@@ -431,7 +435,7 @@ async def fetch_markets_bundle(github_repo: str | None = None) -> dict:
 
     Используется в /markets, рассылке подписчикам и автотрейдере (тот же контур, что у UI).
     """
-    repo = github_repo or os.getenv("GITHUB_REPO", "borzenkovandrej07-alt/DIALECTIC_EDg")
+    repo = github_repo or os.getenv("GITHUB_REPO", "ANAEHY/dialectic_edge")
     binance_data = await fetch_binance_signals()
     verdict = await fetch_verdict(repo)
     sigs = analyze_signals(binance_data, verdict)

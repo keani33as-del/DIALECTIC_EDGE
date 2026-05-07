@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 BINANCE_URL = "https://api.binance.com/api/v3"
 FNG_URL = "https://api.alternative.me/fng/"
 
-GITHUB_REPO = os.getenv("GITHUB_REPO", "borzenkovandrej07-alt/DIALECTIC_EDg")
+GITHUB_REPO = os.getenv("GITHUB_REPO", "ANAEHY/dialectic_edge")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
 GITHUB_PRICES_URL = f"https://api.github.com/repos/{GITHUB_REPO}/contents/prices.json"
 DIGEST_CACHE_URL = f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/DIGEST_CACHE.md"

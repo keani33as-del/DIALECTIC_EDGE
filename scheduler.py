@@ -54,7 +54,7 @@ class Scheduler:
         
         if ALERT_SYSTEM_ENABLED:
             try:
-                github_repo = os.getenv("GITHUB_REPO", "borzenkovandrej07-alt/DIALECTIC_EDg")
+                github_repo = os.getenv("GITHUB_REPO", "ANAEHY/dialectic_edge")
                 self._alert_system = AlertSystem(self.bot, github_repo)
                 logger.info("✅ Alert system инициализирован")
             except Exception as e:
@@ -62,7 +62,7 @@ class Scheduler:
         
         if SIGNALS_SYSTEM_ENABLED:
             try:
-                github_repo = os.getenv("GITHUB_REPO", "borzenkovandrej07-alt/DIALECTIC_EDg")
+                github_repo = os.getenv("GITHUB_REPO", "ANAEHY/dialectic_edge")
                 self._signals_system = SignalsSystem(self.bot, github_repo)
                 logger.info("✅ Signals system инициализирован")
             except Exception as e:

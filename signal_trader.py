@@ -320,7 +320,7 @@ async def _fetch_crypto_signal_bias(
                 vr = markets_bundle.get("verdict")
             if vr is None or not vr.get("verdict"):
                 try:
-                    repo = os.getenv("GITHUB_REPO", "borzenkovandrej07-alt/DIALECTIC_EDg")
+                    repo = os.getenv("GITHUB_REPO", "ANAEHY/dialectic_edge")
                     vr = await fetch_verdict(repo)
                 except Exception as e:
                     logger.debug("fetch_verdict for neutral_follow: %s", e)
@@ -1329,7 +1329,7 @@ async def _check_and_trade_locked(bot, admin_ids: list[int]) -> list[dict]:
         symbols |= set(CRYPTO_SIGNAL_SYMBOLS)
 
     from signals import fetch_markets_bundle
-    gh_repo = os.getenv("GITHUB_REPO", "borzenkovandrej07-alt/DIALECTIC_EDg")
+    gh_repo = os.getenv("GITHUB_REPO", "ANAEHY/dialectic_edge")
     markets_bundle = await fetch_markets_bundle(gh_repo)
 
     # ═══ EVENT DEFENSE CHECK ═══

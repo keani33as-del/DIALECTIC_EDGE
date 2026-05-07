@@ -23,7 +23,7 @@ import aiohttp
 
 logger = logging.getLogger(__name__)
 
-CFTC_UA = "Mozilla/5.0 (compatible; DialecticEdge-Bot/1.0; +https://github.com/borzenkovandrej07-alt/DIALECTIC_EDg)"
+CFTC_UA = "Mozilla/5.0 (compatible; DialecticEdge-Bot/1.0; +https://github.com/ANAEHY/dialectic_edge)"
 
 try:
     import certifi

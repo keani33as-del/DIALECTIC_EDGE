@@ -2137,7 +2137,7 @@ async def cmd_markets(message: Message):
     user_id = message.from_user.id
     await upsert_user(user_id, message.from_user.username or "")
     wait_msg = await message.answer("⏳ Загружаю рынки и сигналы...")
-    github_repo = os.getenv("GITHUB_REPO", "borzenkovandrej07-alt/DIALECTIC_EDg")
+    github_repo = os.getenv("GITHUB_REPO", "ANAEHY/dialectic_edge")
     try:
         from signals import build_markets_panel_message
 
@@ -2274,7 +2274,7 @@ async def cb_markets_signals(callback: CallbackQuery):
 
     elif action == "check":
         await callback.answer("📡 Обновляю...")
-        github_repo = os.getenv("GITHUB_REPO", "borzenkovandrej07-alt/DIALECTIC_EDg")
+        github_repo = os.getenv("GITHUB_REPO", "ANAEHY/dialectic_edge")
         try:
             from signals import build_markets_panel_message
 
@@ -2358,7 +2358,7 @@ async def _cmd_trackrecord(message: Message, report_type: str = None, title: str
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(
-                    "https://raw.githubusercontent.com/borzenkovandrej07-alt/DIALECTIC_EDg/main/FORECASTS.md",
+                    "https://raw.githubusercontent.com/ANAEHY/dialectic_edge/main/FORECASTS.md",
                     timeout=aiohttp.ClientTimeout(total=10)
                 ) as resp:
                     if resp.status == 200:
