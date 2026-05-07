@@ -229,8 +229,31 @@ def _parse_pipe_plan_line(line: str) -> Optional[dict]:
     return plan
 
 
+def _extract_synth_section(report_text: str) -> str:
+    """Извлечь секцию Synth (от ВЕРДИКТ до дисклеймера)."""
+    clean = _strip_markup(report_text)
+    markers = (
+        "ВЕРДИКТ И ТОРГОВЫЙ ПЛАН",
+        "ИТОГОВЫЙ СИНТЕЗ",
+        "ВЕРДИКТ СУДЬИ",
+    )
+    for marker in markers:
+        idx = clean.upper().find(marker.upper())
+        if idx != -1:
+            end_markers = ("Честно о боте", "🤝 Честно", "⚠️ Не является", "─" * 20)
+            end_idx = len(clean)
+            for em in end_markers:
+                e = clean.lower().find(em.lower(), idx)
+                if e != -1:
+                    end_idx = min(end_idx, e)
+            return clean[idx:end_idx]
+    return ""
+
+
 def _extract_pipe_plans(report_text: str) -> list[dict]:
     plans: list[dict] = []
+    
+    # Сначала парсим | формат (существующий)
     for raw_line in _strip_markup(report_text).splitlines():
         line = raw_line.strip()
         if "|" not in line:
@@ -240,6 +263,99 @@ def _extract_pipe_plans(report_text: str) -> list[dict]:
         plan = _parse_pipe_plan_line(line)
         if plan:
             plans.append(plan)
+    
+    # Потом парсим секцию Synth (блок без |)
+    synth_section = _extract_synth_section(report_text)
+    if not synth_section:
+        return plans
+    
+    current_plan: Optional[dict] = None
+    for raw_line in synth_section.splitlines():
+        line = _clean_line(raw_line)
+        if not line or len(line) < 4:
+            if current_plan and current_plan.get("symbol"):
+                plans.append(current_plan)
+                current_plan = None
+            continue
+        
+        lower = line.lower()
+        
+        # Заголовок плана — актив/символ
+        if lower.startswith("•") or lower.startswith("-") or lower.startswith("btc") or lower.startswith("eth") or lower.startswith("sol") or lower.startswith("cash"):
+            if current_plan and current_plan.get("symbol"):
+                plans.append(current_plan)
+            
+            # Извлекаем символ
+            label = line.lstrip("•- ").strip()
+            direction = "CASH"
+            if any(x in label.upper() for x in ("LONG", "BUY")):
+                direction = "LONG"
+            elif any(x in label.upper() for x in ("SHORT", "SELL", "МЕДВ")):
+                direction = "SHORT"
+            
+            sym_match = _SYMBOL_RE.search(label)
+            sym = sym_match.group(1) if sym_match else label[:12]
+            
+            current_plan = {
+                "label": label,
+                "symbol": sym,
+                "direction": direction,
+                "entry": None,
+                "stop": None,
+                "target": None,
+                "horizon": "",
+                "trigger": "",
+                "rr": "",
+                "size": "",
+            }
+        
+        elif current_plan is not None:
+            # Парсим поля плана
+            lower = line.lower()
+            if any(x in lower for x in ("вход", "entry", "стоп", "stop", "цель", "target", "тейк", "rr", "r/r", "размер", "size", "горизонт", "horizon", "триггер", "trigger")):
+                parts = line.split(":", 1)
+                if len(parts) >= 2:
+                    field = parts[0].lower().strip()
+                    val = parts[1].strip()
+                    price_match = re.search(r"\$?([\d.,KkКк]+)", val)
+                    p = _parse_price(price_match.group(1)) if price_match else None
+                    
+                    if any(x in field for x in ("вход", "entry")):
+                        current_plan["entry"] = p
+                    elif any(x in field for x in ("стоп", "stop")):
+                        current_plan["stop"] = p
+                    elif any(x in field for x in ("цель", "target", "тейк")):
+                        current_plan["target"] = p
+                    elif "rr" in field:
+                        current_plan["rr"] = val
+                    elif "размер" in field or "size" in field:
+                        current_plan["size"] = val
+                    elif "горизонт" in field or "horizon" in field:
+                        current_plan["horizon"] = val
+                    elif "триггер" in field or "trigger" in field:
+                        current_plan["trigger"] = val
+    
+    if current_plan and current_plan.get("symbol"):
+        plans.append(current_plan)
+    
+    # Also extract key trigger from synth section
+    trigger_patterns = [
+        r"ключевой\s+триггер[.:]\s*(.+?)(?:\n|$)",
+        r"триггер\s+(?:l?ong|short)[^.\n]{0,150}",
+        r"пробой\s+\$?[\d.,Kk]+",
+    ]
+    for pattern in trigger_patterns:
+        match = re.search(pattern, synth_section, re.IGNORECASE)
+        if match:
+            trigger_val = _clean_line(match.group(0))
+            # Check if not already in plans trigger
+            for plan in plans:
+                if not plan.get("trigger"):
+                # Only add if looks meaningful
+                    if len(trigger_val) > 10:
+                        plan["trigger"] = trigger_val
+                        break
+    
     return plans
 
 
@@ -358,13 +474,33 @@ def _plan_line(plan: dict) -> str:
     return " | ".join(chunks)
 
 
+def _extract_key_trigger(report_text: str) -> str:
+    """Extract key trigger from report (multiple patterns)."""
+    clean = _strip_markup(report_text)
+    
+    patterns = [
+        r"ключевой\s+триггер[^.\n]{0,200}",
+        r"триггер\s+(?:l?ong|short)[^.\n]{0,200}",
+        r"пробой\s+\$?[\d.,Kk]+[^.\n]{0,100}",
+        r"мониторинг[уа][^\n]{0,150}",
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, clean, re.IGNORECASE)
+        if match:
+            val = _clean_line(match.group(0))
+            if len(val) > 5:
+                return val[:200]
+    return ""
+
+
 def build_digest_context(report_text: str, source_news: str = "") -> dict:
     verdict = extract_verdict(report_text)
     plans = extract_trade_plans(report_text)
     monitoring_points = extract_monitoring_points(report_text)
     verdict_reason = _extract_single_line(report_text, "Потому что")
-    key_trigger = _extract_single_line(report_text, "Ключевой триггер для пересмотра")
-    monitoring_level = _extract_single_line(report_text, "Следующий уровень для мониторинга")
+    key_trigger = _extract_key_trigger(report_text)
+    monitoring_level = ""
     plain_language = extract_plain_language(report_text) or _clean_line(source_news)[:320]
 
     return {

@@ -222,7 +222,7 @@ _AGENT_MAX_TOKENS = {
     "bull":     2500,   # увеличено — 4 возможности Russia Edge не обрезаются
     "bear":     2500,   # увеличено — 4 риска Russia Edge не обрезаются
     "verifier": 1000,
-    "synth":    1500,   # укороченный промпт = нужно меньше токенов (было 8192)
+    "synth":    3500,   # Synth needs room for verdict + trading plan + trigger + reminders
 }
 
 # ── Hallucination tracking per agent ─────────────────────────────────────────
@@ -500,13 +500,7 @@ async def _call_openrouter_gemma(prompt: str, system: str, temperature: float,
 async def _call_openrouter_gemini(prompt: str, system: str, temperature: float,
                                   agent_key: str = None) -> str:
     """Gemini через OpenRouter — используем 2.5 Pro для Synth, 2.0 Flash для остальных."""
-    # 2.5 Pro для Synth (самая мощная), 2.0 Flash для остальных
     model = "google/gemini-2.5-pro" if agent_key == "synth" else "google/gemini-2.0-flash-001"
-    
-    # Укороченный промпт Synth = нужно меньше токенов
-    original_max = _AGENT_MAX_TOKENS.get(agent_key, MAX_TOKENS_PER_AGENT)
-    if agent_key == "synth" and original_max > 1500:
-        _AGENT_MAX_TOKENS["synth"] = 1500
     
     try:
         result = await _call_openrouter_model(
@@ -515,10 +509,6 @@ async def _call_openrouter_gemini(prompt: str, system: str, temperature: float,
             agent_key,
         )
         return result
-    finally:
-        # Восстанавливаем оригинальный лимит
-        if agent_key == "synth":
-            _AGENT_MAX_TOKENS["synth"] = original_max
 
 
 async def _call_gemini(
