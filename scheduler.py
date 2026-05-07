@@ -14,7 +14,7 @@ scheduler.py — Фоновые задачи по расписанию.
 import asyncio
 import logging
 import os
-from datetime import datetime, date
+from datetime import datetime, date, time, timedelta
 from database import (
     get_daily_subscribers,
     reset_daily_counts,
@@ -132,11 +132,7 @@ class Scheduler:
         """Сбрасывает счётчики запросов в полночь."""
         while self._running:
             now = datetime.now()
-            seconds_to_midnight = (
-                (24 - now.hour - 1) * 3600
-                + (60 - now.minute - 1) * 60
-                + (60 - now.second)
-            )
+            seconds_to_midnight = (datetime.combine(date.today(), time(0)) + timedelta(days=1) - now).total_seconds()
             await asyncio.sleep(seconds_to_midnight)
             try:
                 await reset_daily_counts()

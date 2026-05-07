@@ -97,7 +97,8 @@ class Backtester:
 
         # Parse signal timestamp
         try:
-            signal_ts = datetime.fromisoformat(signal.timestamp.replace("Z", "+00:00")).replace(tzinfo=None)
+            ts_raw = getattr(signal, "timestamp", None) or ""
+            signal_ts = datetime.fromisoformat(ts_raw.replace("Z", "+00:00")).replace(tzinfo=None)
         except Exception:
             signal_ts = datetime.now()
 

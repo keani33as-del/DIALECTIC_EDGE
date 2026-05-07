@@ -38,14 +38,12 @@ def load_prices_from_github() -> dict:
     if not GITHUB_TOKEN:
         return {}
     try:
-        import requests
         resp = requests.get(
             GITHUB_PRICES_URL,
             headers={"Authorization": f"token {GITHUB_TOKEN}"},
             timeout=10
         )
         if resp.status_code == 200:
-            import base64
             content = base64.b64decode(resp.json()["content"]).decode("utf-8")
             return json.loads(content)
     except Exception as e:

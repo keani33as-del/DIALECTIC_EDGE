@@ -530,9 +530,8 @@ async def fetch_current_prices(symbols: list[str]) -> dict:
         if last_price > 0:
             prices[symbol] = last_price
 
-    missing = [symbol for symbol in symbols if symbol not in prices]
     if not missing:
-        pass
+        return prices
     else:
         try:
             from tracker import get_current_price

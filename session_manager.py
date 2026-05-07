@@ -206,9 +206,9 @@ class SessionManager:
                     DEFAULT_PARAMS["neutral_sl_pct"] * (1 - losing_streak * 0.05),
                     0.02,  # Минимум 2%
                 )
-                self._params["quantity_pct"] = max(
-                    DEFAULT_PARAMS["quantity_pct"] * (1 - losing_streak * 0.1),
-                    0.3,  # Минимум 30% от размера
+self._params["quantity_pct"] = max(
+                    DEFAULT_PARAMS["quantity_pct"] * (1 - min(losing_streak, 5) * 0.1),
+                    0.05,
                 )
                 logger.info(
                     f"📉 Адаптация: {losing_streak} убыточных сессий подряд. "

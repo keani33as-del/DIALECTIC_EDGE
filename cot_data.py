@@ -30,7 +30,8 @@ try:
 
     _SSL_CTX = ssl.create_default_context(cafile=certifi.where())
 except Exception:
-    _SSL_CTX = True  # type: ignore
+    import ssl as _ssl_mod
+    _SSL_CTX = _ssl_mod.create_default_context()
 
 
 def _connector():

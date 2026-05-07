@@ -596,8 +596,8 @@ async def get_market_cache() -> tuple[dict, bool]:
         if m:
             val = m.group(1)
             try:
-                cache[field] = float(val) if val.replace("-", "").replace(".", "").isdigit() else val
-            except:
+                cache[field] = float(val)
+            except ValueError:
                 cache[field] = val
 
     # Проверяем freshness по timestamp в content

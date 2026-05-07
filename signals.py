@@ -35,11 +35,7 @@ COINGECKO_IDS = {
     "BNBUSDT": "binancecoin",
     "SOLUSDT": "solana",
 }
-BYBIT_URL = "https://api.bybit.com"
-
-DIGEST_CACHE_URL = "https://raw.githubusercontent.com/{repo}/main/DIGEST_CACHE.md"
-
-# Единый набор фьючерсов для UI /markets и автотрейдера (BTC/ETH/SOL/BNB)
+# CoinGecko ID для UI /markets и автотрейдера (BTC/ETH/SOL/BNB)
 DEFAULT_FUTURES_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT"]
 
 # Пороги для сигналов
