@@ -37,12 +37,14 @@
     └────┬──────────────────────────────────────────────┘
          │
     ┌────▼──────────────────────────────────────────────┐
-    │  agents.py — МУЛЬТИАГЕНТНЫЕ ДЕБАТЫ               │
-    │                                                │
-    │  🐂 Bull Researcher   — ищет бычьи аргументы   │
-    │  🐻 Bear Skeptic       — ищет медвежьи аргументы│
-    │  🔍 Data Verifier     — ловит галлюцинации     │
-    │  ⚖️ Consensus Synth    — итоговый вердикт       │
+│  agents.py — МУЛЬТИАГЕНТНЫЕ ДЕБАТЫ               │
+     │                                                │
+     │  🐂 Bull Researcher   — ищет бычьи аргументы   │
+     │  🐻 Bear Skeptic       — ищет медвежьи аргументы│
+     │  🔍 Data Verifier     — ловит галлюцинации     │
+     │  ⚖️ Consensus Synth    — вердикт (JSON)        │
+     │  ✍️ Speechwriter       — форматирует JSON в    │
+     │                        читаемый план          │
     └────┬──────────────────────────────────────────────┘
          │
     ┌────▼──────────────────────────────────────────────┐
@@ -174,7 +176,7 @@ python main.py
 | `config.py` | — | Загрузка environment variables |
 | `analysis_service.py` | 286 | Оркестратор: собирает данные → запускает дебаты → формирует отчёт |
 | `ai_provider.py` | 765 | Роутер AI-моделей с fallback на 6 провайдеров |
-| `agents.py` | 574 | 4 агента: Bull, Bear, Verifier, Synth + DebateOrchestrator |
+| `agents.py` | 661 | 4 агента + Speechwriter + DebateOrchestrator |
 
 ### Торговля
 
@@ -303,7 +305,8 @@ python main.py
 | **Bull** | `BULL_SYSTEM` | Найти бычьи аргументы с цифрами из данных |
 | **Bear** | `BEAR_SYSTEM` | Найти медвежьи аргументы с цифрами |
 | **Verifier** | `VERIFIER_SYSTEM` | Удалить галлюцинации (статистика без источника) |
-| **Synth** | `SYNTH_SYSTEM` | Итоговый вердикт + торговый план |
+| **Synth** | `SYNTH_SYSTEM` | Итоговый вердикт (compact JSON) + планы |
+| **Speechwriter** | `SPEECHWRITER_SYSTEM` | Превращает JSON в читаемый торговый план |
 
 ---
 
@@ -473,7 +476,8 @@ total_score = macro_score + onchain_score + technical_score + sentiment_score
 Bull Agent → находит бычьи аргументы из данных
 Bear Agent → находит медвежьи аргументы из данных  
 Verifier   → удаляет галлюцинации
-Synth      → итоговый вердикт + торговый план
+Synth      → итоговый вердикт (compact JSON)
+Speechwriter → форматирует JSON в читаемый план
 
 Каждый агент получает:
   1. Рыночные цены (web_search.py)
