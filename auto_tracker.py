@@ -197,35 +197,46 @@ class PriceFetcher:
             "WTI": "CL=F", "CL": "CL=F", "НЕФТ": "CL=F", "НЕФТЬ": "CL=F",
         }
         
-        try:
-            async with aiohttp.ClientSession() as session:
-                if symbol.upper() in binance_map:
-                    url = f"{BINANCE_URL}/ticker/24hr"
-                    async with session.get(url, params={"symbol": binance_map[symbol.upper()]}, timeout=aiohttp.ClientTimeout(total=5)) as resp:
-                        if resp.status == 200:
-                            data = await resp.json()
-                            result = {"price": float(data["lastPrice"]), "change": float(data["priceChangePercent"])}
-                            self.cache[symbol] = result
-                            return result
-                
-                ticker = yahoo_map.get(symbol.upper())
-                if ticker:
-                    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
-                    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-                    async with session.get(url, params={"interval": "1d", "range": "5d"}, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                        if resp.status == 200:
-                            data = await resp.json()
-                            result = data.get("chart", {}).get("result", [])
-                            if result:
-                                meta = result[0].get("meta", {})
-                                price = meta.get("regularMarketPrice", 0)
-                                if price > 0:
-                                    result = {"price": price, "change": meta.get("regularMarketChangePercent", 0)}
-                                    self.cache[symbol] = result
-                                    return result
-        except Exception as e:
-            logger.warning(f"Current price error {symbol}: {e}")
-        
+        retries = 3
+        backoff = 1.0
+        for attempt in range(retries):
+            try:
+                async with aiohttp.ClientSession() as session:
+                    if symbol.upper() in binance_map:
+                        url = f"{BINANCE_URL}/ticker/24hr"
+                        async with session.get(url, params={"symbol": binance_map[symbol.upper()]}, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                            if resp.status == 200:
+                                data = await resp.json()
+                                result = {"price": float(data["lastPrice"]), "change": float(data["priceChangePercent"])}
+                                self.cache[symbol] = result
+                                return result
+                            else:
+                                logger.debug(f"Binance status {resp.status} for {symbol}")
+
+                    ticker = yahoo_map.get(symbol.upper())
+                    if ticker:
+                        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
+                        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+                        async with session.get(url, params={"interval": "1d", "range": "5d"}, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                            if resp.status == 200:
+                                data = await resp.json()
+                                result = data.get("chart", {}).get("result", [])
+                                if result:
+                                    meta = result[0].get("meta", {})
+                                    price = meta.get("regularMarketPrice", 0)
+                                    if price > 0:
+                                        out = {"price": price, "change": meta.get("regularMarketChangePercent", 0)}
+                                        self.cache[symbol] = out
+                                        return out
+                            else:
+                                logger.debug(f"Yahoo status {resp.status} for {symbol}")
+            except Exception as e:
+                logger.debug(f"PriceFetcher current price attempt {attempt+1} error for {symbol}: {e}")
+            if attempt < retries - 1:
+                await asyncio.sleep(backoff)
+                backoff *= 2
+
+        logger.warning(f"Current price fetch failed for {symbol} after {retries} attempts")
         return None
     
     async def get_fear_greed(self, date: str = None) -> Optional[dict]:

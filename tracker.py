@@ -53,28 +53,43 @@ async def get_current_price(asset: str) -> float | None:
     if asset_upper not in ASSET_MAP:
         return None
     asset_type, identifier = ASSET_MAP[asset_upper]
-
-    try:
-        import aiohttp
-        if asset_type == "crypto":
-            url = "https://api.coingecko.com/api/v3/simple/price"
-            params = {"ids": identifier, "vs_currencies": "usd"}
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, params=params,
-                                       timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                    data = await resp.json()
-                    return data.get(identifier, {}).get("usd")
-        else:
-            url = f"https://query1.finance.yahoo.com/v8/finance/chart/{identifier}"
-            headers = {"User-Agent": "Mozilla/5.0"}
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, headers=headers,
-                                       timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                    data = await resp.json()
-                    return data["chart"]["result"][0]["meta"].get("regularMarketPrice")
-    except Exception as e:
-        logger.warning(f"Price fetch error for {asset}: {e}")
-        return None
+    import aiohttp
+    retries = 3
+    backoff = 1.0
+    for attempt in range(retries):
+        try:
+            if asset_type == "crypto":
+                url = "https://api.coingecko.com/api/v3/simple/price"
+                params = {"ids": identifier, "vs_currencies": "usd"}
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(url, params=params,
+                                           timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            return data.get(identifier, {}).get("usd")
+                        else:
+                            logger.debug(f"Coingecko status {resp.status} for {identifier}")
+            else:
+                url = f"https://query1.finance.yahoo.com/v8/finance/chart/{identifier}"
+                headers = {"User-Agent": "Mozilla/5.0"}
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(url, headers=headers,
+                                           timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            try:
+                                return data["chart"]["result"][0]["meta"].get("regularMarketPrice")
+                            except Exception:
+                                logger.debug(f"Yahoo response missing price for {identifier}")
+                        else:
+                            logger.debug(f"Yahoo status {resp.status} for {identifier}")
+        except Exception as e:
+            logger.debug(f"Price fetch attempt {attempt+1} error for {asset}: {e}")
+        if attempt < retries - 1:
+            await asyncio.sleep(backoff)
+            backoff *= 2
+    logger.warning(f"Price fetch failed for {asset} after {retries} attempts")
+    return None
 
 
 # ─── Проверка прогнозов ───────────────────────────────────────────────────────

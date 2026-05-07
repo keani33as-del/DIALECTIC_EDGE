@@ -598,6 +598,26 @@ def _score_candidate(candidate: dict, current_price: float, signal_bias: dict) -
     target = float(candidate.get("target") or 0)
     signal = signal_bias.get(candidate["symbol"], {})
 
+    # Adaptive parameters based on cached regime/volatility
+    sym_cache = _signal_cache.get(candidate["symbol"], {})
+    regime = (sym_cache.get("regime") or "").upper()
+    regime_conf = float(sym_cache.get("regime_confidence") or 0.5)
+    volatility = float(sym_cache.get("volatility_pct") or 0.0)
+    rsi_val = float(sym_cache.get("rsi") or 50.0)
+
+    # ENTRY tolerance adapts to volatility and regime
+    entry_tol = ENTRY_TOLERANCE_PCT
+    try:
+        if volatility > 5.0:
+            factor = min(3.0, 1.0 + (volatility / 5.0))
+            entry_tol = min(0.5, ENTRY_TOLERANCE_PCT * factor)
+        if regime == "SIDEWAYS":
+            entry_tol = entry_tol * 0.6
+        if regime == "HIGH_VOL":
+            entry_tol = entry_tol * 1.5
+    except Exception:
+        entry_tol = ENTRY_TOLERANCE_PCT
+
     proximity_score = 0.0
     blocked_reason = ""
 
@@ -608,7 +628,7 @@ def _score_candidate(candidate: dict, current_price: float, signal_bias: dict) -
                 blocked_reason = "price_below_stop"
             elif target and current_price >= target:
                 blocked_reason = "price_at_target"
-            elif current_price <= entry * (1 + ENTRY_TOLERANCE_PCT):
+            elif current_price <= entry * (1 + entry_tol):
                 proximity_score = max(0.0, 6.0 - abs(delta) * 150)
             else:
                 proximity_score = -6.0
@@ -617,7 +637,7 @@ def _score_candidate(candidate: dict, current_price: float, signal_bias: dict) -
                 blocked_reason = "price_above_stop"
             elif target and current_price <= target:
                 blocked_reason = "price_at_target"
-            elif current_price >= entry * (1 - ENTRY_TOLERANCE_PCT):
+            elif current_price >= entry * (1 - entry_tol):
                 proximity_score = max(0.0, 6.0 - abs(delta) * 150)
             else:
                 proximity_score = -6.0
@@ -765,8 +785,26 @@ def _score_candidate(candidate: dict, current_price: float, signal_bias: dict) -
                 regime_score += 2.0  # Перекупленность — хороший вход для шорта
 
     total_score = float(candidate.get("digest_score") or 0.0) + proximity_score + signal_score + trend_score + regime_score
-    # Use lower threshold for signal-follow mode
-    threshold = SIGNAL_FOLLOW_SCORE_THRESHOLD if candidate.get("signal_follow_only") else OPEN_SCORE_THRESHOLD
+
+    # Adaptive OPEN threshold: easier in confirmed uptrends, stricter in sideways/high vol
+    base_threshold = SIGNAL_FOLLOW_SCORE_THRESHOLD if candidate.get("signal_follow_only") else OPEN_SCORE_THRESHOLD
+    threshold = base_threshold
+    try:
+        if not candidate.get("signal_follow_only"):
+            if regime == "UPTREND":
+                threshold = max(8.0, base_threshold - 2.0 * regime_conf)
+            elif regime == "DOWNTREND":
+                threshold = base_threshold + 2.0 * regime_conf
+            elif regime == "SIDEWAYS":
+                threshold = base_threshold + 3.0 * regime_conf
+            elif regime == "HIGH_VOL":
+                threshold = base_threshold + 4.0 * regime_conf
+            # Volatility penalty
+            if volatility > 10.0:
+                threshold += min(6.0, (volatility - 10.0) * 0.5)
+    except Exception:
+        threshold = base_threshold
+
     ready = not blocked_reason and total_score >= threshold
 
     scored = dict(candidate)
@@ -1506,6 +1544,30 @@ async def _check_and_trade_locked(bot, admin_ids: list[int]) -> list[dict]:
             "whale_sentiment": whale_sent,
             "defense_mode": defense_active,
         }, ensure_ascii=False)
+
+        # Safety: убедимся, что размер позиции осмысленный (> 0). Логируем и пропускаем иначе.
+        if not quantity_pct or quantity_pct <= 0 or quantity_pct < 1e-4:
+            logger.info(f"⏭ {sym}: computed quantity_pct={quantity_pct:.6f} too small — пропускаем открытие")
+            try:
+                await append_trade_decision_log("autotrade_skip", {
+                    "symbol": sym,
+                    "reason": "quantity_pct_too_small",
+                    "quantity_pct": quantity_pct,
+                    "candidate_score": candidate.get("total_score"),
+                }, None)
+            except Exception as _e:
+                logger.debug("append_trade_decision_log error: %s", _e)
+            continue
+
+        # Volatility adjustment: reduce size on high volatility (simple safeguard)
+        try:
+            vol_pct = float(candidate.get("volatility_pct") or 0.0)
+            if vol_pct > 5.0:
+                old_q = quantity_pct
+                quantity_pct = quantity_pct * 0.5
+                logger.info(f"⚡ {sym}: высокая волатильность {vol_pct:.1f}% — уменьшаем размер {old_q:.4f} -> {quantity_pct:.4f}")
+        except Exception:
+            pass
 
         try:
             result = await add_backtest_signal(
