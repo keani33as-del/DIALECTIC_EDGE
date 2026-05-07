@@ -79,17 +79,20 @@ async def _fetch_fred_series(series_id: str, limit: int = 2) -> Optional[list]:
 async def fetch_extended_macro() -> MacroExtended:
     """Получает расширенные макро данные"""
     macro = MacroExtended()
-    
+    logger.info("[MACRO] Fetching extended macro from FRED...")
+
     # Параллельные запросы к FRED
     balance_task = _fetch_fred_series("WALCL", limit=5)  # Fed Balance Sheet
     yield_10y_task = _fetch_fred_series("DGS10", limit=2)  # 10Y Yield
     yield_2y_task = _fetch_fred_series("DGS2", limit=2)   # 2Y Yield
     hy_spread_task = _fetch_fred_series("HYCD", limit=2)  # High Yield Spread
-    
+
     balance_data, yield_10y_data, yield_2y_data, hy_data = await asyncio.gather(
         balance_task, yield_10y_task, yield_2y_task, hy_spread_task
     )
-    
+
+    logger.info(f"[MACRO] FRED responses — Balance: {bool(balance_data)}, 10Y: {bool(yield_10y_data)}, 2Y: {bool(yield_2y_data)}, HY: {bool(hy_data)}")
+
     # 1. Fed Balance Sheet
     if balance_data and len(balance_data) >= 1:
         current_val = balance_data[0].get("value")
@@ -110,23 +113,30 @@ async def fetch_extended_macro() -> MacroExtended:
             if macro.fed_balance_change_1w > 10:
                 macro.qe_qt_mode = "QE"  # Printing
                 macro.fed_balance_signal = f"🔵 QE (баланс растёт +${macro.fed_balance_change_1w:.0f}B за неделю)"
+                logger.info(f"[MACRO] Fed Balance: QE mode, +${macro.fed_balance_change_1w:.0f}B/wk")
             elif macro.fed_balance_change_1w < -10:
                 macro.qe_qt_mode = "QT"  # Tightening
                 macro.fed_balance_signal = f"🔴 QT (баланс сокращается -${abs(macro.fed_balance_change_1w):.0f}B за неделю)"
+                logger.warning(f"[MACRO] Fed Balance: QT mode, -${abs(macro.fed_balance_change_1w):.0f}B/wk")
             else:
                 macro.qe_qt_mode = "NEUTRAL"
                 macro.fed_balance_signal = f"⚪ NEUTRAL (баланс стабилен ${macro.fed_balance_billions:.0f}B)"
+                logger.info(f"[MACRO] Fed Balance: NEUTRAL, ${macro.fed_balance_billions:.0f}B")
+        else:
+            logger.warning("[MACRO] Fed Balance: no data")
     
     # 2. Treasury Yields
     if yield_10y_data and len(yield_10y_data) >= 1:
         val = yield_10y_data[0].get("value")
         if val and val != ".":
             macro.yield_10y = float(val)
+            logger.info(f"[MACRO] 10Y Yield: {macro.yield_10y:.2f}%")
     
     if yield_2y_data and len(yield_2y_data) >= 1:
         val = yield_2y_data[0].get("value")
         if val and val != ".":
             macro.yield_2y = float(val)
+            logger.info(f"[MACRO] 2Y Yield: {macro.yield_2y:.2f}%")
     
     # Yield Curve Spread
     if macro.yield_10y > 0 and macro.yield_2y > 0:
@@ -135,12 +145,18 @@ async def fetch_extended_macro() -> MacroExtended:
         # Сигнал кривой
         if macro.yield_spread < -0.5:
             macro.yield_curve_signal = f"🔴 ИНВЕРТИРОВАНА (спред {macro.yield_spread:.2f}%) — рецессия вероятна"
+            logger.warning(f"[MACRO] Yield Curve: ИНВЕРТИРОВАНА {macro.yield_spread:.2f}%")
         elif macro.yield_spread < 0:
             macro.yield_curve_signal = f"🟡 ЧАСТИЧНО ИНВЕРТИРОВАНА ({macro.yield_spread:.2f}%) — внимание"
+            logger.warning(f"[MACRO] Yield Curve: частично инвертирована {macro.yield_spread:.2f}%")
         elif macro.yield_spread < 1.0:
             macro.yield_curve_signal = f"🟢 НОРМАЛЬНАЯ ({macro.yield_spread:.2f}%)"
+            logger.info(f"[MACRO] Yield Curve: нормальная {macro.yield_spread:.2f}%")
         else:
             macro.yield_curve_signal = f"🟢 КРУТАЯ ({macro.yield_spread:.2f}%)"
+            logger.info(f"[MACRO] Yield Curve: крутая {macro.yield_spread:.2f}%")
+    else:
+        logger.warning("[MACRO] Yield data unavailable")
     
     # 3. Credit Spreads
     if hy_data and len(hy_data) >= 1:
@@ -150,11 +166,15 @@ async def fetch_extended_macro() -> MacroExtended:
             
             if macro.hy_spread > 5.0:
                 macro.credit_signal = f"🔴 СТРЕСС ({macro.hy_spread:.1f}%) — высокий риск"
+                logger.warning(f"[MACRO] Credit Spread: СТРЕСС {macro.hy_spread:.1f}%")
             elif macro.hy_spread > 3.5:
                 macro.credit_signal = f"🟡 ПОВЫШЕННЫЙ ({macro.hy_spread:.1f}%)"
+                logger.info(f"[MACRO] Credit Spread: повышенный {macro.hy_spread:.1f}%")
             else:
                 macro.credit_signal = f"🟢 НОРМАЛЬНО ({macro.hy_spread:.1f}%)"
+                logger.info(f"[MACRO] Credit Spread: нормальный {macro.hy_spread:.1f}%")
     
+    logger.info(f"[MACRO] DONE — Fed: {macro.fed_balance_signal}, Yield: {macro.yield_curve_signal}, Credit: {macro.credit_signal}")
     return macro
 
 

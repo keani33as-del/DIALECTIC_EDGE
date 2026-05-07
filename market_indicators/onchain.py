@@ -74,88 +74,93 @@ async def _fetch_coingecko(session, endpoint: str, params: dict = None) -> Optio
 async def fetch_btc_onchain() -> OnChainMetrics:
     """Получает on-chain метрики для BTC"""
     metrics = OnChainMetrics()
-    
-    async with asyncio.Lock():
-        import aiohttp
-        async with aiohttp.ClientSession() as session:
-            # 1. MVRV — через market_data endpoint
-            market_data = await _fetch_coingecko(
-                session, 
-                "coins/bitcoin",
-                params={"localization": "false", "tickers": "false", "community_data": "false"}
-            )
-            
-            if market_data:
-                # MVRV sometimes available in market_data
-                # CoinGecko doesn't have direct MVRV, we calculate from market cap
-                # For now, use available data
-                pass
-            
-            # 2. Exchange Reserves — через /coins/{id}/market_chart (volume-based proxy)
-            chart_data = await _fetch_coingecko(
-                session,
-                "coins/bitcoin/market_chart",
-                params={"vs": "usd", "days": "7", "interval": "daily"}
-            )
-            
-            if chart_data and "total_volumes" in chart_data:
-                volumes = chart_data["total_volumes"]
-                if len(volumes) >= 2:
-                    # Примерный объём — приблизительная оценка reserve activity
-                    current_volume = volumes[-1][1] if volumes else 0
-                    prev_volume = volumes[-2][1] if len(volumes) > 1 else current_volume
-                    metrics.tx_volume_24h = current_volume / 1e9  # в billions
-                    
-                    if prev_volume > 0:
-                        change = ((current_volume - prev_volume) / prev_volume) * 100
-                        if change > 0:
-                            metrics.active_addresses_signal = "🔴 Растёт (↑)"
-                        else:
-                            metrics.active_addresses_signal = "🟢 Падает (↓)"
-            
-            # 3. Basic BTC data для reference
-            btc_data = await _fetch_coingecko(
-                session,
-                "simple/price",
-                params={
-                    "ids": "bitcoin",
-                    "vs_currencies": "usd",
-                    "include_market_cap": "true",
-                    "include_24hr_vol": "true"
-                }
-            )
-            
-            if btc_data and "bitcoin" in btc_data:
-                btc = btc_data["bitcoin"]
-                # Сохраняем для использования в других метриках
-                metrics.tx_volume_24h = btc.get("usd_24h_vol", 0) / 1e9  # billions USD
-        
-        await asyncio.sleep(0.5)  # Rate limiting
-    
-    # MVRV — используем приблизительную оценку через market cycle
-    # Реальный MVRV требует Glassnode API
-    # Пока используем упрощённую оценку на основе цены
-    try:
-        # Попытка получить realized cap через альтернативный источник
-        metrics.mvrv = await _estimate_mvrv_approx(session)
-        
-        if metrics.mvrv > 3.5:
-            metrics.mvrv_signal = "🔴 ПЕРЕОЦЕНЁН (MVRV > 3.5)"
-        elif metrics.mvrv > 3.0:
-            metrics.mvrv_signal = "🟡 Высокий (3.0-3.5)"
-        elif metrics.mvrv >= 1.0 and metrics.mvrv <= 2.0:
-            metrics.mvrv_signal = "🟢 Справедливая цена (1.0-2.0)"
-        elif metrics.mvrv < 1.0:
-            metrics.mvrv_signal = "🟢🔵 ИСТОРИЧЕСКОЕ ДНО (MVRV < 1.0)"
+    logger.info("[ON-CHAIN] Fetching BTC metrics from CoinGecko...")
+
+    import aiohttp
+    async with aiohttp.ClientSession() as session:
+        # 1. MVRV — через market_data endpoint
+        market_data = await _fetch_coingecko(
+            session,
+            "coins/bitcoin",
+            params={"localization": "false", "tickers": "false", "community_data": "false"}
+        )
+
+        if market_data:
+            logger.info("[ON-CHAIN] CoinGecko /coins/bitcoin: OK")
         else:
-            metrics.mvrv_signal = "⚪ Норма (2.0-3.0)"
-    except:
-        metrics.mvrv_signal = "⚪ N/A"
-    
+            logger.warning("[ON-CHAIN] CoinGecko /coins/bitcoin: failed")
+
+        # 2. Exchange Reserves — через /coins/{id}/market_chart (volume-based proxy)
+        chart_data = await _fetch_coingecko(
+            session,
+            "coins/bitcoin/market_chart",
+            params={"vs": "usd", "days": "7", "interval": "daily"}
+        )
+
+        if chart_data and "total_volumes" in chart_data:
+            volumes = chart_data["total_volumes"]
+            if len(volumes) >= 2:
+                current_volume = volumes[-1][1] if volumes else 0
+                prev_volume = volumes[-2][1] if len(volumes) > 1 else current_volume
+                metrics.tx_volume_24h = current_volume / 1e9  # в billions
+                logger.info(f"[ON-CHAIN] 24h Volume: ${metrics.tx_volume_24h:.1f}B")
+
+                if prev_volume > 0:
+                    change = ((current_volume - prev_volume) / prev_volume) * 100
+                    if change > 0:
+                        metrics.active_addresses_signal = "🔴 Растёт (↑)"
+                    else:
+                        metrics.active_addresses_signal = "🟢 Падает (↓)"
+
+        # 3. Basic BTC data для reference
+        btc_data = await _fetch_coingecko(
+            session,
+            "simple/price",
+            params={
+                "ids": "bitcoin",
+                "vs_currencies": "usd",
+                "include_market_cap": "true",
+                "include_24hr_vol": "true"
+            }
+        )
+
+        if btc_data and "bitcoin" in btc_data:
+            btc = btc_data["bitcoin"]
+            metrics.tx_volume_24h = btc.get("usd_24h_vol", 0) / 1e9  # billions USD
+            logger.info(f"[ON-CHAIN] BTC price data: OK, vol=${metrics.tx_volume_24h:.1f}B")
+
+        await asyncio.sleep(0.5)  # Rate limiting
+
+    # MVRV — используем приблизительную оценку через market cycle
+    try:
+        import aiohttp
+        async with aiohttp.ClientSession() as session2:
+            metrics.mvrv = await _estimate_mvrv_approx(session2)
+    except Exception as e:
+        logger.warning(f"[ON-CHAIN] MVRV estimation failed: {e}")
+        metrics.mvrv = 2.0
+
+    if metrics.mvrv > 3.5:
+        metrics.mvrv_signal = "🔴 ПЕРЕОЦЕНЁН (MVRV > 3.5)"
+        logger.warning(f"[ON-CHAIN] MVRV {metrics.mvrv:.2f} > 3.5: ПЕРЕОЦЕНЁН")
+    elif metrics.mvrv > 3.0:
+        metrics.mvrv_signal = "🟡 Высокий (3.0-3.5)"
+        logger.info(f"[ON-CHAIN] MVRV {metrics.mvrv:.2f}: Высокий")
+    elif metrics.mvrv >= 1.0 and metrics.mvrv <= 2.0:
+        metrics.mvrv_signal = "🟢 Справедливая цена (1.0-2.0)"
+        logger.info(f"[ON-CHAIN] MVRV {metrics.mvrv:.2f}: Справедливая цена")
+    elif metrics.mvrv < 1.0:
+        metrics.mvrv_signal = "🟢🔵 ИСТОРИЧЕСКОЕ ДНО (MVRV < 1.0)"
+        logger.warning(f"[ON-CHAIN] MVRV {metrics.mvrv:.2f} < 1.0: ИСТОРИЧЕСКОЕ ДНО")
+    else:
+        metrics.mvrv_signal = "⚪ Норма (2.0-3.0)"
+        logger.info(f"[ON-CHAIN] MVRV {metrics.mvrv:.2f}: Норма")
+
     # SOPR — требует Glassnode, используем заглушку
-    metrics.sopr = 1.02  # Примерное значение
+    metrics.sopr = 1.02
     metrics.sopr_signal = "⚪ SOPR ~1.02 (фиксация прибыли минимальная)"
-    
+    logger.info(f"[ON-CHAIN] SOPR: {metrics.sopr_signal}")
+
     # Exchange Reserves — используем volume как proxy
     if metrics.tx_volume_24h > 30:
         metrics.exchange_reserves_signal = "🟡 Высокая активность на биржах"
@@ -163,7 +168,9 @@ async def fetch_btc_onchain() -> OnChainMetrics:
         metrics.exchange_reserves_signal = "🟢 Нормальная активность"
     else:
         metrics.exchange_reserves_signal = "🟢🔵 HODLing фаза (низкая активность)"
-    
+    logger.info(f"[ON-CHAIN] Exchange Activity: {metrics.exchange_reserves_signal}")
+
+    logger.info(f"[ON-CHAIN] DONE — MVRV={metrics.mvrv:.2f}, SOPR={metrics.sopr:.3f}, Vol=${metrics.tx_volume_24h:.1f}B")
     return metrics
 
 

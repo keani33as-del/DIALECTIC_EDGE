@@ -57,16 +57,19 @@ async def build_enriched_context(
     
     Returns: (context_string, EnrichedData)
     """
+    logger.info("[AGGREGATOR] Starting enriched context build...")
     enriched = EnrichedData()
     
     # Параллельно собираем данные
     onchain_task = fetch_onchain_metrics()
     macro_task = fetch_extended_macro()
     
+    logger.info("[AGGREGATOR] Fetching on-chain + macro data in parallel...")
     onchain_data, macro_data = await asyncio.gather(onchain_task, macro_task)
     
     enriched.onchain = onchain_data
     enriched.macro = macro_data
+    logger.info("[AGGREGATOR] On-chain + macro fetched OK")
     
     # Проверяем критические стоп-факторы
     critical_bearish, critical_bullish = get_critical_signals(
@@ -74,6 +77,7 @@ async def build_enriched_context(
         vix=vix,
         fear_greed=fear_greed,
     )
+    logger.info(f"[AGGREGATOR] Critical signals — bearish={critical_bearish}, bullish={critical_bullish}")
     
     # Вычисляем скор
     score = calculate_market_score(
@@ -111,6 +115,9 @@ async def build_enriched_context(
     
     enriched.score = score
     
+    logger.info(f"[AGGREGATOR] Scoring — total={score.total_score}, macro={score.macro_score}, onchain={score.onchain_score}, tech={score.technical_score}, sentiment={score.sentiment_score}")
+    logger.info(f"[AGGREGATOR] Verdict — preliminary={score.preliminary_verdict}, final={score.final_verdict}")
+    
     # Формируем контекст
     context_parts = []
     
@@ -138,6 +145,7 @@ async def build_enriched_context(
     elif critical_bullish:
         context_parts.append("🔵 СТОП-ФАКТОР: Критические условия указывают на историческое дно!")
     
+    logger.info(f"[AGGREGATOR] DONE — context length={len(context_parts)} parts, final_verdict={score.final_verdict}")
     return "\n".join(context_parts), enriched
 
 

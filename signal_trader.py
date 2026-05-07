@@ -1286,16 +1286,16 @@ async def _check_and_trade_locked(bot, admin_ids: list[int]) -> list[dict]:
         if len(open_positions) >= 5:
             break
         if candidate["symbol"] in held_symbols:
-            logger.info(f"⏭ {candidate['symbol']}: уже в позиции")
+            logger.debug(f"⏭ {candidate['symbol']}: уже в позиции")
             continue
         if not candidate.get("ready"):
             reason = candidate.get("blocked_reason") or f"score={candidate.get('total_score',0):.1f}<{OPEN_SCORE_THRESHOLD}"
-            logger.info(f"⏭ {candidate['symbol']} {candidate['direction']}: не готов — {reason}")
+            logger.debug(f"⏭ {candidate['symbol']} {candidate['direction']}: не готов — {reason}")
             continue
 
         # ═══ DEFENSE MODE BLOCK ═══
         if defense_active:
-            logger.info(f"⏭ {candidate['symbol']}: blocked by DEFENSE MODE")
+            logger.warning(f"⏭ {candidate['symbol']}: blocked by DEFENSE MODE")
             continue
 
         # ═══ CORRELATION FILTER ═══
@@ -1303,7 +1303,7 @@ async def _check_and_trade_locked(bot, admin_ids: list[int]) -> list[dict]:
         if corr_matrix:
             conflict = _correlation.check_conflict(sym, list(held_symbols), corr_matrix)
             if conflict:
-                logger.info(f"⏭ {sym}: blocked — high correlation with {conflict}")
+                logger.debug(f"⏭ {sym}: blocked — high correlation with {conflict}")
                 continue
 
         # ═══ WHALE SENTIMENT BONUS ═══
@@ -1311,14 +1311,14 @@ async def _check_and_trade_locked(bot, admin_ids: list[int]) -> list[dict]:
         whale_bonus = 0.0
         if whale_sent == "BULLISH" and candidate["direction"] == "BUY":
             whale_bonus = 3.0
-            logger.info(f"🐋 {sym}: Whale BUY signal confirmed — bonus +3.0")
+            logger.info(f"🐋 {sym}: Whale BUY confirmed — bonus +3.0")
         elif whale_sent == "BEARISH" and candidate["direction"] == "SELL":
             whale_bonus = 3.0
-            logger.info(f"🐋 {sym}: Whale SELL signal confirmed — bonus +3.0")
+            logger.info(f"🐋 {sym}: Whale SELL confirmed — bonus +3.0")
         elif (whale_sent == "BEARISH" and candidate["direction"] == "BUY") or \
              (whale_sent == "BULLISH" and candidate["direction"] == "SELL"):
             whale_bonus = -5.0
-            logger.info(f"🐋 {sym}: Whale signal AGAINST trade — penalty -5.0")
+            logger.warning(f"🐋 {sym}: Whale AGAINST trade — penalty -5.0")
 
         # ═══ DYNAMIC RISK MANAGEMENT ═══
         entry = float(candidate["current_price"])
@@ -1452,12 +1452,12 @@ async def run_signal_trader(bot, admin_ids: list[int]):
     while True:
         try:
             cycle += 1
-            logger.info(f"🔄 Автотрейд цикл #{cycle}")
+            logger.debug("🔄 Автотрейд цикл #{cycle}")
             events = await check_and_trade(bot, admin_ids)
             if events:
-                logger.info(f"✅ Цикл #{cycle}: {len(events)} событий")
+                logger.info("✅ Цикл #{cycle}: {len(events)} событий")
             else:
-                logger.info(f"😴 Цикл #{cycle}: нет событий")
+                logger.debug("😴 Цикл #{cycle}: нет событий")
         except Exception as e:
             logger.error(f"Auto trader error: {e}", exc_info=True)
         await asyncio.sleep(INTERVAL_SECONDS)

@@ -166,6 +166,7 @@ async def run_full_analysis(
     if not custom_mode:
         try:
             from market_indicators import build_enriched_context, enrich_prices_with_scores
+            logger.info("[ANALYSIS] Building enriched context with market_indicators...")
             enriched_context_str, enriched_data = await build_enriched_context(
                 vix=prices_dict.get("VIX"),
                 fear_greed=prices_dict.get("FEAR_GREED"),
@@ -180,7 +181,7 @@ async def run_full_analysis(
             if enriched_data:
                 prices_dict = enrich_prices_with_scores(prices_dict, enriched_data.score, enriched_data)
             
-            logger.info("On-chain + Macro extended + Scoring: OK")
+            logger.info(f"[ANALYSIS] On-chain + Macro + Scoring: OK (verdict={enriched_data.score.final_verdict}, score={enriched_data.score.total_score:+d})")
         except Exception as e:
             logger.warning(f"On-chain/macro/scoring failed: {e}")
 
