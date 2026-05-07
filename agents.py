@@ -478,9 +478,44 @@ class ConsensusSynth(BaseAgent):
         super().__init__("Consensus Synthesizer", "⚖️", SYNTH_SYSTEM, "synth")
 
 
-class Speechwriter(BaseAgent):
+class Speechwriter:
+    """Speechwriter — форматирует JSON от Synth в красивый текст для Telegram."""
+
     def __init__(self):
-        super().__init__("Speechwriter", "✍️", SPEECHWRITER_SYSTEM, "synth")
+        self.system_prompt = SPEECHWRITER_SYSTEM
+
+    async def format(self, synth_json: str) -> str:
+        """
+        Принимает JSON (или текст) от Synth и превращает в читаемый торговый план.
+        """
+        from ai_provider import ai
+
+        prompt = f"""Преобразуй данные ниже в читаемый торговый план:
+
+{synth_json}
+
+ФОРМАТ:
+🏆 ВЕРДИКТ СУДЬИ: [БЫЧИЙ/МЕДВЕЖИЙ/НЕЙТРАЛЬНЫЙ]
+Потому что: [1 предложение]
+
+📋 ТОРГОВЫЙ ПЛАН:
+• BTC | SHORT | Вход: $79800 | Стоп: $82000 | Цель: $77000 | R/R: 1:2 | 10% депозита
+
+👀 КЛЮЧЕВОЙ ТРИГГЕР: [цена или событие]
+
+💬 ПРОСТЫМИ СЛОВАМИ: [1-2 предложения для непрофессионала]
+
+📊 QE/QT РЕЖИМ: [QE/QT/NEUTRAL]
+
+НИЧЕГО КРОМЕ ФОРМАТИРОВАННОГО ТЕКСТА НЕ ВЫВОДИ.
+"""
+
+        try:
+            response = await ai.synth(prompt=prompt, system=self.system_prompt)
+            return response
+        except Exception as e:
+            logger.error(f"Speechwriter error: {e}")
+            return synth_json  # fallback — выводим как есть
 
 
 # ─── ОРКЕСТРАТОР ──────────────────────────────────────────────────────────────
@@ -553,7 +588,7 @@ class DebateOrchestrator:
         
         # Шаг 2: Speechwriter → красивый форматированный текст
         try:
-            final_synthesis = await self.writer.respond(synth_json, history, round_num=rounds)
+            final_synthesis = await self.writer.format(synth_json)
         except Exception as e:
             logger.warning(f"[SPEECHWRITER] Error, using raw synth: {e}")
             final_synthesis = synth_json
