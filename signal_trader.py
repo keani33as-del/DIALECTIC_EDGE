@@ -1579,12 +1579,12 @@ async def run_signal_trader(bot, admin_ids: list[int]):
     while True:
         try:
             cycle += 1
-            logger.debug("🔄 Автотрейд цикл #{cycle}")
+            logger.debug(f"🔄 Автотрейд цикл #{cycle}")
             events = await check_and_trade(bot, admin_ids)
             if events:
-                logger.info("✅ Цикл #{cycle}: {len(events)} событий")
+                logger.info(f"✅ Цикл #{cycle}: {len(events)} событий")
             else:
-                logger.debug("😴 Цикл #{cycle}: нет событий")
+                logger.debug(f"😴 Цикл #{cycle}: нет событий")
         except Exception as e:
             logger.error(f"Auto trader error: {e}", exc_info=True)
         await asyncio.sleep(INTERVAL_SECONDS)

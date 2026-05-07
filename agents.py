@@ -506,6 +506,33 @@ class DebateOrchestrator:
         logger.info("Финальный синтез (только валидные аргументы)...")
         final_synthesis = await self.synth.respond(full_context, history, round_num=rounds)
 
+        # ─── Hallucination tracking ───────────────────────────────────────────
+        try:
+            import re as _re
+            from ai_provider import track_hallucinations, log_hallucination_stats
+
+            verifier_text = history.last_message_by("Verifier") or ""
+            bull_all = " ".join(m.content for m in history.messages if "Bull" in m.agent)
+            bear_all = " ".join(m.content for m in history.messages if "Bear" in m.agent)
+
+            # Verifier отмечает ГАЛЛЮЦИНАЦИЯ — считаем
+            hall_bull = len(_re.findall(r"ГАЛЛЮЦИНАЦИЯ", verifier_text[:2000])) if verifier_text else 0
+
+            # Count total agent arguments (paragraphs that look like arguments)
+            bull_args = max(1, len([p for p in bull_all.split("\n") if p.strip().startswith("•") or p.strip().startswith("-")]))
+            bear_args = max(1, len([p for p in bear_all.split("\n") if p.strip().startswith("•") or p.strip().startswith("-")]))
+
+            # Отдельно считаем галлюцинации Bull из Verifier-ответа
+            bull_halls = len(_re.findall(r"ГАЛЛЮЦИНАЦИЯ", verifier_text[:2000]))
+            bear_halls = len(_re.findall(r"Bear.*ГАЛЛЮЦИНАЦИЯ|Bull.*ГАЛЛЮЦИНАЦИЯ", verifier_text[:2000])) // 2
+
+            track_hallucinations("bull", bull_args, bull_halls)
+            track_hallucinations("bear", bear_args, bear_halls)
+            log_hallucination_stats()
+            logger.info(f"[HALLUCINATION] Bull: {bull_halls}/{bull_args}, Bear: {bear_halls}/{bear_args}")
+        except Exception as _e:
+            logger.debug(f"[HALLUCINATION] Tracking skipped: {_e}")
+
         return self._format_report(history, final_synthesis, news_context, custom_mode)
 
     def _format_report(self, history, synthesis, news_context, custom_mode) -> str:
