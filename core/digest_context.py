@@ -471,6 +471,10 @@ def _plan_line(plan: dict) -> str:
         chunks.append(f"горизонт {plan['horizon']}")
     if plan.get("trigger"):
         chunks.append(f"триггер {plan['trigger']}")
+    if plan.get("rr"):
+        chunks.append(f"R/R {plan['rr']}")
+    if plan.get("size"):
+        chunks.append(f"{plan['size']}")
     return " | ".join(chunks)
 
 
@@ -494,9 +498,49 @@ def _extract_key_trigger(report_text: str) -> str:
     return ""
 
 
+def _try_parse_synth_json(report_text: str) -> list[dict]:
+    """Попытка распарсить JSON если Synth выдал структурированный ответ."""
+    synth_section = _extract_synth_section(report_text)
+    if not synth_section:
+        return []
+    
+    import json as _json
+    
+    # Ищем JSON в секции Synth
+    for block in re.findall(r'\{[^{}]*"plans"[^{}]*\}', synth_section, re.DOTALL):
+        plans = []
+        for pm in re.findall(r'\{[^{}]*\}', block):
+            try:
+                plan_data = _json.loads(pm)
+                if plan_data.get("symbol"):
+                    plans.append({
+                        "label": plan_data.get("symbol", ""),
+                        "symbol": plan_data.get("symbol", ""),
+                        "direction": plan_data.get("direction", "CASH"),
+                        "entry": float(plan_data["entry"]) if plan_data.get("entry") else None,
+                        "stop": float(plan_data["stop"]) if plan_data.get("stop") else None,
+                        "target": float(plan_data["target"]) if plan_data.get("target") else None,
+                        "rr": plan_data.get("rr", ""),
+                        "size": plan_data.get("size", ""),
+                        "trigger": plan_data.get("trigger", ""),
+                    })
+            except Exception:
+                continue
+        if plans:
+            return plans
+    return []
+
+
 def build_digest_context(report_text: str, source_news: str = "") -> dict:
     verdict = extract_verdict(report_text)
     plans = extract_trade_plans(report_text)
+    
+    # Fallback: try to parse JSON if plans still empty
+    if not plans:
+        json_plans = _try_parse_synth_json(report_text)
+        if json_plans:
+            plans = json_plans
+    
     monitoring_points = extract_monitoring_points(report_text)
     verdict_reason = _extract_single_line(report_text, "Потому что")
     key_trigger = _extract_key_trigger(report_text)
