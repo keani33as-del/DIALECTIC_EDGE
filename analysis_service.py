@@ -10,6 +10,7 @@ from datetime import datetime
 from typing import Dict, Tuple
 
 from agents import DebateOrchestrator
+# fetch_full_context из старого файла data_sources.py
 from data_sources import fetch_full_context
 from database import log_report
 from github_export import get_previous_digest, push_digest_cache
@@ -159,6 +160,29 @@ async def run_full_analysis(
             logger.info("Elite data enrichment: OK")
         except Exception as e:
             logger.warning(f"Elite data enrichment failed: {e}")
+
+    # ═══ ON-CHAIN + EXTENDED MACRO + SCORING ═══
+    # Добавляем MVRV, SOPR, Fed Balance, Yields, Yield Curve, система баллов
+    if not custom_mode:
+        try:
+            from market_indicators import build_enriched_context, enrich_prices_with_scores
+            enriched_context_str, enriched_data = await build_enriched_context(
+                vix=prices_dict.get("VIX"),
+                fear_greed=prices_dict.get("FEAR_GREED"),
+                sentiment_label=sentiment_result.label if sentiment_result else None,
+                trend_btc=prices_dict.get("TREND_BTC"),
+                rsi_btc=prices_dict.get("RSI_BTC"),
+                rsi_spy=prices_dict.get("RSI_SPY"),
+            )
+            news_context += f"\n\n{enriched_context_str}"
+            
+            # Обогащаем prices_dict для отчёта и графиков
+            if enriched_data:
+                prices_dict = enrich_prices_with_scores(prices_dict, enriched_data.score, enriched_data)
+            
+            logger.info("On-chain + Macro extended + Scoring: OK")
+        except Exception as e:
+            logger.warning(f"On-chain/macro/scoring failed: {e}")
 
     sentiment_result, confidence_instruction = await analyze_and_filter_async(
         news_context,

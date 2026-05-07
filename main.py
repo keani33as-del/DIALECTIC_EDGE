@@ -45,6 +45,7 @@ from analysis_service import (
     _fetcher as news_fetcher,
     build_digest_persist_metadata,
 )
+# fetch_full_context из старого файла data_sources.py
 from data_sources import fetch_full_context
 from meta_analyst import get_meta_context
 from github_export import get_previous_digest, push_digest_cache
