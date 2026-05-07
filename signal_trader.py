@@ -1282,18 +1282,34 @@ async def _check_and_trade_locked(bot, admin_ids: list[int]) -> list[dict]:
     ranked = rank_trade_candidates(consensus, prices, signal_bias)
     held_symbols = {p["symbol"] for p in open_positions}
 
-    # Inject MVRV into candidates from market_indicators (if available)
+    # MVRV cache: берём из GitHub если свежий, иначе fetch и сохраняем
+    mvrv = 0.0
     try:
+        from github_export import get_market_cache, save_market_cache
         from market_indicators import fetch_onchain_metrics
-        onchain = await fetch_onchain_metrics()
-        mvrv = onchain.mvrv
-        logger.info(f"[MVRV] Current BTC MVRV: {mvrv:.2f}")
-        for c in ranked:
-            c["mvrv"] = mvrv
+        
+        cache, is_fresh = await get_market_cache()
+        
+        if is_fresh and "mvrv" in cache:
+            mvrv = float(cache["mvrv"])
+            logger.info(f"[MVRV] From cache: {mvrv:.2f}")
+        else:
+            onchain = await fetch_onchain_metrics()
+            mvrv = onchain.mvrv
+            logger.info(f"[MVRV] Fetched: {mvrv:.2f}")
+            # Сохраняем в кэш асинхронно (не ждём)
+            asyncio.create_task(save_market_cache(mvrv=mvrv))
     except Exception as _e:
-        logger.debug(f"[MVRV] Not available: {_e}")
-        for c in ranked:
-            c["mvrv"] = 0
+        logger.debug(f"[MVRV] Cache unavailable, fetch failed: {_e}")
+        try:
+            from market_indicators import fetch_onchain_metrics
+            onchain = await fetch_onchain_metrics()
+            mvrv = onchain.mvrv
+        except:
+            mvrv = 0.0
+
+    for c in ranked:
+        c["mvrv"] = mvrv
 
     for candidate in ranked:
         if len(open_positions) >= 5:

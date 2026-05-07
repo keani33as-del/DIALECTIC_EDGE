@@ -28,6 +28,7 @@ GITHUB_REPO  = os.getenv("GITHUB_REPO", "spermoeshka/DIALECTIC_EDg")
 FORECASTS_FILE   = "FORECASTS.md"
 DIGEST_CACHE_FILE = "DIGEST_CACHE.md"
 BACKTEST_FILE = "BACKTEST.md"
+MARKET_CACHE_FILE = "MARKET_CACHE.md"
 
 TIMEOUT = aiohttp.ClientTimeout(total=15)
 
@@ -494,3 +495,120 @@ async def export_backtest_to_github(signals: list[dict], stats: dict, config: di
 
 if __name__ == "__main__":
     asyncio.run(export_to_github())
+
+
+# ─── MARKET_CACHE.md — кэш рыночных данных (on-chain, macro, scores) ─────────
+
+CACHE_TTL_MINUTES = 20  # актуально 20 минут, потом перезапрашиваем
+
+
+async def save_market_cache(
+    mvrv: float = 0.0,
+    sopr: float = 0.0,
+    fed_balance: float = 0.0,
+    qe_qt_mode: str = "UNKNOWN",
+    yield_spread: float = 0.0,
+    hy_spread: float = 0.0,
+    vix: float = 0.0,
+    fear_greed: float = 0.0,
+    market_score: int = 0,
+    final_verdict: str = "NEUTRAL",
+    total_score: int = 0,
+) -> bool:
+    """
+    Сохраняет актуальные рыночные метрики в MARKET_CACHE.md на GitHub.
+    Используется signal_trader и analysis_service чтобы не делать
+    лишние API-запросы при каждом цикле.
+    """
+    if not GITHUB_TOKEN:
+        return False
+
+    content, sha = await _github_get(MARKET_CACHE_FILE)
+
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    
+    entry = (
+        f"## {now}\n\n"
+        f"| Метрика | Значение |\n"
+        f"|---------|----------|\n"
+        f"| MVRV | {mvrv:.2f} |\n"
+        f"| SOPR | {sopr:.3f} |\n"
+        f"| Fed Balance ($B) | {fed_balance:.0f} |\n"
+        f"| QE/QT Mode | {qe_qt_mode} |\n"
+        f"| Yield Spread | {yield_spread:.2f}% |\n"
+        f"| HY Spread | {hy_spread:.2f}% |\n"
+        f"| VIX | {vix:.1f} |\n"
+        f"| Fear & Greed | {fear_greed:.0f} |\n"
+        f"| Market Score | {total_score:+d} |\n"
+        f"| Final Verdict | {final_verdict} |\n"
+    )
+
+    entries = re.split(r"\n## ", content) if content else []
+    entries = [e.strip() for e in entries if e.strip() and not e.startswith("#")]
+    entries = entries[:3]  # храним только 3 последних
+    entries.insert(0, entry)
+
+    header = (
+        "# 📦 Dialectic Edge — Market Cache\n\n"
+        f"> Актуальность: {CACHE_TTL_MINUTES} минут. Автообновление при каждом цикле.\n\n"
+        "---\n\n"
+    )
+    full_content = header + "\n\n---\n\n## ".join(entries)
+
+    success = await _github_put(
+        MARKET_CACHE_FILE, full_content, sha,
+        f"📦 Update market cache {now} [skip ci]"
+    )
+    if success:
+        logger.info(f"✅ MARKET_CACHE.md saved (MVRV={mvrv:.2f}, score={total_score:+d})")
+    return success
+
+
+async def get_market_cache() -> tuple[dict, bool]:
+    """
+    Возвращает закэшированные рыночные данные и флаг is_fresh.
+    is_fresh = True если кэш младше CACHE_TTL_MINUTES.
+    
+    Returns: (cache_dict, is_fresh)
+    """
+    if not GITHUB_TOKEN:
+        return {}, False
+
+    content, _ = await _github_get(MARKET_CACHE_FILE)
+    if not content:
+        return {}, False
+
+    cache = {}
+
+    for pattern, field in [
+        (r"MVRV\s*\|\s*([\d.]+)", "mvrv"),
+        (r"SOPR\s*\|\s*([\d.]+)", "sopr"),
+        (r"Fed Balance.*?\|\s*([\d.]+)", "fed_balance"),
+        (r"QE/QT Mode\s*\|\s*(\w+)", "qe_qt_mode"),
+        (r"Yield Spread\s*\|\s*([-]?[\d.]+)", "yield_spread"),
+        (r"HY Spread\s*\|\s*([\d.]+)", "hy_spread"),
+        (r"VIX\s*\|\s*([\d.]+)", "vix"),
+        (r"Fear & Greed\s*\|\s*([\d.]+)", "fear_greed"),
+        (r"Market Score\s*\|\s*([-]?[\d]+)", "market_score"),
+        (r"Final Verdict\s*\|\s*(\w+)", "final_verdict"),
+    ]:
+        m = re.search(pattern, content)
+        if m:
+            val = m.group(1)
+            try:
+                cache[field] = float(val) if val.replace("-", "").replace(".", "").isdigit() else val
+            except:
+                cache[field] = val
+
+    # Проверяем freshness по timestamp в content
+    fresh = False
+    time_m = re.search(r"## (\d{4}-\d{2}-\d{2} \d{2}:\d{2})", content)
+    if time_m:
+        try:
+            cache_time = datetime.strptime(time_m.group(1), "%Y-%m-%d %H:%M")
+            age_minutes = (datetime.now() - cache_time).total_seconds() / 60
+            fresh = age_minutes <= CACHE_TTL_MINUTES
+        except:
+            fresh = False
+
+    return cache, fresh

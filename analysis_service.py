@@ -182,6 +182,24 @@ async def run_full_analysis(
                 prices_dict = enrich_prices_with_scores(prices_dict, enriched_data.score, enriched_data)
             
             logger.info(f"[ANALYSIS] On-chain + Macro + Scoring: OK (verdict={enriched_data.score.final_verdict}, score={enriched_data.score.total_score:+d})")
+            
+            # Сохраняем в GitHub cache
+            try:
+                from github_export import save_market_cache
+                asyncio.create_task(save_market_cache(
+                    mvrv=enriched_data.onchain.mvrv if enriched_data.onchain else 0,
+                    sopr=enriched_data.onchain.sopr if enriched_data.onchain else 0,
+                    fed_balance=enriched_data.macro.fed_balance_billions if enriched_data.macro else 0,
+                    qe_qt_mode=enriched_data.macro.qe_qt_mode if enriched_data.macro else "UNKNOWN",
+                    yield_spread=enriched_data.macro.yield_spread if enriched_data.macro else 0,
+                    hy_spread=enriched_data.macro.hy_spread if enriched_data.macro else 0,
+                    vix=prices_dict.get("VIX", 0),
+                    fear_greed=prices_dict.get("FEAR_GREED", 0),
+                    total_score=enriched_data.score.total_score,
+                    final_verdict=enriched_data.score.final_verdict,
+                ))
+            except Exception as _e:
+                logger.debug(f"[ANALYSIS] Cache save skipped: {_e}")
         except Exception as e:
             logger.warning(f"On-chain/macro/scoring failed: {e}")
 
