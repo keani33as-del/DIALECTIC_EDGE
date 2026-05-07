@@ -225,6 +225,63 @@ _AGENT_MAX_TOKENS = {
     "synth":    1500,   # укороченный промпт = нужно меньше токенов (было 8192)
 }
 
+# ── Hallucination tracking per agent ─────────────────────────────────────────
+# Tracks: agent → total_args, hallucinations, per-model stats
+import threading as _threading
+
+_hallucination_lock = _threading.Lock()
+_hallucination_stats = {
+    "bull":     {"total": 0, "hall": 0, "by_model": {}},
+    "bear":     {"total": 0, "hall": 0, "by_model": {}},
+    "verifier": {"total": 0, "hall": 0, "by_model": {}},
+    "synth":    {"total": 0, "hall": 0, "by_model": {}},
+}
+
+
+def track_hallucinations(agent_key: str, total_args: int, hallucination_count: int, model_name: str = ""):
+    """Call this after each agent response to track hallucination rate."""
+    with _hallucination_lock:
+        if agent_key not in _hallucination_stats:
+            return
+        s = _hallucination_stats[agent_key]
+        s["total"] += total_args
+        s["hall"] += hallucination_count
+        if model_name:
+            if model_name not in s["by_model"]:
+                s["by_model"][model_name] = {"total": 0, "hall": 0}
+            s["by_model"][model_name]["total"] += total_args
+            s["by_model"][model_name]["hall"] += hallucination_count
+
+
+def get_hallucination_report() -> dict:
+    """Returns hallucination stats for all agents. Call after debate."""
+    with _hallucination_lock:
+        report = {}
+        for agent, s in _hallucination_stats.items():
+            rate = (s["hall"] / s["total"] * 100) if s["total"] > 0 else 0.0
+            by_m = {}
+            for m, ms in s["by_model"].items():
+                m_rate = (ms["hall"] / ms["total"] * 100) if ms["total"] > 0 else 0.0
+                by_m[m] = {"rate": round(m_rate, 1), "total_args": ms["total"], "hallucinations": ms["hall"]}
+            report[agent] = {
+                "total_args": s["total"],
+                "hallucinations": s["hall"],
+                "rate_pct": round(rate, 1),
+                "by_model": by_m,
+            }
+        return report
+
+
+def log_hallucination_stats():
+    """Logs current hallucination stats to logger. Call periodically."""
+    report = get_hallucination_report()
+    for agent, data in report.items():
+        rate = data["rate_pct"]
+        emoji = "🟢" if rate < 10 else "🟡" if rate < 25 else "🔴"
+        logger.info(f"[HALLUCINATION] {agent}: {data['hallucinations']}/{data['total_args']} ({rate:.1f}%) {emoji}")
+        for m, md in data["by_model"].items():
+            logger.info(f"  → {m}: {md['hallucinations']}/{md['total_args']} ({md['rate']:.1f}%)")
+
 
 # ── Базовый вызов ──────────────────────────────────────────────────────────────
 

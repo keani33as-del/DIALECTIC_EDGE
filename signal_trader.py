@@ -61,6 +61,8 @@ REVERSAL_SCORE_THRESHOLD = AUTOTRADE_REVERSAL_SCORE_THRESHOLD
 CRYPTO_SIGNAL_SYMBOLS = {"BTC", "ETH", "SOL", "BNB"}
 
 _trade_lock = asyncio.Lock()
+_last_qe_qt_mode = None
+_last_mvrv_alert = 0.0  # timestamp of last MVRV alert to avoid spam
 
 _regime_detector = RegimeDetector()
 _risk_manager = DynamicRiskManager()
@@ -825,8 +827,11 @@ async def _close_position_if_needed(position: dict, prices: dict, signal_bias: d
     direction = (position.get("direction") or "").upper()
     target = float(meta.get("target") or 0.0)
     stop = float(meta.get("stop") or 0.0)
+    partial_tp = float(meta.get("partial_tp") or 0.0)  # Split TP: 50% at this price
+    trailing_trail = float(meta.get("trailing_pct") or 0.0)  # Trailing stop %
     entry_price = float(position.get("entry_price") or 0.0)
     reason = ""
+    is_partial = False
 
     # ИСПРАВЛЕНО: если target/stop не были сохранены — применяем дефолты
     if entry_price > 0:
@@ -834,15 +839,46 @@ async def _close_position_if_needed(position: dict, prices: dict, signal_bias: d
             target = entry_price * 1.04   # +4% по умолчанию
         if not stop:
             stop   = entry_price * 0.98   # -2% по умолчанию
+        if partial_tp <= 0:
+            partial_tp = entry_price * 1.02  # Split TP: 50% at +2% (default)
+        if trailing_trail <= 0:
+            trailing_trail = 1.5  # Default trailing stop: 1.5%
+
+    # Dynamic trailing stop: when price moves in our favor, raise the stop
+    trailing_stop = stop
+    if direction == "BUY" and current_price > entry_price:
+        profit_pct = (current_price - entry_price) / entry_price * 100
+        trailing_stop = max(stop, entry_price * (1 - trailing_trail / 100))
+        if profit_pct >= 3.0:  # Only activate after +3% profit
+            trailing_stop = current_price * (1 - trailing_trail / 100)
+    elif direction == "SELL" and current_price < entry_price:
+        profit_pct = (entry_price - current_price) / entry_price * 100
+        trailing_stop = min(stop, entry_price * (1 + trailing_trail / 100))
+        if profit_pct >= 3.0:
+            trailing_stop = current_price * (1 + trailing_trail / 100)
 
     if direction == "BUY":
-        if target and current_price >= target:
+        # Split TP: close 50% at partial_tp
+        if partial_tp > entry_price and current_price >= partial_tp:
+            reason = "Partial TP hit — 50% фиксация"
+            is_partial = True
+        # Full TP: all remaining
+        elif target and current_price >= target:
             reason = "Target hit — фиксация прибыли"
+        # Trailing stop
+        elif current_price <= trailing_stop:
+            reason = f"Trailing stop hit (price fell to ${current_price:,.0f}, stop=${trailing_stop:,.0f})"
+        # Hard stop
         elif stop and current_price <= stop:
             reason = "Stop loss hit"
     elif direction == "SELL":
-        if target and current_price <= target:
+        if partial_tp > 0 and current_price <= partial_tp:
+            reason = "Partial TP hit — 50% фиксация"
+            is_partial = True
+        elif target and current_price <= target:
             reason = "Target hit — фиксация прибыли"
+        elif current_price >= trailing_stop:
+            reason = f"Trailing stop hit (price rose to ${current_price:,.0f}, stop=${trailing_stop:,.0f})"
         elif stop and current_price >= stop:
             reason = "Stop loss hit"
 
@@ -986,6 +1022,26 @@ async def _close_on_signal_reversal(position: dict, prices: dict, signal_bias: d
         "pnl_pct": pnl_pct_rev,
         "capital": new_capital_rev,
     }
+
+
+async def _alert_admins(bot, admin_ids: list[int], alert_type: str, message: str):
+    """Отправляет алерт админам — MVRV критический, Defense mode, QE/QT переключение."""
+    if not bot or not admin_ids:
+        return
+    emoji_map = {
+        "MVRV_OVER": "🚨",
+        "MVRV_UNDER": "🔵",
+        "DEFENSE_MODE": "🛡️",
+        "QE_QT_CHANGE": "📊",
+        "MARKET_SCORE": "📈",
+    }
+    emoji = emoji_map.get(alert_type, "⚠️")
+    msg = f"{emoji} *{alert_type}*\n\n{message}"
+    for admin_id in admin_ids:
+        try:
+            await bot.send_message(admin_id, msg, parse_mode="Markdown")
+        except Exception:
+            continue
 
 
 async def _notify_admins(bot, admin_ids: list[int], event: dict):
@@ -1235,6 +1291,7 @@ async def _check_and_trade_locked(bot, admin_ids: list[int]) -> list[dict]:
         if _event_defense.is_defense_mode:
             defense_active = True
             logger.warning(f"🚨 DEFENSE MODE: {_event_defense.get_defense_recommendation()}")
+            await _alert_admins(bot, admin_ids, "DEFENSE MODE", _event_defense.get_defense_recommendation())
 
     # ═══ WHALE DETECTION ═══
     # Проверяем китовые сделки для крипто-символов
@@ -1293,6 +1350,28 @@ async def _check_and_trade_locked(bot, admin_ids: list[int]) -> list[dict]:
         if is_fresh and "mvrv" in cache:
             mvrv = float(cache["mvrv"])
             logger.info(f"[MVRV] From cache: {mvrv:.2f}")
+            
+            # QE/QT change alert
+            global _last_qe_qt_mode
+            cached_qe_qt = cache.get("qe_qt_mode", "UNKNOWN")
+            if _last_qe_qt_mode and cached_qe_qt != _last_qe_qt_mode:
+                emoji = "📈" if cached_qe_qt == "QE" else "📉" if cached_qe_qt == "QT" else "⚪"
+                await _alert_admins(bot, admin_ids, "QE_QT_CHANGE", 
+                    f"{emoji} Fed режим изменился: **{_last_qe_qt_mode}** → **{cached_qe_qt}**\n"
+                    f"QT = ликвидность уходит → уменьшай позиции\n"
+                    f"QE = ликвидность растёт → можно увеличивать")
+                _last_qe_qt_mode = cached_qe_qt
+            elif _last_qe_qt_mode is None:
+                _last_qe_qt_mode = cached_qe_qt
+            
+            # Market score extreme alert
+            total_score = int(cache.get("market_score", 0))
+            if total_score >= 8:
+                await _alert_admins(bot, admin_ids, "MARKET_SCORE", 
+                    f"📈 Market Score **{total_score:+d}** — сильный бычий сигнал. Confluence высокая.")
+            elif total_score <= -8:
+                await _alert_admins(bot, admin_ids, "MARKET_SCORE",
+                    f"📉 Market Score **{total_score:+d}** — сильный медвежий сигнал. Confluence низкая.")
         else:
             onchain = await fetch_onchain_metrics()
             mvrv = onchain.mvrv
@@ -1394,16 +1473,26 @@ async def _check_and_trade_locked(bot, admin_ids: list[int]) -> list[dict]:
         mvrv_check = candidate.get("mvrv") or 0
         if mvrv_check > 3.5 and candidate["direction"] == "BUY":
             logger.warning(f"⏭ {sym}: MVRV {mvrv_check:.1f} > 3.5 = ПЕРЕОЦЕНЁН, пропускаем LONG")
+            if mvrv_check > 4.0:
+                await _alert_admins(bot, admin_ids, "MVRV_OVER", f"MVRV **{mvrv_check:.1f}** > 4.0 — ПЕРЕОЦЕНЁН. Рекомендация: закрыть LONG позиции, не открывать новые.")
             continue
         if mvrv_check > 0 and mvrv_check < 1.0 and candidate["direction"] == "SELL":
             logger.warning(f"⏭ {sym}: MVRV {mvrv_check:.1f} < 1.0 = ИСТОРИЧЕСКОЕ ДНО, пропускаем SHORT")
+            await _alert_admins(bot, admin_ids, "MVRV_UNDER", f"MVRV **{mvrv_check:.2f}** < 1.0 — ИСТОРИЧЕСКОЕ ДНО. Рекомендация: закрыть SHORT позиции, готовиться к LONG.")
             continue
         
         support = candidate.get("support") or 0
         notes = f"Signal-follow | {candidate['direction']} | {regime or 'N/A'}"
+        
+        # Split TP: 50% at +2%, full TP at calculated target
+        partial_tp_price = entry * 1.02
+        trailing_pct = 1.5  # Activate trailing stop at +3% profit
+        
         trade_meta = json.dumps({
             "target": final_target,
             "stop": final_stop,
+            "partial_tp": partial_tp_price,
+            "trailing_pct": trailing_pct,
             "entry_plan": entry,
             "support": support,
             "consensus_verdict": cv,

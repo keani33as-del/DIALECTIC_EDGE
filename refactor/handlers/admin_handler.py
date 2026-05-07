@@ -47,12 +47,54 @@ class AdminHandler:
 
     async def format_health_check(self) -> str:
         stats = await get_admin_stats()
+        
+        checks = []
+        overall = "✅"
+        
+        # DB check
+        try:
+            from database import get_pending_predictions
+            pending = await get_pending_predictions()
+            checks.append("🟢 БД SQLite — OK")
+        except Exception as e:
+            checks.append(f"🔴 БД SQLite — ERROR: {e}")
+            overall = "🔴"
+        
+        # GitHub connection check
+        try:
+            from github_export import _github_get, DIGEST_CACHE_FILE
+            content, sha = await _github_get(DIGEST_CACHE_FILE)
+            if content:
+                checks.append("🟢 GitHub connection — OK")
+            else:
+                checks.append("🟡 GitHub — пустой контент")
+        except Exception as e:
+            checks.append(f"🔴 GitHub — ERROR: {e}")
+            overall = "🔴"
+        
+        # Last digest check
+        import re
+        from datetime import datetime, timedelta
+        last_digest = "неизвестно"
+        try:
+            from github_export import _github_get, DIGEST_CACHE_FILE
+            content, _ = await _github_get(DIGEST_CACHE_FILE)
+            if content:
+                time_m = re.search(r"## (\d{4}-\d{2}-\d{2} \d{2}:\d{2})", content)
+                if time_m:
+                    last_digest = time_m.group(1)
+        except:
+            pass
+        
+        checks_text = "\n".join(checks)
+        
         return (
-            "<b>✅ Health Check</b>\n\n"
-            f"<b>Users:</b> {stats['total_users']}\n"
-            f"<b>Subscribers:</b> {stats['subscribers']}\n"
-            f"<b>Reports:</b> {stats['total_reports']}\n"
-            "<b>Status:</b> online"
+            f"{overall} *Health Check*\n\n"
+            f"{checks_text}\n\n"
+            f"📋 Последний дайджест: {last_digest}\n"
+            f"👥 Пользователей: {stats['total_users']} | Активных 7д: {stats['active_week']}\n"
+            f"📊 Отчётов: {stats['total_reports']} | Подписчиков: {stats['subscribers']}\n"
+            f"🟢 Статус бота: online"
         )
 
     def get_recent_logs(self) -> str:
