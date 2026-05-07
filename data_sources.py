@@ -525,10 +525,11 @@ async def fetch_economic_calendar() -> str:
         return ""  # Finnhub уже даёт earnings calendar
 
     try:
-        try:
         import feedparser
     except ImportError:
         return "Экономический календарь недоступен (feedparser не установлен)"
+    
+    try:
         url = "https://www.investing.com/rss/news_14.rss"
         async with aiohttp.ClientSession(headers=HEADERS) as session:
             async with session.get(url, timeout=TIMEOUT) as resp:
@@ -554,7 +555,6 @@ async def fetch_economic_calendar() -> str:
         for event in important:
             lines.append(f"• {event}")
         return "\n".join(lines)
-
     except Exception as e:
         logger.warning(f"Economic calendar error: {e}")
         return ""
