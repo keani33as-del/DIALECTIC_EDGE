@@ -21,6 +21,7 @@ from .scorer import (
     calculate_market_score, 
     get_critical_signals,
     format_scored_context_for_agents,
+    format_signal_block_for_debates,
     MarketScore
 )
 
@@ -135,7 +136,12 @@ async def build_enriched_context(
     context_parts.append("")
     context_parts.append(scored_str)
     
-    # 4. Финальный вердикт для агентов
+    # 4. СИГНАЛ БЛОК для Bull/Bear дебатов (НОВЫЙ!)
+    signal_block = format_signal_block_for_debates(enriched.score, enriched.onchain, enriched.macro)
+    context_parts.append("")
+    context_parts.append(signal_block)
+    
+    # 5. Финальный вердикт для агентов
     context_parts.append("")
     verdict_emoji = "🟢" if score.final_verdict == "BULLISH" else "🔴" if score.final_verdict == "BEARISH" else "⚪"
     context_parts.append(f"{verdict_emoji} СИСТЕМА БАЛЛОВ РЕКОМЕНДУЕТ: **{score.final_verdict}**")

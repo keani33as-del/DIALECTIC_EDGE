@@ -1282,6 +1282,19 @@ async def _check_and_trade_locked(bot, admin_ids: list[int]) -> list[dict]:
     ranked = rank_trade_candidates(consensus, prices, signal_bias)
     held_symbols = {p["symbol"] for p in open_positions}
 
+    # Inject MVRV into candidates from market_indicators (if available)
+    try:
+        from market_indicators import fetch_onchain_metrics
+        onchain = await fetch_onchain_metrics()
+        mvrv = onchain.mvrv
+        logger.info(f"[MVRV] Current BTC MVRV: {mvrv:.2f}")
+        for c in ranked:
+            c["mvrv"] = mvrv
+    except Exception as _e:
+        logger.debug(f"[MVRV] Not available: {_e}")
+        for c in ranked:
+            c["mvrv"] = 0
+
     for candidate in ranked:
         if len(open_positions) >= 5:
             break
@@ -1355,12 +1368,21 @@ async def _check_and_trade_locked(bot, admin_ids: list[int]) -> list[dict]:
         final_target = risk_calc.get("take_profit", base_target)
         quantity_pct = risk_calc.get("risk_pct", 0.02) / 100  # Convert to fraction
 
-        # Минимальный R/R 1.5
+# Минимальный R/R 1.5
         rr = abs(final_target - entry) / abs(entry - final_stop) if entry != final_stop else 0
         if rr < 1.5:
             logger.info(f"⏭ {sym}: R/R {rr:.2f} < 1.5 — пропускаем")
             continue
-
+        
+        # MVRV hard-stop: если MVRV > 3.5 — критический медвежий, не открываем LONG
+        mvrv_check = candidate.get("mvrv") or 0
+        if mvrv_check > 3.5 and candidate["direction"] == "BUY":
+            logger.warning(f"⏭ {sym}: MVRV {mvrv_check:.1f} > 3.5 = ПЕРЕОЦЕНЁН, пропускаем LONG")
+            continue
+        if mvrv_check > 0 and mvrv_check < 1.0 and candidate["direction"] == "SELL":
+            logger.warning(f"⏭ {sym}: MVRV {mvrv_check:.1f} < 1.0 = ИСТОРИЧЕСКОЕ ДНО, пропускаем SHORT")
+            continue
+        
         support = candidate.get("support") or 0
         notes = f"Signal-follow | {candidate['direction']} | {regime or 'N/A'}"
         trade_meta = json.dumps({

@@ -27,6 +27,7 @@ from .scorer import (
     calculate_market_score,
     get_critical_signals,
     format_scored_context_for_agents,
+    format_signal_block_for_debates,
 )
 from .aggregator import (
     build_enriched_context,
@@ -49,6 +50,7 @@ __all__ = [
     "calculate_market_score",
     "get_critical_signals",
     "format_scored_context_for_agents",
+    "format_signal_block_for_debates",
     # Aggregator
     "build_enriched_context",
     "enrich_prices_with_scores",

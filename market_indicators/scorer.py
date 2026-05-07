@@ -417,6 +417,120 @@ def format_scored_context_for_agents(score: MarketScore) -> str:
     return "\n".join(lines)
 
 
+def format_signal_block_for_debates(score: MarketScore, onchain: 'OnChainMetrics' = None, macro: 'MacroExtended' = None) -> str:
+    """
+    Формирует структурированный СИГНАЛ БЛОК для Bull/Bear агентов.
+    Агенты должны читать этот блок и использовать в аргументах.
+    
+    Формат:
+    === 🎯 СИГНАЛЫ ДЛЯ ДЕБАТОВ ===
+    🟢 БЫЧЬИ:
+      • описание + почему бычий
+    🔴 МЕДВЕЖИЙ:
+      • описание + почему медвежий
+    ⚠️ ВНИМАНИЕ:
+      • описание
+    """
+    lines = ["=== 🎯 СИГНАЛЫ ДЛЯ ДЕБАТОВ ==="]
+    
+    # Определяем бычьи и медвежьи из скора
+    bull_list = []
+    bear_list = []
+    neutral_list = []
+    
+    if score.bullish_signals:
+        for sig in score.bullish_signals[:4]:
+            bull_list.append(sig)
+    
+    if score.bearish_signals:
+        for sig in score.bearish_signals[:4]:
+            bear_list.append(sig)
+    
+    # Добавляем критические стоп-факторы
+    if score.has_critical_bullish:
+        bull_list.append("🔵 ИСТОРИЧЕСКОЕ ДНО / ЭКСТРЕМАЛЬНЫЙ СТРАХ — критический бычий")
+    if score.has_critical_bearish:
+        bear_list.append("🚨 MVRV>3.5 / VIX>40 / ПУЗЫРЬ — критический медвежий")
+    
+    # Ончейн данные
+    if onchain:
+        if onchain.mvrv > 3.5:
+            bear_list.append(f"MVRV {onchain.mvrv:.1f} — ПЕРЕОЦЕНЁН (риск коррекции)")
+        elif onchain.mvrv < 1.0:
+            bull_list.append(f"MVRV {onchain.mvrv:.1f} — ИСТОРИЧЕСКОЕ ДНО (opportunity)")
+        elif onchain.mvrv > 3.0:
+            neutral_list.append(f"MVRV {onchain.mvrv:.1f} — Высокий (внимание)")
+        else:
+            bull_list.append(f"MVRV {onchain.mvrv:.1f} — Норма/Справедливо (бычий)")
+        
+        if onchain.sopr > 1.05:
+            bear_list.append(f"SOPR {onchain.sopr:.3f} — Фиксация прибыли (осторожно)")
+        elif onchain.sopr < 0.95:
+            bull_list.append(f"SOPR {onchain.sopr:.3f} — Капитуляция (дно?)")
+        
+        if "HODL" in (onchain.exchange_reserves_signal or ""):
+            bull_list.append("Exchange Reserves падают — HODLing фаза (🟢 бычий)")
+        elif "продажа" in (onchain.exchange_reserves_signal or "").lower():
+            bear_list.append("Exchange Reserves растут — продажа (🔴 медвежий)")
+        
+        if "+" in (onchain.active_addresses_signal or "") or "растёт" in (onchain.active_addresses_signal or "").lower():
+            bull_list.append("Active Addresses растут — здоровый рост (🟢 бычий)")
+    
+    # Макро данные
+    if macro:
+        if macro.qe_qt_mode == "QE":
+            bull_list.append("Fed QE — ликвидность растёт (🟢 бычий)")
+        elif macro.qe_qt_mode == "QT":
+            bear_list.append("Fed QT — ликвидность падает (🔴 медвежий)")
+        
+        if macro.yield_spread < -0.5:
+            bear_list.append(f"Yield Curve ИНВЕРТИРОВАНА ({macro.yield_spread:.2f}%) — рецессия риск")
+        elif macro.yield_spread < 0:
+            neutral_list.append(f"Yield Curve частично инвертирована ({macro.yield_spread:.2f}%) — внимание")
+        
+        if macro.hy_spread > 5.0:
+            bear_list.append(f"Credit Spread {macro.hy_spread:.1f}% — СТРЕСС на рынке")
+        elif macro.hy_spread > 3.5:
+            neutral_list.append(f"Credit Spread повышен ({macro.hy_spread:.1f}%)")
+        
+        if macro.fed_balance_change_1w > 10:
+            bull_list.append(f"Fed Balance +${macro.fed_balance_change_1w:.0f}B/wk — QE режим")
+        elif macro.fed_balance_change_1w < -10:
+            bear_list.append(f"Fed Balance -${abs(macro.fed_balance_change_1w):.0f}B/wk — QT режим")
+    
+    # Итоговый вердикт из скора
+    verdict_note = ""
+    if score.final_verdict == "BULLISH":
+        verdict_note = " → СИСТЕМА БАЛЛОВ РЕКОМЕНДУЕТ: БЫЧИЙ"
+    elif score.final_verdict == "BEARISH":
+        verdict_note = " → СИСТЕМА БАЛЛОВ РЕКОМЕНДУЕТ: МЕДВЕЖИЙ"
+    
+    # Собираем блок
+    if bull_list:
+        lines.append("")
+        lines.append("🟢 БЫЧЬИ:")
+        for sig in bull_list[:5]:
+            lines.append(f"  • {sig}")
+    
+    if bear_list:
+        lines.append("")
+        lines.append("🔴 МЕДВЕЖИЙ:")
+        for sig in bear_list[:5]:
+            lines.append(f"  • {sig}")
+    
+    if neutral_list:
+        lines.append("")
+        lines.append("⚠️ ВНИМАНИЕ:")
+        for sig in neutral_list[:3]:
+            lines.append(f"  • {sig}")
+    
+    if verdict_note:
+        lines.append("")
+        lines.append(f"📊 {verdict_note}")
+    
+    return "\n".join(lines)
+
+
 # ─── Test ────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
