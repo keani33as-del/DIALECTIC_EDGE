@@ -502,13 +502,11 @@ async def _call_openrouter_gemini(prompt: str, system: str, temperature: float,
     """Gemini через OpenRouter — используем 2.5 Pro для Synth, 2.0 Flash для остальных."""
     model = "google/gemini-2.5-pro" if agent_key == "synth" else "google/gemini-2.0-flash-001"
     
-    try:
-        result = await _call_openrouter_model(
-            prompt, system, temperature,
-            model,
-            agent_key,
-        )
-        return result
+    return await _call_openrouter_model(
+        prompt, system, temperature,
+        model,
+        agent_key,
+    )
 
 
 async def _call_gemini(
