@@ -277,47 +277,83 @@ FinBERT из контекста: [score] [label] [confidence]
 
 
 SYNTH_SYSTEM = """
-Ты — Consensus Synthesizer. Твоя задача: ВЕРДИКТ + ПЛАН.
+Ты — Consensus Synthesizer. Твоя задача: выдать структурированный JSON с вердиктом и планом.
 
-📊 ОБЯЗАТЕЛЬНО УЧТИ СИСТЕМУ БАЛЛОВ (если есть в контексте):
-Смотри блок "=== 🎯 СИСТЕМА БАЛЛОВ ===" — там ИИ уже посчитал баллы.
-Если "СИСТЕМА БАЛЛОВ РЕКОМЕНДУЕТ: БЫЧИЙ" — склоняйся к бычьему.
-Если "СИСТЕМА БАЛЛОВ РЕКОМЕНДУЕТ: МЕДВЕЖИЙ" — склоняйся к медвежьему.
-Если "⚠️ СТОП-ФАКТОР: Критические условия..." — следуй этому предупреждению.
+📊 ОБЯЗАТЕЛЬНО УЧТИ СИСТЕМУ БАЛЛОВ:
+- Если "СИСТЕМА БАЛЛОВ РЕКОМЕНДУЕТ: БЫЧИЙ" — склоняйся к бычьему
+- Если "СИСТЕМА БАЛЛОВ РЕКОМЕНДУЕТ: МЕДВЕЖИЙ" — склоняйся к медвежьему
+- Если "⚠️ СТОП-ФАКТОР" — следуй предупреждению
 
 АЛГОРИТМ:
 1. Проверь критические стоп-факторы (MVRV > 3.5 = ПРОДАВАТЬ, MVRV < 1.0 = ПОКУПАТЬ)
 2. Посмотри систему баллов — какой вердикт рекомендуется
-3. Проверь QE/QT режим (QT = уменьшай позиции, QE = увеличивай)
+3. Проверь QE/QT режим (QT = -50% размера, QE = +50%)
 4. Учти аргументы Bull и Bear
 5. Прими финальное решение
 
-QE/QT ПРАВИЛО РАЗМЕРА ПОЗИЦИИ:
-• QE активен → ликвидность растёт → размер позиции +50% от нормы
-• QT активен → ликвидность падает → размер позиции -50% от нормы, стопы УЖЕ
-• NEUTRAL → стандартный размер
+ВЫВЕДИ ТОЛЬКО JSON (ничего другого!):
 
-ВСЁ ЧТО НЕОБХОДИМО (писать коротко, без лишнего):
+{
+  "verdict": "МЕДВЕЖИЙ",
+  "reason": "COT NET SHORT -4935 контрактов, SPY RSI 73.1 перекуплен",
+  "plans": [
+    {"symbol": "BTC", "direction": "SHORT", "entry": 79800, "stop": 82000, "target": 77000, "rr": "1:2", "size": "10%"},
+    {"symbol": "SOL", "direction": "CASH", "trigger": "пробой $92"}
+  ],
+  "key_trigger": "пробой $82000 → подтверждение медвежьего тренда",
+  "simple": "Фонды шортят BTC, SPY перекуплен — готовься к коррекции. COT NET SHORT -4935.",
+  "qe_qt": "QT",
+  "confidence": "HIGH"
+}
 
-🏆 ВЕРДИКТ СУДЬИ: [БЫЧИЙ / МЕДВЕЖИЙ / НЕЙТРАЛЬНЫЙ]
-Потому что: [1 предложение с цифрой из контекста]
-
-📋 ТОРГОВЫЙ ПЛАН (конкретные уровни):
-Если есть сигнал:
-• [Актив] | [LONG/SHORT] | Вход: $X | Стоп: $Y | Цель: $Z | R/R 1:N | Размер: [учитывая QE/QT]
-Если нет сигнала (NEUTRAL):
-• CASH | VIX=[X], FinBERT=[label], QE/QT=[режим]
-• Триггер LONG: [актив] пробой $[цена + 3%]
-• Триггер SHORT: [актив] пробой $[цена - 2%]
-
-👀 КЛЮЧЕВОЙ ТРИГГЕР: [конкретная цена или событие]
-
-═══════════════════════════════════════════════
-Антигаллюцинационный фильтр:
-- ТОЛЬКО цифры из контекста (цены, RSI, VIX, FinBERT, MVRV)
-- НЕТ источника = не пиши
+ПРАВИЛА JSON:
+- Только цифры из контекста (без источника = не пиши)
 - R/R минимум 1:2
+- entry/stop/target — числа (без $)
+- plans: макс 3 позиции
+- Если NEUTRAL: plans = [{"symbol": "CASH", "direction": "CASH", "trigger": "..."}]
+- simple: 1-2 предложения ПРОСТЫМ ЯЗЫКОМ для непрофессионала
+- confidence: HIGH / MEDIUM / LOW
 """ + COMMON_GROUNDING_RULE
+
+SPEECHWRITER_SYSTEM = """
+Ты — Speechwriter. Тебе дают JSON от Synth:
+
+{
+  "verdict": "МЕДВЕЖИЙ",
+  "reason": "...",
+  "plans": [{"symbol": "BTC", "direction": "SHORT", "entry": 79800, "stop": 82000, "target": 77000, "rr": "1:2", "size": "10%"}, ...],
+  "key_trigger": "...",
+  "simple": "ПРОСТЫМИ СЛОВАМИ 1-2 предложения",
+  "qe_qt": "QT",
+  "confidence": "HIGH"
+}
+
+Твоя задача: превратить этот JSON в красивый, читаемый текст для Telegram.
+
+ФОРМАТ ОТВЕТА:
+
+🏆 ВЕРДИКТ СУДЬИ: [БЫЧИЙ/МЕДВЕЖИЙ/НЕЙТРАЛЬНЫЙ]
+Потому что: [reason из JSON]
+
+📋 ТОРГОВЫЙ ПЛАН:
+• BTC | SHORT | Вход: $79800 | Стоп: $82000 | Цель: $77000 | R/R: 1:2 | 10% депозита
+• SOL | CASH | Триггер: пробой $92
+...
+
+👀 КЛЮЧЕВОЙ ТРИГГЕР: [key_trigger из JSON]
+
+💬 ПРОСТЫМИ СЛОВАМИ: [simple из JSON]
+
+📊 QE/QT РЕЖИМ: [QE или QT или NEUTRAL] — ликвидность [растёт/падает/нейтральна]
+
+⚡ КАК ЧИТАТЬ ПЛАН:
+• Все цены — уровни для входа/стопа/цели
+• R/R = соотношение риск/награда (1:2 = рискуем 1 чтобы заработать 2)
+• % = доля депозита на эту сделку
+
+НИЧЕГО КРОМЕ ФОРМАТИРОВАННОГО ТЕКСТА НЕ ВЫВОДИ.
+"""
 
 
 
@@ -442,14 +478,20 @@ class ConsensusSynth(BaseAgent):
         super().__init__("Consensus Synthesizer", "⚖️", SYNTH_SYSTEM, "synth")
 
 
+class Speechwriter(BaseAgent):
+    def __init__(self):
+        super().__init__("Speechwriter", "✍️", SPEECHWRITER_SYSTEM, "synth")
+
+
 # ─── ОРКЕСТРАТОР ──────────────────────────────────────────────────────────────
 
 class DebateOrchestrator:
     def __init__(self):
-        self.bull     = BullResearcher()
-        self.bear     = BearSkeptic()
-        self.verifier = DataVerifier()
-        self.synth    = ConsensusSynth()
+        self.bull      = BullResearcher()
+        self.bear      = BearSkeptic()
+        self.verifier  = DataVerifier()
+        self.synth     = ConsensusSynth()
+        self.writer    = Speechwriter()
 
     async def run_debate(
         self,
@@ -503,8 +545,18 @@ class DebateOrchestrator:
             bear_x = await self.bear.respond_counter(full_context, history, extra_round)
             history.add(f"{self.bear.emoji} {self.bear.name}", bear_x, extra_round)
 
-        logger.info("Финальный синтез (только валидные аргументы)...")
-        final_synthesis = await self.synth.respond(full_context, history, round_num=rounds)
+        logger.info("Финальный синтез: Synth (JSON) → Speechwriter (формат)...")
+        
+        # Шаг 1: Synth → компактный JSON
+        synth_json = await self.synth.respond(full_context, history, round_num=rounds)
+        logger.info(f"[SPEECHWRITER] Raw synth output: {synth_json[:300]}")
+        
+        # Шаг 2: Speechwriter → красивый форматированный текст
+        try:
+            final_synthesis = await self.writer.respond(synth_json, history, round_num=rounds)
+        except Exception as e:
+            logger.warning(f"[SPEECHWRITER] Error, using raw synth: {e}")
+            final_synthesis = synth_json
 
         # ─── Hallucination tracking ───────────────────────────────────────────
         try:
@@ -543,7 +595,7 @@ class DebateOrchestrator:
             from ai_provider import get_models_summary
             models_line = get_models_summary()
         except Exception:
-            models_line = "🐂 Bull | 🐻 Bear | 🔍 Verifier | ⚖️ Synth"
+            models_line = "🐂 Bull | 🐻 Bear | 🔍 Verifier | ⚖️ Synth → ✍️ Speechwriter"
 
         honest_header = (
             "💬 *Прежде чем читать:*\n"
