@@ -378,19 +378,32 @@ async def _fetch_crypto_signal_bias(
             except Exception as e3:
                 logger.warning(f"CoinGecko fallback also failed: {e3}")
 
-        # Last resort: assume SHORT (price falling = buy opportunity)
+        # Last resort: CoinGecko price-only fallback
         if not bias:
-            for symbol in crypto_symbols:
-                price = prices.get(symbol) or 0
-                if price > 0:
-                    bias[symbol] = {
-                        "symbol": symbol,
-                        "score": -15.0,
-                        "direction": "SHORT",
-                        "strength": 15.0,
-                        "reasons": ["Fallback — price falling"],
-                        "last_price": price,
-                    }
+            try:
+                ids_map = {"BTC": "bitcoin", "ETH": "ethereum", "BNB": "binancecoin", "SOL": "solana"}
+                ids = [ids_map[s] for s in crypto_symbols if s in ids_map]
+                if ids:
+                    url = "https://api.coingecko.com/api/v3/simple/price"
+                    params = {"ids": ",".join(ids), "vs_currencies": "usd"}
+                    async with aiohttp.ClientSession() as session:
+                        async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                            if resp.status == 200:
+                                data = await resp.json()
+                                for s in crypto_symbols:
+                                    cg_id = ids_map.get(s)
+                                    if cg_id and cg_id in data:
+                                        price = data[cg_id].get("usd", 0)
+                                        bias[s] = {
+                                            "symbol": s,
+                                            "score": -10.0,
+                                            "direction": "SHORT",
+                                            "strength": 10.0,
+                                            "reasons": ["Fallback — all APIs failed"],
+                                            "last_price": price,
+                                        }
+            except Exception:
+                pass
 
         return {symbol: bias.get(symbol, {}) for symbol in crypto_symbols}
 

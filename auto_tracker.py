@@ -17,7 +17,7 @@ from typing import Optional
 try:
     from dotenv import load_dotenv
     load_dotenv()
-except:
+except Exception:
     pass
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(message)s')

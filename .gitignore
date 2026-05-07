@@ -7,3 +7,4 @@ venv/
 .env
 dialectic_edge.db
 .cache/
+.vscode/
