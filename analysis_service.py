@@ -40,6 +40,40 @@ def _get_orchestrator() -> DebateOrchestrator:
     return _orchestrator
 
 
+def _as_float(value) -> float | None:
+    """Coerce a prices_dict entry to a float for downstream comparators.
+
+    `prices_dict` mixes shapes: numeric scalars, dicts like
+    {"price": 17.3, "change_24h": ...}, dicts with a `"value"` key (e.g. F&G),
+    and None. The market_indicators scoring code assumes plain numbers; passing
+    a dict triggers `TypeError: '>' not supported between instances of 'dict'
+    and 'int'`. This helper normalizes all of those into Optional[float].
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return float(value)
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, dict):
+        for key in ("price", "value"):
+            inner = value.get(key)
+            if isinstance(inner, (int, float)):
+                return float(inner)
+            if isinstance(inner, str):
+                try:
+                    return float(inner.replace(",", "").strip())
+                except ValueError:
+                    continue
+        return None
+    if isinstance(value, str):
+        try:
+            return float(value.replace(",", "").strip())
+        except ValueError:
+            return None
+    return None
+
+
 def build_digest_persist_metadata(
     *,
     custom_mode: bool,
@@ -191,12 +225,12 @@ async def run_full_analysis(
             from market_indicators import build_enriched_context, enrich_prices_with_scores
             logger.info("[ANALYSIS] Building enriched context with market_indicators...")
             enriched_context_str, enriched_data = await build_enriched_context(
-                vix=prices_dict.get("VIX"),
-                fear_greed=prices_dict.get("FEAR_GREED"),
+                vix=_as_float(prices_dict.get("VIX")),
+                fear_greed=_as_float(prices_dict.get("FEAR_GREED")),
                 sentiment_label=sentiment_result.label if sentiment_result else None,
                 trend_btc=prices_dict.get("TREND_BTC"),
-                rsi_btc=prices_dict.get("RSI_BTC"),
-                rsi_spy=prices_dict.get("RSI_SPY"),
+                rsi_btc=_as_float(prices_dict.get("RSI_BTC")),
+                rsi_spy=_as_float(prices_dict.get("RSI_SPY")),
             )
             news_context += f"\n\n{enriched_context_str}"
             
