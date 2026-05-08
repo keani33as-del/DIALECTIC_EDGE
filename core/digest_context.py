@@ -176,6 +176,28 @@ def _normalize_direction(value: str) -> str:
     return upper[:20]
 
 
+def _strip_field_prefix(text: str, prefixes: tuple[str, ...]) -> str:
+    """
+    "горизонт 7 дней" -> "7 дней". "триггер: Пробой $94." -> "Пробой $94.".
+
+    Pipe-style chunks come in either as `"<field> <value>"` or
+    `"<field>: <value>"`. Renderer (`_plan_line`) re-prepends "горизонт " /
+    "триггер ", so we MUST strip the field word here — otherwise we get
+    "горизонт горизонт 7 дней".
+    """
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return cleaned
+    lower = cleaned.lower()
+    for prefix in prefixes:
+        if lower.startswith(prefix):
+            cut = cleaned[len(prefix):]
+            return cut.lstrip(" :\t-—–").strip()
+    if ":" in cleaned:
+        return cleaned.split(":", 1)[-1].strip()
+    return cleaned
+
+
 def _parse_pipe_plan_line(line: str) -> Optional[dict]:
     cleaned = _clean_line(line)
     if "|" not in cleaned:
@@ -218,13 +240,13 @@ def _parse_pipe_plan_line(line: str) -> Optional[dict]:
             if price_match:
                 plan["target"] = _parse_price(price_match.group(1))
         elif "горизонт" in lower or "horizon" in lower:
-            plan["horizon"] = chunk_clean.split(":", 1)[-1].strip()
+            plan["horizon"] = _strip_field_prefix(chunk_clean, ("горизонт", "horizon"))
         elif "триггер" in lower or "trigger" in lower:
-            plan["trigger"] = chunk_clean.split(":", 1)[-1].strip()
+            plan["trigger"] = _strip_field_prefix(chunk_clean, ("триггер", "trigger"))
         elif "r/r" in lower:
             plan["rr"] = chunk_clean.replace("R/R", "").replace("r/r", "").strip(": ")
         elif "размер" in lower or "size" in lower:
-            plan["size"] = chunk_clean.split(":", 1)[-1].strip()
+            plan["size"] = _strip_field_prefix(chunk_clean, ("размер", "size"))
 
     return plan
 
@@ -250,10 +272,49 @@ def _extract_synth_section(report_text: str) -> str:
     return ""
 
 
+_PLAN_BLOCK_END_MARKERS = (
+    "👀",  # Точки наблюдения
+    "💬",  # Простыми словами
+    "📌",  # Эффекты 2-го порядка
+    "📡",  # Режим рынка
+    "🤝",  # Честно о боте
+    "⚠️",  # Дисклеймер
+    "🚨",  # Алерты
+)
+
+
+def _extract_plan_subsection(synth_section: str) -> str:
+    """
+    Из секции Synth выделяем именно блок «📋 Торговый план» — от заголовка
+    до первого из followup-маркеров (👀 Точки наблюдения, 💬 Простыми
+    словами, 📌 Эффекты, и т.п.). Если заголовка нет — отдаём всю секцию
+    Synth как fallback (старое поведение), но с тем же ранним стопом
+    на followup-маркерах.
+    """
+    if not synth_section:
+        return ""
+
+    plan_markers = ("📋 Торговый план", "ТОРГОВЫЙ ПЛАН", "Торговый план")
+    start_idx = -1
+    for marker in plan_markers:
+        i = synth_section.find(marker)
+        if i != -1 and (start_idx == -1 or i < start_idx):
+            start_idx = i
+    block = synth_section[start_idx:] if start_idx != -1 else synth_section
+
+    end_idx = len(block)
+    for marker in _PLAN_BLOCK_END_MARKERS:
+        i = block.find(marker)
+        if i != -1 and i < end_idx:
+            end_idx = i
+    return block[:end_idx]
+
+
 def _extract_pipe_plans(report_text: str) -> list[dict]:
     plans: list[dict] = []
-    
-    # Сначала парсим | формат (существующий)
+
+    # 1) | формат: разрешаем себе пробежаться по всему отчёту, но только
+    # по строкам с pipe — других не трогаем.
     for raw_line in _strip_markup(report_text).splitlines():
         line = raw_line.strip()
         if "|" not in line:
@@ -263,39 +324,59 @@ def _extract_pipe_plans(report_text: str) -> list[dict]:
         plan = _parse_pipe_plan_line(line)
         if plan:
             plans.append(plan)
-    
-    # Потом парсим секцию Synth (блок без |)
+
+    # 2) Block-стиль (Актив/Направление/Вход/...). Раньше парсер шёл по
+    # ВСЕЙ Synth-секции и подсасывал bullets из «👀 Точки наблюдения» и
+    # «📌 Эффекты», превращая их в фиктивные планы. Теперь жёстко
+    # обрезаем до блока «📋 Торговый план» и стопаемся на followup-маркерах.
     synth_section = _extract_synth_section(report_text)
-    if not synth_section:
+    plan_subsection = _extract_plan_subsection(synth_section)
+    if not plan_subsection:
         return plans
-    
+
     current_plan: Optional[dict] = None
-    for raw_line in synth_section.splitlines():
+    for raw_line in plan_subsection.splitlines():
+        # | формат уже обработан pipe-парсером выше. Если оставить эти
+        # строки block-парсеру — он стартует НОВЫЙ пустой план «BTC LONG»
+        # (по startswith("btc")) поверх уже распарсенного, дедуп их не
+        # сольёт (entry/target/stop разные), и юзер видит фантомные дубли.
+        if "|" in raw_line:
+            if current_plan and current_plan.get("symbol"):
+                plans.append(current_plan)
+                current_plan = None
+            continue
+
         line = _clean_line(raw_line)
         if not line or len(line) < 4:
             if current_plan and current_plan.get("symbol"):
                 plans.append(current_plan)
                 current_plan = None
             continue
-        
+
         lower = line.lower()
-        
-        # Заголовок плана — актив/символ
-        if lower.startswith("•") or lower.startswith("-") or lower.startswith("btc") or lower.startswith("eth") or lower.startswith("sol") or lower.startswith("cash"):
+
+        # «Триггер LONG …» — это monitoring-точка, а не новый план,
+        # даже если идёт на отдельной строке с маркером.
+        if lower.startswith("триггер") and ("long" in lower or "short" in lower):
+            continue
+
+        is_bullet = lower.startswith("•") or lower.startswith("-")
+        is_known_asset = any(lower.startswith(token) for token in ("btc", "eth", "sol", "spy", "qqq", "wti", "gold", "cash", "usd"))
+
+        if is_bullet or is_known_asset:
             if current_plan and current_plan.get("symbol"):
                 plans.append(current_plan)
-            
-            # Извлекаем символ
+
             label = line.lstrip("•- ").strip()
             direction = "CASH"
             if any(x in label.upper() for x in ("LONG", "BUY")):
                 direction = "LONG"
             elif any(x in label.upper() for x in ("SHORT", "SELL", "МЕДВ")):
                 direction = "SHORT"
-            
+
             sym_match = _SYMBOL_RE.search(label)
             sym = sym_match.group(1) if sym_match else label[:12]
-            
+
             current_plan = {
                 "label": label,
                 "symbol": sym,
@@ -308,18 +389,16 @@ def _extract_pipe_plans(report_text: str) -> list[dict]:
                 "rr": "",
                 "size": "",
             }
-        
+
         elif current_plan is not None:
-            # Парсим поля плана
-            lower = line.lower()
             if any(x in lower for x in ("вход", "entry", "стоп", "stop", "цель", "target", "тейк", "rr", "r/r", "размер", "size", "горизонт", "horizon", "триггер", "trigger")):
-                parts = line.split(":", 1)
-                if len(parts) >= 2:
-                    field = parts[0].lower().strip()
-                    val = parts[1].strip()
+                parts_split = line.split(":", 1)
+                if len(parts_split) >= 2:
+                    field = parts_split[0].lower().strip()
+                    val = parts_split[1].strip()
                     price_match = re.search(r"\$?([\d.,KkКк]+)", val)
                     p = _parse_price(price_match.group(1)) if price_match else None
-                    
+
                     if any(x in field for x in ("вход", "entry")):
                         current_plan["entry"] = p
                     elif any(x in field for x in ("стоп", "stop")):
@@ -334,28 +413,15 @@ def _extract_pipe_plans(report_text: str) -> list[dict]:
                         current_plan["horizon"] = val
                     elif "триггер" in field or "trigger" in field:
                         current_plan["trigger"] = val
-    
+
     if current_plan and current_plan.get("symbol"):
         plans.append(current_plan)
-    
-    # Also extract key trigger from synth section
-    trigger_patterns = [
-        r"ключевой\s+триггер[.:]\s*(.+?)(?:\n|$)",
-        r"триггер\s+(?:l?ong|short)[^.\n]{0,150}",
-        r"пробой\s+\$?[\d.,Kk]+",
-    ]
-    for pattern in trigger_patterns:
-        match = re.search(pattern, synth_section, re.IGNORECASE)
-        if match:
-            trigger_val = _clean_line(match.group(0))
-            # Check if not already in plans trigger
-            for plan in plans:
-                if not plan.get("trigger"):
-                # Only add if looks meaningful
-                    if len(trigger_val) > 10:
-                        plan["trigger"] = trigger_val
-                        break
-    
+
+    # Намеренно НЕ накатываем generic-fallback `trigger_patterns` поверх
+    # планов: раньше он подсасывал «Триггер LONG: Пробой $2350 → …»
+    # из «👀 Точки наблюдения» и приклеивал его к ETH CASH / SPY CASH,
+    # ломая каждый план. Если конкретный план явно не имеет триггера —
+    # пусть так и остаётся, лучше пусто чем чужой триггер.
     return plans
 
 
@@ -444,11 +510,77 @@ def extract_trade_plans(report_text: str) -> list[dict]:
     return unique
 
 
+_MONITORING_HEADERS = (
+    "👀 ТОЧКИ НАБЛЮДЕНИЯ",
+    "ТОЧКИ НАБЛЮДЕНИЯ",
+    "👀 Точки наблюдения",
+    "Точки наблюдения",
+)
+
+_MONITORING_END_MARKERS = (
+    "💬",
+    "📌",
+    "📡",
+    "🤝",
+    "⚠️",
+    "🚨",
+    "📊",
+    "📋",
+    "🎯",
+    "🧠",
+    "📜",
+)
+
+
+def _extract_monitoring_block_bullets(report_text: str) -> list[str]:
+    """
+    Достаём bullets из явной секции «👀 Точки наблюдения:». Эта секция
+    есть в Speechwriter-выходе и юзер ожидает увидеть её КАК ЕСТЬ
+    в дайджесте. Старая `extract_monitoring_points` ловила только
+    «Ключевой триггер ...» и «Триггер LONG ...» — а целые bullet-листы
+    типа «данные по CPI и ставке ФРС», «BTC $78,000 пробой вверх»
+    тупо терялись.
+    """
+    clean = _strip_markup(report_text)
+    upper = clean.upper()
+
+    start_idx = -1
+    for header in _MONITORING_HEADERS:
+        i = upper.find(header.upper())
+        if i != -1 and (start_idx == -1 or i < start_idx):
+            start_idx = i + len(header)
+    if start_idx == -1:
+        return []
+
+    block = clean[start_idx:start_idx + 1200]
+
+    end_idx = len(block)
+    for marker in _MONITORING_END_MARKERS:
+        i = block.find(marker)
+        if i != -1 and i < end_idx:
+            end_idx = i
+    block = block[:end_idx]
+
+    bullets: list[str] = []
+    for raw in block.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if not (line.startswith("•") or line.startswith("-") or line.startswith("—") or line.startswith("–")):
+            continue
+        cleaned = _clean_line(line)
+        if len(cleaned) < 4:
+            continue
+        bullets.append(cleaned)
+    return bullets
+
+
 def extract_monitoring_points(report_text: str) -> list[str]:
-    points = [
-        _extract_single_line(report_text, "Ключевой триггер для пересмотра"),
-        _extract_single_line(report_text, "Следующий уровень для мониторинга"),
-    ]
+    points: list[str] = []
+
+    points.extend(_extract_monitoring_block_bullets(report_text))
+    points.append(_extract_single_line(report_text, "Ключевой триггер для пересмотра"))
+    points.append(_extract_single_line(report_text, "Следующий уровень для мониторинга"))
 
     clean = _strip_markup(report_text)
     trigger_lines = re.findall(r"(Триггер\s+(?:LONG|SHORT)[^.\n]{0,180})", clean, re.IGNORECASE)
@@ -542,7 +674,13 @@ def build_digest_context(report_text: str, source_news: str = "") -> dict:
             plans = json_plans
     
     monitoring_points = extract_monitoring_points(report_text)
-    verdict_reason = _extract_single_line(report_text, "Потому что")
+    # Speechwriter рендерит «🧠 Почему: …», старый Synth писал «Потому что: …».
+    # Принимаем оба варианта — иначе в дайджесте просто исчезает строка
+    # «🧠 Почему», и юзер не понимает откуда вердикт.
+    verdict_reason = (
+        _extract_single_line(report_text, "Почему")
+        or _extract_single_line(report_text, "Потому что")
+    )
     key_trigger = _extract_key_trigger(report_text)
     monitoring_level = ""
     plain_language = extract_plain_language(report_text) or _clean_line(source_news)[:320]

@@ -39,7 +39,11 @@ from web_search import get_full_realtime_context
 from report_sanitizer import sanitize_full_report
 from chart_generator import generate_main_chart, generate_russia_chart
 from core import digest_context
-from core.digest_context import build_digest_context, format_digest_telegram_summary
+from core.digest_context import (
+    _plan_line as _digest_plan_line,
+    build_digest_context,
+    format_digest_telegram_summary,
+)
 from storage import Storage
 from analysis_service import (
     run_full_analysis as analysis_service_run_full_analysis,
@@ -413,149 +417,77 @@ def extract_symbols_from_report(report: str, prices: dict) -> tuple[dict, dict, 
 
 def build_short_report(parts: dict, stars: str, pct: int) -> list:
     """
-    Возвращает СПИСОК сообщений для отправки.
-    ПЕРВОЕ сообщение — полное (вердикт + торговый план + простыми словами + эффекты 2-го порядка).
-    Полные дебаты — в .txt файле.
+    Собирает ОДНО сообщение для пользователя в фиксированном layout'е:
+
+      📊 DIALECTIC EDGE — ЕЖЕДНЕВНЫЙ ДАЙДЖЕСТ
+      🕒 dd.mm.yyyy HH:MM
+
+      🎯 Вердикт: <emoji> <Бычий/Медвежий/Нейтральный>
+      📊 Сигнал: ⭐⭐⭐⭐⭐ (NN%)
+
+      🧠 Почему: …
+
+      📋 Торговый план:
+      • <symbol> <DIR> | вход $X | цель $Y | стоп $Z | горизонт N | триггер …
+
+      👀 Точки наблюдения:
+      • …
+
+      💬 Простыми словами: …
+
+      📜 Полный raw-ответ модели и полные дебаты доступны кнопками ниже.
+
+    Возвращает список из одного элемента, чтобы существующие caller'ы
+    (refactor/handlers/market_handler.py и т.п.) ломались только если
+    реально расчитывают на конкретное число чанков. Полный raw-отчёт
+    + полные дебаты пользователь забирает кнопками под сообщением.
     """
     now = datetime.now().strftime("%d.%m.%Y %H:%M")
     full = parts.get("full", "")
-    
-    # ─── Парсим вердикт и торговый план ───
-    verdict = extract_verdict_from_report(full) or "NEUTRAL"
-    verdict_emoji = {"BUY": "🟢", "SELL": "🔴", "NEUTRAL": "⚪️"}.get(verdict, "⚪️")
-    verdict_text = {"BUY": "БЫЧИЙ", "SELL": "МЕДВЕЖИЙ", "NEUTRAL": "НЕЙТРАЛЬНЫЙ"}.get(verdict, "НЕЙТРАЛЬНЫЙ")
 
-    # Парсим торговые планы
-    entries, stop_losses, targets, timeframes = extract_symbols_from_report(full, {})
+    digest_ctx = build_digest_context(full)
+    verdict_label = digest_ctx.get("verdict_label", "Нейтральный")
+    verdict_emoji = digest_ctx.get("verdict_emoji", "⚪️")
+    verdict_reason = digest_ctx.get("verdict_reason", "")
+    plans = digest_ctx.get("plans") or []
+    monitoring_points = digest_ctx.get("monitoring_points") or []
+    plain_language = digest_ctx.get("plain_language", "")
+    key_trigger = digest_ctx.get("key_trigger", "")
 
-    # ─── Собираем полное сообщение ───
-    lines = [
-        f"📊 *DIALECTIC EDGE — ЕЖЕДНЕВНЫЙ ДАЙДЖЕСТ*",
-        f"🕐 {now}",
+    lines: list[str] = [
+        "📊 *DIALECTIC EDGE — ЕЖЕДНЕВНЫЙ ДАЙДЖЕСТ*",
+        f"🕒 {now}",
         "",
-        f"🎯 *ВЕРДИКТ:* {verdict_emoji} *{verdict_text}*",
-        f"📊 Сигнал: {stars} ({pct}%)",
-        "",
-        f"{'─' * 30}",
-        "",
+        f"🎯 *Вердикт:* {verdict_emoji} *{verdict_label}*",
+        f"📊 *Сигнал:* {stars} ({pct}%)",
     ]
 
-    # ─── Парсим context для плана и причин ───
-    digest_ctx = build_digest_context(full)
-    verdict_reason = digest_ctx.get("verdict_reason", "")
-    plans = digest_ctx.get("plans", [])
-    key_trigger = digest_ctx.get("key_trigger", "")
-    monitoring_level = digest_ctx.get("monitoring_level", "")
-    monitoring_points = digest_ctx.get("monitoring_points", [])
-    
-    # Почему
     if verdict_reason:
-        lines.extend([f"🧠 *Почему:* {verdict_reason}", ""])
-    
-    # Торговый план
-    lines.append("📋 *ТОРГОВЫЙ ПЛАН:*")
+        lines.extend(["", f"🧠 *Почему:* {verdict_reason}"])
+
+    lines.extend(["", "📋 *Торговый план:*"])
     if plans:
         for plan in plans[:5]:
-            direction = plan.get("direction", "")
-            symbol = plan.get("symbol") or plan.get("label", "Актив")
-            entry = plan.get("entry")
-            target = plan.get("target")
-            stop = plan.get("stop")
-            horizon = plan.get("horizon", "")
-            
-            chunks = [f"• *{symbol}* {direction}"]
-            if entry:
-                chunks.append(f"вход ${entry:,.0f}")
-            if target:
-                chunks.append(f"цель ${target:,.0f}")
-            if stop:
-                chunks.append(f"стоп ${stop:,.0f}")
-            if horizon:
-                chunks.append(f"горизонт {horizon}")
-            lines.append(" ".join(chunks))
+            lines.append(f"• {_digest_plan_line(plan)}")
     elif key_trigger:
-        lines.append(f"⏳ {key_trigger}")
-        if monitoring_level:
-            lines.append(f"👀 Уровень мониторинга: {monitoring_level}")
-        if monitoring_points:
-            lines.append("")
-            for point in monitoring_points[:3]:
-                lines.append(f"• {point}")
+        lines.append(f"• {key_trigger}")
     else:
-        lines.append("⏳ Ждём подтверждения по триггерам")
-    
-    lines.append("")
-    
-    # ─── ПРОСТЫМИ СЛОВАМИ ───
-    # Вытаскиваем ровно один блок, останавливаясь на секциях любого из следующих блоков
-    # (📊 QE/QT, 🤝 Честно о боте, ⚠️ дисклеймер и т.д.) чтобы не втягивать их в блок.
-    # Раньше фильтр `len < 200` ловил эти короткие заголовки и совал в "Дайджест/Простыми словами".
-    plain_text = digest_context.extract_plain_language(full)
-    if plain_text:
-        lines.append("💬 *ПРОСТЫМИ СЛОВАМИ:*")
-        lines.append(f"▫️ {plain_text}")
-        lines.append("")
+        lines.append("• Явной сделки нет — ждём подтверждения по триггерам.")
 
-    # ─── ЭФФЕКТЫ 2-ГО ПОРЯДКА ───
-    effects_start = full.find("📌" if "📌" in full else "ЭФФЕКТ")
-    if effects_start != -1:
-        effects_block = full[effects_start:effects_start+800]
-        effect_lines = []
-        for line in effects_block.split("\n"):
-            if "→" in line and len(line.strip()) < 150:
-                effect_lines.append(line.strip())
-            if len(effect_lines) >= 3:
-                break
-        if effect_lines:
-            lines.append("🔗 *ЭФФЕКТЫ 2-ГО ПОРЯДКА:*")
-            for el in effect_lines[:3]:
-                lines.append(f"▫️ {el}")
-            lines.append("")
+    if monitoring_points:
+        lines.extend(["", "👀 *Точки наблюдения:*"])
+        for point in monitoring_points[:4]:
+            lines.append(f"• {point}")
 
-    # ─── РЕЖИМ РЫНКА ───
-    for marker in ["📡 РЕЖИМ РЫНКА:", "РЕЖИМ РЫНКА:"]:
-        idx = full.find(marker)
-        if idx != -1:
-            mode_section = full[idx:idx+300]
-            mode_lines = [l.strip() for l in mode_section.split("\n") if l.strip() and len(l.strip()) < 120][:3]
-            if mode_lines:
-                lines.append("📈 *РЕЖИМ РЫНКА:*")
-                for ml in mode_lines:
-                    if any(w in ml for w in ["VIX", "Fear", "Risk", "SPX", "BTC"]):
-                        lines.append(f"▫️ {ml}")
-            break
+    if plain_language:
+        lines.extend(["", f"💬 *Простыми словами:* {plain_language}"])
 
-    lines.append(f"{'─' * 30}")
-    lines.append("")
-    lines.append("📎 Полные дебаты — в файле ниже")
+    lines.extend([
+        "",
+        "📜 Полный raw-ответ модели и полные дебаты доступны кнопками ниже.",
+    ])
 
-    messages = ["\n".join(lines)]
-    
-    # ─── Второе сообщение — Synth секция (вердикт + план) ───
-    # Ищем секцию Synth начиная с "⚖️"
-    synth_markers = ["⚖️ *ВЕРДИКТ И ТОРГОВЫЙ ПЛАН*", "⚖️ ВЕРДИКТ И ТОРГОВЫЙ ПЛАН", 
-                     "⚖️ *ИТОГОВЫЙ СИНТЕЗ*", "🏆 ВЕРДИКТ"]
-    
-    synth_start_idx = -1
-    for marker in synth_markers:
-        synth_start_idx = full.find(marker)
-        if synth_start_idx != -1:
-            break
-    
-    if synth_start_idx == -1:
-        # Fallback на поиск любой секции Synth
-        for marker in ["ПОТОМУ ЧТО", "ИТОГОВЫЙ", "СИНТЕЗ"]:
-            synth_start_idx = full.find(marker)
-            if synth_start_idx != -1:
-                break
-    
-    if synth_start_idx != -1:
-        # Берём до 3500 символов (второе сообщение в Telegram)
-        synth_section = full[synth_start_idx:synth_start_idx + 3500]
-        if synth_section.strip():
-            messages.append(synth_section.strip())
-
-    return messages
+    return ["\n".join(lines)]
 
 
 async def send_debates_attachment(chat_id: int, rounds: list[str]) -> None:
@@ -672,21 +604,32 @@ async def send_daily_digest_bundle(
 
     messages = build_short_report(parts, stars_str, pct_val)
     logger.info(f"Отправляю {len(messages)} сообщений. Размеры: {[len(m) for m in messages]}")
+
+    rounds_out = debate_cache.get(user_id, {}).get("rounds") or []
+    keyboard = main_report_keyboard(user_id, has_debates=bool(rounds_out))
+
+    # Один основной digest-блок: к нему прицепляем клавиатуру с двумя кнопками
+    # ("📜 Показать всё" + "📖 Полные дебаты агентов") — чтобы строка
+    # "Полный raw-ответ модели и полные дебаты доступны кнопками ниже"
+    # действительно заканчивалась кнопками без отдельного "Полный анализ выше"
+    # сообщения посередине.
     for i, msg in enumerate(messages):
         logger.info(f"Отправляю чанк {i+1}/{len(messages)}, размер: {len(msg)}")
-        await bot.send_message(chat_id, clean_markdown(msg), parse_mode="Markdown")
+        is_last = i == len(messages) - 1
+        await bot.send_message(
+            chat_id,
+            clean_markdown(msg),
+            parse_mode="Markdown",
+            reply_markup=keyboard if is_last else None,
+        )
         if i == 0:
             await send_digest_chart(chat_id, report, prices_dict or {}, stars_str, pct_val)
-        await asyncio.sleep(0.3)
-    await bot.send_message(
-        chat_id,
-        "Полный анализ выше.\n"
-        "📎 Сразу после этой кнопки придёт файл со всеми дебатами — он не пропадёт при рестарте бота.",
-        reply_markup=main_report_keyboard(
-            user_id, has_debates=bool(debate_cache.get(user_id, {}).get("rounds")),
-        ),
-    )
-    rounds_out = debate_cache.get(user_id, {}).get("rounds") or []
+        if not is_last:
+            await asyncio.sleep(0.3)
+
+    # Полные дебаты файлом — пользователь забирает их и кнопкой "📖 Полные
+    # дебаты агентов" (callback `debate:{user_id}:0`), и сразу здесь как
+    # неубиваемое txt-вложение, чтобы рестарт Railway не уничтожил историю.
     if rounds_out:
         await asyncio.sleep(0.25)
         await send_debates_attachment(chat_id, rounds_out)
