@@ -10,7 +10,9 @@ agents.py — Система 4 AI-АГЕНТОВ-ДЕБАТЁРОВ v7.1
 """
 
 import asyncio
+import json
 import logging
+import re
 from dataclasses import dataclass, field
 from datetime import datetime
 
@@ -478,6 +480,100 @@ class ConsensusSynth(BaseAgent):
         super().__init__("Consensus Synthesizer", "⚖️", SYNTH_SYSTEM, "synth")
 
 
+_SPEECHWRITER_TIMEOUT_S = 45.0
+_CODE_FENCE_RE = re.compile(r"^```[a-zA-Z0-9]*\s*\n?|\n?```\s*$", re.MULTILINE)
+
+
+def _strip_code_fences(text: str) -> str:
+    """Some LLMs wrap output in ```...``` even when told not to. Strip them."""
+    if not text:
+        return text
+    cleaned = _CODE_FENCE_RE.sub("", text).strip()
+    return cleaned or text
+
+
+def _extract_json_obj(text: str) -> dict | None:
+    """Extract the first JSON object from arbitrary LLM text. Returns None on failure."""
+    if not text:
+        return None
+    raw = _strip_code_fences(text).strip()
+    try:
+        return json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        pass
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start != -1 and end > start:
+        try:
+            return json.loads(raw[start : end + 1])
+        except (json.JSONDecodeError, TypeError):
+            return None
+    return None
+
+
+def _format_price(value) -> str:
+    """Format a price-like value for the trade plan line."""
+    if value is None or value == "":
+        return "—"
+    if isinstance(value, (int, float)):
+        if value >= 1000:
+            return f"${value:,.0f}".replace(",", " ")
+        return f"${value:g}"
+    s = str(value).strip()
+    if s and s[0].isdigit():
+        return f"${s}"
+    return s
+
+
+def _render_trade_plan_from_json(data: dict) -> str:
+    """Deterministic Telegram-ready text rendering of Synth JSON.
+    Used when Synth returns parseable JSON, avoiding an extra LLM call entirely.
+    """
+    verdict = str(data.get("verdict", "НЕЙТРАЛЬНЫЙ")).upper().strip() or "НЕЙТРАЛЬНЫЙ"
+    reason = str(data.get("reason", "")).strip()
+    plans = data.get("plans") or []
+    key_trigger = str(data.get("key_trigger", "")).strip()
+    simple = str(data.get("simple", "")).strip()
+    qe_qt = str(data.get("qe_qt", "NEUTRAL")).upper().strip() or "NEUTRAL"
+
+    lines: list[str] = []
+    lines.append(f"🏆 ВЕРДИКТ СУДЬИ: {verdict}")
+    if reason:
+        lines.append(f"Потому что: {reason}")
+    lines.append("")
+    lines.append("📋 ТОРГОВЫЙ ПЛАН:")
+    if isinstance(plans, list) and plans:
+        for p in plans:
+            if not isinstance(p, dict):
+                continue
+            sym = str(p.get("symbol", "")).upper() or "?"
+            direction = str(p.get("direction", "")).upper()
+            if direction in {"CASH", "WAIT", "FLAT"}:
+                trigger = str(p.get("trigger") or p.get("entry") or "—")
+                lines.append(f"• {sym} | CASH | Триггер: {trigger}")
+                continue
+            entry = _format_price(p.get("entry"))
+            stop = _format_price(p.get("stop"))
+            target = _format_price(p.get("target"))
+            rr = str(p.get("rr", "")).strip() or "—"
+            size = str(p.get("size", "")).strip() or "—"
+            lines.append(
+                f"• {sym} | {direction or '—'} | Вход: {entry} | Стоп: {stop} | Цель: {target} | R/R: {rr} | {size} депозита"
+            )
+    else:
+        lines.append("• нет идей с положительным ожиданием — стой в стороне")
+    lines.append("")
+    if key_trigger:
+        lines.append(f"👀 КЛЮЧЕВОЙ ТРИГГЕР: {key_trigger}")
+        lines.append("")
+    if simple:
+        lines.append(f"💬 ПРОСТЫМИ СЛОВАМИ: {simple}")
+        lines.append("")
+    qe_qt_word = {"QE": "растёт", "QT": "падает"}.get(qe_qt, "нейтральна")
+    lines.append(f"📊 QE/QT РЕЖИМ: {qe_qt} — ликвидность {qe_qt_word}")
+    return "\n".join(lines).rstrip()
+
+
 class Speechwriter:
     """Speechwriter — форматирует JSON от Synth в красивый текст для Telegram."""
 
@@ -487,7 +583,25 @@ class Speechwriter:
     async def format(self, synth_json: str) -> str:
         """
         Принимает JSON (или текст) от Synth и превращает в читаемый торговый план.
+
+        Стратегия:
+          1. Если Synth вернул валидный JSON → рендерим детерминированно (быстро,
+             без LLM-вызова, без галлюцинаций, цифры один-в-один).
+          2. Иначе → зовём LLM с таймаутом и пост-обработкой (снятие ```code fences```).
+          3. Если и это сломалось → возвращаем сырой ввод как fallback.
         """
+        # 1. Strict path: deterministic rendering when Synth returned clean JSON.
+        data = _extract_json_obj(synth_json)
+        if data is not None:
+            try:
+                rendered = _render_trade_plan_from_json(data)
+                if rendered.strip():
+                    logger.info("[SPEECHWRITER] Deterministic render OK (no LLM call)")
+                    return rendered
+            except Exception as e:
+                logger.warning(f"[SPEECHWRITER] Deterministic render failed, falling back to LLM: {e}")
+
+        # 2. LLM fallback for free-form Synth output.
         from ai_provider import ai
 
         prompt = f"""Преобразуй данные ниже в читаемый торговый план:
@@ -511,8 +625,14 @@ class Speechwriter:
 """
 
         try:
-            response = await ai.synth(prompt=prompt, system=self.system_prompt)
-            return response
+            response = await asyncio.wait_for(
+                ai.synth(prompt=prompt, system=self.system_prompt),
+                timeout=_SPEECHWRITER_TIMEOUT_S,
+            )
+            return _strip_code_fences(response or "") or synth_json
+        except asyncio.TimeoutError:
+            logger.warning(f"[SPEECHWRITER] timed out after {_SPEECHWRITER_TIMEOUT_S}s, returning raw synth")
+            return synth_json
         except Exception as e:
             logger.error(f"Speechwriter error: {e}")
             return synth_json  # fallback — выводим как есть
@@ -595,23 +715,29 @@ class DebateOrchestrator:
 
         # ─── Hallucination tracking ───────────────────────────────────────────
         try:
-            import re as _re
             from ai_provider import track_hallucinations, log_hallucination_stats
 
-            verifier_text = history.last_message_by("Verifier") or ""
+            verifier_text = (history.last_message_by("Verifier") or "")[:2000]
             bull_all = " ".join(m.content for m in history.messages if "Bull" in m.agent)
             bear_all = " ".join(m.content for m in history.messages if "Bear" in m.agent)
-
-            # Verifier отмечает ГАЛЛЮЦИНАЦИЯ — считаем
-            hall_bull = len(_re.findall(r"ГАЛЛЮЦИНАЦИЯ", verifier_text[:2000])) if verifier_text else 0
 
             # Count total agent arguments (paragraphs that look like arguments)
             bull_args = max(1, len([p for p in bull_all.split("\n") if p.strip().startswith("•") or p.strip().startswith("-")]))
             bear_args = max(1, len([p for p in bear_all.split("\n") if p.strip().startswith("•") or p.strip().startswith("-")]))
 
-            # Отдельно считаем галлюцинации Bull из Verifier-ответа
-            bull_halls = len(_re.findall(r"ГАЛЛЮЦИНАЦИЯ", verifier_text[:2000]))
-            bear_halls = len(_re.findall(r"Bear.*ГАЛЛЮЦИНАЦИЯ|Bull.*ГАЛЛЮЦИНАЦИЯ", verifier_text[:2000])) // 2
+            # Verifier marks hallucinations per-line; attribute each one to Bull or Bear
+            # by looking for the agent name in the same line. Lines mentioning neither
+            # are ignored (avoids the previous bug where ALL hallucinations were attributed
+            # to Bull, and Bear count was a divided-by-2 hack).
+            bull_halls = 0
+            bear_halls = 0
+            for line in verifier_text.splitlines():
+                if "ГАЛЛЮЦИНАЦИЯ" not in line:
+                    continue
+                if "Bull" in line:
+                    bull_halls += 1
+                if "Bear" in line:
+                    bear_halls += 1
 
             track_hallucinations("bull", bull_args, bull_halls)
             track_hallucinations("bear", bear_args, bear_halls)

@@ -57,9 +57,6 @@ def save_prices_to_github(prices: dict):
         logger.warning("No GITHUB_TOKEN - prices not saved")
         return
     try:
-        import base64
-        import requests
-        
         content = json.dumps(prices, indent=2, ensure_ascii=False)
         
         resp = requests.get(GITHUB_PRICES_URL, headers={"Authorization": f"token {GITHUB_TOKEN}"}, timeout=10)
@@ -330,17 +327,9 @@ class DigestParser:
                             "asset": asset, "forecast": direction, "forecast_type": "direction"
                         })
                     break
-        
-        if verdict_direction:
-            key = f"VERDICT:{verdict_direction}:{date}"
-            if key not in seen:
-                seen.add(key)
-                forecasts.append({
-                    "date": date, "type": "Daily Digest",
-                    "asset": "VERDICT", "forecast": verdict_direction, "forecast_type": "direction"
-                })
-        
-        for pattern, asset in price_patterns:
+
+            # FIX: price extraction must run per-line, not once after the loop.
+            for pattern, asset in price_patterns:
                 match = re.search(pattern, line, re.IGNORECASE)
                 if match:
                     price = match.group(1)
@@ -356,7 +345,16 @@ class DigestParser:
                             "asset": asset_norm, "forecast": price, "forecast_type": "price"
                         })
                     break
-        
+
+        if verdict_direction:
+            key = f"VERDICT:{verdict_direction}:{date}"
+            if key not in seen:
+                seen.add(key)
+                forecasts.append({
+                    "date": date, "type": "Daily Digest",
+                    "asset": "VERDICT", "forecast": verdict_direction, "forecast_type": "direction"
+                })
+
         return forecasts
 
 

@@ -16,9 +16,15 @@ scorer.py — Система баллов для вердикта
 - VIX < 15 + F&G > 70 → БЫЧИЙ
 """
 
+from __future__ import annotations
+
 import logging
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .onchain import OnChainMetrics
+    from .macro_extended import MacroExtended
 
 logger = logging.getLogger(__name__)
 
@@ -417,7 +423,11 @@ def format_scored_context_for_agents(score: MarketScore) -> str:
     return "\n".join(lines)
 
 
-def format_signal_block_for_debates(score: MarketScore, onchain: 'OnChainMetrics' = None, macro: 'MacroExtended' = None) -> str:
+def format_signal_block_for_debates(
+    score: MarketScore,
+    onchain: OnChainMetrics | None = None,
+    macro: MacroExtended | None = None,
+) -> str:
     """
     Формирует структурированный СИГНАЛ БЛОК для Bull/Bear агентов.
     Агенты должны читать этот блок и использовать в аргументах.
