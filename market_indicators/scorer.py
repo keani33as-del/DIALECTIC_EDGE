@@ -462,27 +462,31 @@ def format_signal_block_for_debates(
     if score.has_critical_bearish:
         bear_list.append("🚨 MVRV>3.5 / VIX>40 / ПУЗЫРЬ — критический медвежий")
     
-    # Ончейн данные
+    # Ончейн данные (.2f для MVRV — совпадает с каноническим он-чейн блоком)
     if onchain:
         if onchain.mvrv > 3.5:
-            bear_list.append(f"MVRV {onchain.mvrv:.1f} — ПЕРЕОЦЕНЁН (риск коррекции)")
-        elif onchain.mvrv < 1.0:
-            bull_list.append(f"MVRV {onchain.mvrv:.1f} — ИСТОРИЧЕСКОЕ ДНО (opportunity)")
+            bear_list.append(f"MVRV {onchain.mvrv:.2f} — ПЕРЕОЦЕНЁН (риск коррекции)")
+        elif 0 < onchain.mvrv < 1.0:
+            bull_list.append(f"MVRV {onchain.mvrv:.2f} — ИСТОРИЧЕСКОЕ ДНО (opportunity)")
         elif onchain.mvrv > 3.0:
-            neutral_list.append(f"MVRV {onchain.mvrv:.1f} — Высокий (внимание)")
-        else:
-            bull_list.append(f"MVRV {onchain.mvrv:.1f} — Норма/Справедливо (бычий)")
-        
+            neutral_list.append(f"MVRV {onchain.mvrv:.2f} — Высокий (внимание)")
+        elif onchain.mvrv > 0:
+            bull_list.append(f"MVRV {onchain.mvrv:.2f} — Норма/Справедливо (бычий)")
+        # else: mvrv == 0 — placeholder/N/A, ничего не добавляем
+
         if onchain.sopr > 1.05:
             bear_list.append(f"SOPR {onchain.sopr:.3f} — Фиксация прибыли (осторожно)")
-        elif onchain.sopr < 0.95:
+        elif 0 < onchain.sopr < 0.95:
             bull_list.append(f"SOPR {onchain.sopr:.3f} — Капитуляция (дно?)")
-        
-        if "HODL" in (onchain.exchange_reserves_signal or ""):
+        # SOPR == 0 — placeholder, ничего не цитируем
+
+        # Читаем dataclass-поле reserves_signal (раньше был typo — exchange_reserves_signal)
+        reserves_str = (getattr(onchain, "reserves_signal", "") or "")
+        if "HODL" in reserves_str:
             bull_list.append("Exchange Reserves падают — HODLing фаза (🟢 бычий)")
-        elif "продажа" in (onchain.exchange_reserves_signal or "").lower():
+        elif "продажа" in reserves_str.lower():
             bear_list.append("Exchange Reserves растут — продажа (🔴 медвежий)")
-        
+
         if "+" in (onchain.active_addresses_signal or "") or "растёт" in (onchain.active_addresses_signal or "").lower():
             bull_list.append("Active Addresses растут — здоровый рост (🟢 бычий)")
     

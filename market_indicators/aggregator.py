@@ -91,7 +91,7 @@ async def build_enriched_context(
         # Ончейн
         mvrv=enriched.onchain.mvrv if enriched.onchain else None,
         sopr=enriched.onchain.sopr if enriched.onchain else None,
-        exchange_reserves_trend="down" if enriched.onchain and enriched.onchain.exchange_reserves_signal and "HODL" in enriched.onchain.exchange_reserves_signal else "up",
+        exchange_reserves_trend="down" if enriched.onchain and getattr(enriched.onchain, "reserves_signal", None) and "HODL" in enriched.onchain.reserves_signal else "up",
         
         # Технические
         rsi=rsi_btc,
