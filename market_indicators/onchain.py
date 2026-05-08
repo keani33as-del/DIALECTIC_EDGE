@@ -140,35 +140,31 @@ async def fetch_btc_onchain() -> OnChainMetrics:
         logger.warning(f"[ON-CHAIN] MVRV estimation failed: {e}")
         metrics.mvrv = 2.0
 
-    if metrics.mvrv > 3.5:
-        metrics.mvrv_signal = "🔴 ПЕРЕОЦЕНЁН (MVRV > 3.5)"
-        logger.warning(f"[ON-CHAIN] MVRV {metrics.mvrv:.2f} > 3.5: ПЕРЕОЦЕНЁН")
-    elif metrics.mvrv > 3.0:
-        metrics.mvrv_signal = "🟡 Высокий (3.0-3.5)"
-        logger.info(f"[ON-CHAIN] MVRV {metrics.mvrv:.2f}: Высокий")
-    elif metrics.mvrv >= 1.0 and metrics.mvrv <= 2.0:
-        metrics.mvrv_signal = "🟢 Справедливая цена (1.0-2.0)"
-        logger.info(f"[ON-CHAIN] MVRV {metrics.mvrv:.2f}: Справедливая цена")
-    elif metrics.mvrv < 1.0:
-        metrics.mvrv_signal = "🟢🔵 ИСТОРИЧЕСКОЕ ДНО (MVRV < 1.0)"
-        logger.warning(f"[ON-CHAIN] MVRV {metrics.mvrv:.2f} < 1.0: ИСТОРИЧЕСКОЕ ДНО")
-    else:
-        metrics.mvrv_signal = "⚪ Норма (2.0-3.0)"
-        logger.info(f"[ON-CHAIN] MVRV {metrics.mvrv:.2f}: Норма")
+    # Единый формат MVRV-сигнала с конкретным значением.
+    # Прежде были две версии: инлайн без числа (банд only) и помощник `get_mvrv_signal`
+    # с числом — Verifier не находил цифру в каноническом блоке и помечал
+    # валидные аргументы Bull/Bear как галлюцинации.
+    metrics.mvrv_signal = get_mvrv_signal(metrics.mvrv)
+    logger.info(f"[ON-CHAIN] MVRV {metrics.mvrv:.2f}: {metrics.mvrv_signal}")
 
-    # SOPR — требует Glassnode, используем заглушку
-    metrics.sopr = 1.02
-    metrics.sopr_signal = "⚪ SOPR ~1.02 (фиксация прибыли минимальная)"
+    # SOPR — требует Glassnode ПРО API. Пока выводим явным placeholder'ом,
+    # чтобы агенты не цитировали хардкод 1.02 как реальное измерение.
+    metrics.sopr = 0.0  # 0.0 → скорер пропустит баллы SOPR как невалидные
+    metrics.sopr_signal = "⚪ SOPR недоступен (нужен Glassnode API — placeholder)"
     logger.info(f"[ON-CHAIN] SOPR: {metrics.sopr_signal}")
 
-    # Exchange Reserves — используем volume как proxy
+    # Exchange Reserves — используем volume как proxy.
+    # Используем именно поле dataclass `reserves_signal` (раньше писали в
+    # `exchange_reserves_signal`, этого поля в dataclass нет — attr создавался
+    # динамически, а `format_onchain_for_agents` читал `reserves_signal` и получал
+    # дефолт "N/A" — канонический блок был бесполезным).
     if metrics.tx_volume_24h > 30:
-        metrics.exchange_reserves_signal = "🟡 Высокая активность на биржах"
+        metrics.reserves_signal = "🟡 Высокая активность на биржах"
     elif metrics.tx_volume_24h > 15:
-        metrics.exchange_reserves_signal = "🟢 Нормальная активность"
+        metrics.reserves_signal = "🟢 Нормальная активность"
     else:
-        metrics.exchange_reserves_signal = "🟢🔵 HODLing фаза (низкая активность)"
-    logger.info(f"[ON-CHAIN] Exchange Activity: {metrics.exchange_reserves_signal}")
+        metrics.reserves_signal = "🟢🔵 HODLing фаза (низкая активность)"
+    logger.info(f"[ON-CHAIN] Exchange Activity: {metrics.reserves_signal}")
 
     logger.info(f"[ON-CHAIN] DONE — MVRV={metrics.mvrv:.2f}, SOPR={metrics.sopr:.3f}, Vol=${metrics.tx_volume_24h:.1f}B")
     return metrics
@@ -256,27 +252,49 @@ def get_exchange_reserves_signal(change_7d: float) -> str:
 
 
 def format_onchain_for_agents(metrics: OnChainMetrics) -> str:
-    """Форматирует on-chain метрики для AI агентов"""
-    
+    """Форматирует on-chain метрики для AI агентов.
+
+    Инвариант для Verifier: каждая цифра, которую может процитировать
+    Bull/Bear, должна встречаться в этом каноническом блоке в точно той
+    же форме (.2f для MVRV, .3f для SOPR, .1f для volume и резервов).
+    Иначе валидные аргументы пойдут в галлюцинации и вердикт перекосит.
+    """
+
     lines = ["=== ON-CHAIN МЕТРИКИ (BTC) ==="]
-    
-    # MVRV — самый важный
-    lines.append(f"• MVRV: {metrics.mvrv_signal}")
-    lines.append(f"• SOPR: {metrics.sopr_signal}")
-    lines.append(f"• Exchange Activity: {metrics.reserves_signal}")
+
+    # MVRV — самый важный, всегда с конкретным числом
+    if metrics.mvrv and metrics.mvrv > 0:
+        lines.append(f"• MVRV: {metrics.mvrv:.2f} — {metrics.mvrv_signal}")
+    else:
+        lines.append(f"• MVRV: {metrics.mvrv_signal}")
+
+    # SOPR — избегаем показывать фейковые числа. metrics.sopr <= 0 — placeholder.
+    if metrics.sopr and metrics.sopr > 0:
+        lines.append(f"• SOPR: {metrics.sopr:.3f} — {metrics.sopr_signal}")
+    else:
+        lines.append(f"• SOPR: {metrics.sopr_signal}")
+
+    # Exchange Activity — читаем dataclass-поле reserves_signal
+    # (раньше производитель писал в exchange_reserves_signal — и оно было “N/A”)
+    reserves_line = metrics.reserves_signal or "N/A"
+    if metrics.exchange_reserves_change_7d:
+        sign = "↑" if metrics.exchange_reserves_change_7d > 0 else "↓"
+        reserves_line += f" ({sign}{abs(metrics.exchange_reserves_change_7d):.1f}% за 7д)"
+    lines.append(f"• Exchange Activity: {reserves_line}")
+
     lines.append(f"• 24h Volume: ${metrics.tx_volume_24h:.1f}B")
-    
-    # Сигналы для AI
+
+    # Сигналы для AI — только когда есть реальные данные
     if metrics.mvrv > 3.5:
         lines.append("⚠️ MVRV > 3.5 = КРИТИЧЕСКИЙ — высокий риск коррекции")
-    elif metrics.mvrv < 1.0:
+    elif metrics.mvrv > 0 and metrics.mvrv < 1.0:
         lines.append("🔵 MVRV < 1.0 = КРИТИЧЕСКИЙ — исторически дно, opportunity")
-    
-    if metrics.sopr > 1.05:
+
+    if metrics.sopr and metrics.sopr > 1.05:
         lines.append("⚠️ SOPR > 1.05 = инвесторы фиксируют прибыль")
-    elif metrics.sopr < 0.95:
+    elif metrics.sopr and 0 < metrics.sopr < 0.95:
         lines.append("🔵 SOPR < 0.95 = капитуляция, возможно дно")
-    
+
     return "\n".join(lines)
 
 
@@ -291,7 +309,7 @@ if __name__ == "__main__":
         print(f"SOPR: {metrics.sopr:.3f}")
         print(f"SOPR Signal: {metrics.sopr_signal}")
         print(f"24h Volume: ${metrics.tx_volume_24h:.1f}B")
-        print(f"Reserves Signal: {metrics.exchange_reserves_signal}")
+        print(f"Reserves Signal: {metrics.reserves_signal}")
         print()
         print(format_onchain_for_agents(metrics))
     
