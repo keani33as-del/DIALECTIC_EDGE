@@ -41,7 +41,7 @@ async def init_db():
         # Добавляем колонку signals_sub если её нет (для обновления с существующей БД)
         try:
             await db.execute("ALTER TABLE users ADD COLUMN signals_sub INTEGER DEFAULT 0")
-        except:
+        except Exception:
             pass  # Колонка уже существует
 
         await db.execute("""
@@ -398,7 +398,7 @@ async def import_forecasts_from_markdown():
             accuracy_text = parts[7].strip().replace("%", "").replace("*", "")
             try:
                 pnl_pct = float(accuracy_text)
-            except:
+            except (TypeError, ValueError):
                 pnl_pct = 0.0
             if "неверно" in result_text:
                 result = "loss"
@@ -857,6 +857,17 @@ async def set_backtest_enabled(enabled: bool) -> dict:
         """, (1 if enabled else 0,))
         await db.commit()
     return await get_backtest_config()
+
+
+async def clear_backtest_signals(reset_capital: float = 100.0) -> None:
+    """Wipe all backtest signals and reset capital — used by /backtest_clear."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM backtest_signals")
+        await db.execute(
+            "UPDATE backtest_config SET capital = ?, last_updated = datetime('now') WHERE id = 1",
+            (reset_capital,),
+        )
+        await db.commit()
 
 
 # ─── Daily Context ─────────────────────────────────────────────────────────────

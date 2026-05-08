@@ -66,6 +66,7 @@ from database import (
     add_portfolio_position, get_portfolio, remove_portfolio_position,
     add_backtest_signal, close_backtest_signal, get_backtest_signals, get_backtest_stats,
     get_backtest_config, update_backtest_capital, set_backtest_enabled,
+    clear_backtest_signals,
     save_daily_context, get_daily_context,
     get_predictions_summary,
 )
@@ -925,7 +926,6 @@ async def cmd_close_position(message: Message):
     """Close a specific position manually: /close BTC"""
     try:
         from signal_trader import get_signal_trader_status, fetch_current_prices, _parse_trade_meta
-        from database import close_backtest_signal, get_backtest_signals, get_backtest_config, update_backtest_capital
         from session_manager import session_manager
 
         args = message.text.split(maxsplit=1)
@@ -1921,7 +1921,6 @@ async def cmd_russia(message: Message):
             logger.info("Russia пост-фильтр: удалено строк: %d", _san_lines_ru)
 
         # Кэшируем
-        from datetime import datetime
         import time
         russia_cache["report"]    = report
         russia_cache["timestamp"] = datetime.now().strftime("%d.%m.%Y %H:%M")
@@ -2681,7 +2680,6 @@ async def cmd_weekly(message: Message):
 
 
 # ─── /subscribe ───────────────────────────────────────────────────────────────
-from datetime import datetime
 
 @dp.message(Command("subscribe"))
 async def cmd_subscribe(message: Message):
@@ -2690,8 +2688,6 @@ async def cmd_subscribe(message: Message):
     user      = await get_user(user_id)
     is_subbed = user.get("daily_sub", 0) if user else 0
     sub_time  = user.get("sub_time", "08:00") if user else "08:00"
-    
-    from datetime import datetime
     current_utc = datetime.utcnow().strftime("%H:%M UTC")
 
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -2935,28 +2931,6 @@ async def cmd_help(message: Message):
 @dp.message(Command("admin"))
 async def cmd_admin(message: Message):
     await handle_stats_command(message)
-    return
-    if message.from_user.id not in ADMIN_IDS:
-        return
-    stats    = await get_admin_stats()
-    fb       = await get_feedback_stats()
-    tr       = await get_track_record()
-    tr_stats = tr["stats"]
-    wins     = tr_stats.get("wins") or 0
-    losses   = tr_stats.get("losses") or 0
-    winrate  = (wins / (wins + losses) * 100) if (wins + losses) > 0 else 0
-
-    await message.answer(
-        f"🔧 *ADMIN*\n\n"
-        f"👥 Пользователи: {stats['total_users']} | Активных: {stats['active_week']}\n"
-        f"📬 Подписчики: {stats['subscribers']}\n"
-        f"📊 Запросов: {stats['total_reports']}\n\n"
-        f"👍 Фидбек: {fb.get('positive',0)}+ / {fb.get('negative',0)}-\n\n"
-        f"🎯 Track Record:\n"
-        f"Прогнозов: {tr_stats.get('total',0)} | Winrate: {winrate:.0f}%\n"
-        f"Avg P&L: {(tr_stats.get('avg_pnl') or 0):+.1f}%",
-        parse_mode="Markdown"
-    )
 
 
 # ─── Фидбек ───────────────────────────────────────────────────────────────────
@@ -3006,7 +2980,6 @@ async def cb_trackrecord_all(callback: CallbackQuery):
 # ─── Запуск ───────────────────────────────────────────────────────────────────
 
 async def set_bot_commands(bot: Bot):
-    from aiogram.types import BotCommand
     commands = [
         BotCommand(command="start", description="Перезапуск бота"),
         BotCommand(command="help", description="Справка"),
@@ -3104,8 +3077,6 @@ async def main():
 
 # ─── Портфельный трекер ─────────────────────────────────────────────────────────
 
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-
 user_portfolio_state = {}  # user_id: {"symbol": str, "step": str}
 
 
@@ -3192,64 +3163,6 @@ async def cmd_portfolio(message: Message):
 @dp.callback_query(F.data.startswith("portfolio:"))
 async def handle_portfolio_callback(callback: CallbackQuery):
     await handle_portfolio_action(callback)
-    return
-
-    user_id = callback.from_user.id
-    parts = callback.data.split(":")
-    action = parts[1] if len(parts) > 1 else ""
-    symbol = parts[2] if len(parts) > 2 else ""
-    
-    await callback.answer()
-    
-    if action == "add_select":
-        await callback.message.edit_text("Выбери криптовалюту:", reply_markup=select_crypto_keyboard())
-    
-    elif action == "add_amount":
-        user_portfolio_state[user_id] = {"symbol": symbol, "step": "amount"}
-        await callback.message.edit_text(f"Сколько {symbol} ты купил?\nВведи число (например 0.5)")
-    
-    elif action == "menu":
-        await callback.message.delete()
-        await show_portfolio(callback)
-    
-    elif action == "refresh":
-        await callback.message.edit_text("⏳ Обновляю...")
-        await show_portfolio(callback)
-    
-    elif action.startswith("cmd:"):
-        cmd = action.replace("cmd:", "")
-        await callback.message.delete()
-        if cmd == "profile":
-            await cmd_profile(callback.message)
-        elif cmd == "daily":
-            await cmd_daily(callback.message)
-        elif cmd == "status":
-            await cmd_status(callback.message)
-        elif cmd == "trackrecord":
-            await cmd_trackrecord(callback.message)
-    
-    elif action == "remove_select":
-        positions = await get_portfolio(user_id)
-        if not positions:
-            await callback.message.edit_text("Нечего удалять!", reply_markup=portfolio_keyboard(False))
-        else:
-            buttons = []
-            for pos in positions:
-                s = pos["symbol"]
-                a = pos["amount"]
-                buttons.append([InlineKeyboardButton(
-                    text=f"🗑 {s} ({a})",
-                    callback_data=portfolio_cb.new(action="confirm_remove", symbol=s)
-                )])
-            buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data=portfolio_cb.new(action="menu", symbol=""))])
-            await callback.message.edit_text("Что удалить?", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
-    
-    elif action == "confirm_remove":
-        await remove_portfolio_position(user_id, symbol)
-        await callback.message.edit_text(f"✅ {symbol} удалён из портфеля")
-        await asyncio.sleep(1)
-        await callback.message.delete()
-        await cmd_portfolio(callback.message)
 
 
 @dp.message(Command("add"))
@@ -3258,36 +3171,6 @@ async def cmd_add_portfolio(message: Message):
     user_id = message.from_user.id
     await upsert_user(user_id)
     await add_portfolio_command(message)
-    return
-    
-    parts = message.text.split()
-    
-    if len(parts) != 4:
-        await message.answer(
-            "❌ Неверный формат.\n\n"
-            "Пример: /add BTC 0.5 65000\n"
-            "Формат: /add СИМВОЛ КОЛИЧЕСТВО ЦЕНА_ВХОДА"
-        )
-        return
-    
-    try:
-        symbol = parts[1].upper()
-        amount = float(parts[2])
-        entry_price = float(parts[3])
-    except ValueError:
-        await message.answer("❌ Введите числа правильно.")
-        return
-    
-    allowed = ["BTC", "ETH", "SOL", "GOLD"]
-    if symbol not in allowed:
-        await message.answer(f"❌ Пока только: {', '.join(allowed)}")
-        return
-    
-    await add_portfolio_position(user_id, symbol, amount, entry_price)
-    
-    await message.answer(
-        f"✅ Добавлено:\n{symbol} | {amount} шт. | Вход: ${entry_price:,.0f}"
-    )
 
 
 @dp.message(Command("remove"))
@@ -3296,19 +3179,6 @@ async def cmd_remove_portfolio(message: Message):
     user_id = message.from_user.id
     await upsert_user(user_id)
     await remove_portfolio_command(message)
-    return
-    
-    parts = message.text.split()
-    
-    if len(parts) != 2:
-        await message.answer("Пример: /remove BTC")
-        return
-    
-    symbol = parts[1].upper()
-    
-    await remove_portfolio_position(user_id, symbol)
-    
-    await message.answer(f"✅ Удалено: {symbol}")
 
 
 # ─── Backtest ───────────────────────────────────────────────────────────────────
@@ -3495,10 +3365,7 @@ async def cmd_backtest_capital(message: Message):
 @dp.message(Command("backtest_clear"))
 async def cmd_backtest_clear(message: Message):
     """Clear backtest signals and reset capital."""
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("DELETE FROM backtest_signals")
-        await db.execute("UPDATE backtest_config SET capital = 100.0, last_updated = datetime('now') WHERE id = 1")
-        await db.commit()
+    await clear_backtest_signals(reset_capital=100.0)
     await message.answer("🗑 Бэктест очищен, капитал сброшен до $100")
 
 

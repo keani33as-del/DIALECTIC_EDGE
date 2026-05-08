@@ -40,6 +40,7 @@ from database import (
     update_backtest_capital,
 )
 from session_manager import session_manager, SESSION_START_CAPITAL
+from backtester import get_candles
 from core.regime_detector import RegimeDetector, MarketRegime
 from core.dynamic_risk import DynamicRiskManager
 from core.multi_tf import MultiTimeframeAnalyzer

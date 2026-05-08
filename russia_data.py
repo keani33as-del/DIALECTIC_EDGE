@@ -799,12 +799,11 @@ async def fetch_russia_context() -> str:
     # Добавляем бюджетный калькулятор если есть цена Urals
     urals_price = None
     for section in sections:
-        import re
         m = re.search(r'Urals.*?\$(\d+\.?\d*)', section)
         if m:
             try:
                 urals_price = float(m.group(1))
-            except:
+            except (TypeError, ValueError):
                 pass
     if urals_price and urals_price > 30:
         budget_section = calc_budget_balance(urals_price)

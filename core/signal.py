@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from trading_signal import parse_signals_from_predictions
+from trading_signal import Signal, parse_signals_from_predictions
 
 logger = logging.getLogger(__name__)
 

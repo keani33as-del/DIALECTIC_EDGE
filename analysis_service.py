@@ -29,6 +29,15 @@ logger = logging.getLogger(__name__)
 
 _fetcher = NewsFetcher()
 _storage = Storage()
+_orchestrator: DebateOrchestrator | None = None
+
+
+def _get_orchestrator() -> DebateOrchestrator:
+    """Lazy module-level singleton: avoids re-instantiating Bull/Bear/Verifier/Synth/Speechwriter on every request."""
+    global _orchestrator
+    if _orchestrator is None:
+        _orchestrator = DebateOrchestrator()
+    return _orchestrator
 
 
 def build_digest_persist_metadata(
@@ -149,6 +158,20 @@ async def run_full_analysis(
     if predictions_summary and not custom_mode:
         news_context += f"\n\n{predictions_summary}"
 
+    # FIX: sentiment must be computed BEFORE on-chain enrichment because
+    # build_enriched_context() reads sentiment_result.label.
+    sentiment_result, confidence_instruction = await analyze_and_filter_async(
+        news_context,
+        str(live_prices),
+    )
+    sentiment_block = format_for_agents(sentiment_result, confidence_instruction)
+    prices_dict = dict(prices_dict) if prices_dict else {}
+    prices_dict["SENTIMENT"] = {
+        "score": sentiment_result.score,
+        "label": sentiment_result.label,
+        "confidence": sentiment_result.confidence,
+    }
+
     # ═══ ELITE DATA ENRICHMENT ═══
     # Добавляем данные уровня хедж-фондов: деривативы, макро, Fear&Greed
     if not custom_mode:
@@ -186,7 +209,7 @@ async def run_full_analysis(
             # Сохраняем в GitHub cache
             try:
                 from github_export import save_market_cache
-                asyncio.create_task(save_market_cache(
+                _cache_task = asyncio.create_task(save_market_cache(
                     mvrv=enriched_data.onchain.mvrv if enriched_data.onchain else 0,
                     sopr=enriched_data.onchain.sopr if enriched_data.onchain else 0,
                     fed_balance=enriched_data.macro.fed_balance_billions if enriched_data.macro else 0,
@@ -198,24 +221,15 @@ async def run_full_analysis(
                     total_score=enriched_data.score.total_score,
                     final_verdict=enriched_data.score.final_verdict,
                 ))
+                _cache_task.add_done_callback(
+                    lambda t: t.exception() and logger.debug(f"[ANALYSIS] Cache task error: {t.exception()}")
+                )
             except Exception as _e:
                 logger.debug(f"[ANALYSIS] Cache save skipped: {_e}")
         except Exception as e:
             logger.warning(f"On-chain/macro/scoring failed: {e}")
 
-    sentiment_result, confidence_instruction = await analyze_and_filter_async(
-        news_context,
-        str(live_prices),
-    )
-    sentiment_block = format_for_agents(sentiment_result, confidence_instruction)
-    prices_dict = dict(prices_dict) if prices_dict else {}
-    prices_dict["SENTIMENT"] = {
-        "score": sentiment_result.score,
-        "label": sentiment_result.label,
-        "confidence": sentiment_result.confidence,
-    }
-
-    report = await DebateOrchestrator().run_debate(
+    report = await _get_orchestrator().run_debate(
         news_context=news_context,
         live_prices=live_prices,
         profile_instruction=profile_instruction + sentiment_block,
