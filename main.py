@@ -38,6 +38,7 @@ from config import (
 from web_search import get_full_realtime_context
 from report_sanitizer import sanitize_full_report
 from chart_generator import generate_main_chart, generate_russia_chart
+from core import digest_context
 from core.digest_context import build_digest_context, format_digest_telegram_summary
 from storage import Storage
 from analysis_service import (
@@ -347,32 +348,18 @@ def hydrate_debate_from_report(full_report: str) -> dict | None:
 
 
 def extract_verdict_from_report(report: str) -> str | None:
-    """Extract verdict from report synthesis section."""
-    markers = [
-        "⚖️ *ВЕРДИКТ И ТОРГОВЫЙ ПЛАН*",
-        "⚖️ ВЕРДИКТ И ТОРГОВЫЙ ПЛАН",
-        "⚖️ *ИТОГОВЫЙ СИНТЕЗ И РЕКОМЕНДАЦИИ*",
-        "⚖️ ИТОГОВЫЙ СИНТЕЗ И РЕКОМЕНДАЦИИ",
-        "ИТОГОВЫЙ СИНТЕЗ",
-    ]
-    synth_start = None
-    for m in markers:
-        if m in report:
-            synth_start = report.find(m)
-            break
-    
-    if synth_start is None:
+    """Extract verdict from report synthesis section.
+
+    Delegates to ``digest_context.extract_verdict`` which looks at the
+    explicit ``ВЕРДИКТ СУДЬИ: <X>`` line first instead of scanning the whole
+    synthesis block. The naive substring scan used to flip ``МЕДВЕЖИЙ``
+    to ``BUY`` whenever the verdict reasoning mentioned the word
+    ``бычий`` (e.g. ``FinBERT не подтверждает бычий настрой``),
+    producing a digest header that contradicted the trade plan below.
+    """
+    if not report or not report.strip():
         return None
-    
-    synth = report[synth_start:synth_start + 1500]
-    synth_upper = synth.upper()
-    
-    if "БЫЧ" in synth_upper or "BULL" in synth_upper:
-        return "BUY"
-    elif "МЕДВЕЖ" in synth_upper or "BEAR" in synth_upper:
-        return "SELL"
-    else:
-        return "NEUTRAL"
+    return digest_context.extract_verdict(report) or None
 
 
 def extract_symbols_from_report(report: str, prices: dict) -> tuple[dict, dict, dict, dict]:
@@ -454,12 +441,12 @@ def build_short_report(parts: dict, stars: str, pct: int) -> list:
     ]
 
     # ─── Парсим context для плана и причин ───
-    digest_context = build_digest_context(full)
-    verdict_reason = digest_context.get("verdict_reason", "")
-    plans = digest_context.get("plans", [])
-    key_trigger = digest_context.get("key_trigger", "")
-    monitoring_level = digest_context.get("monitoring_level", "")
-    monitoring_points = digest_context.get("monitoring_points", [])
+    digest_ctx = build_digest_context(full)
+    verdict_reason = digest_ctx.get("verdict_reason", "")
+    plans = digest_ctx.get("plans", [])
+    key_trigger = digest_ctx.get("key_trigger", "")
+    monitoring_level = digest_ctx.get("monitoring_level", "")
+    monitoring_points = digest_ctx.get("monitoring_points", [])
     
     # Почему
     if verdict_reason:
@@ -500,23 +487,14 @@ def build_short_report(parts: dict, stars: str, pct: int) -> list:
     lines.append("")
     
     # ─── ПРОСТЫМИ СЛОВАМИ ───
-    simple_block_start = full.find("ПРОСТЫМИ СЛОВАМИ" if "ПРОСТЫМИ СЛОВАМИ" in full else "💬")
-    if simple_block_start == -1:
-        simple_block_start = full.find("───\n💬" if "───\n💬" in full else "💬")
-    if simple_block_start != -1:
-        simple_block = full[simple_block_start:simple_block_start+600]
-        simple_lines = []
-        for line in simple_block.split("\n"):
-            if len(line.strip()) > 10 and len(line.strip()) < 200:
-                if not line.startswith("─") and not line.startswith("💬"):
-                    simple_lines.append(line.strip())
-            if len(simple_lines) >= 3:
-                break
-        if simple_lines:
-            lines.append("💬 *ПРОСТЫМИ СЛОВАМИ:*")
-            for sl in simple_lines[:3]:
-                lines.append(f"▫️ {sl}")
-            lines.append("")
+    # Вытаскиваем ровно один блок, останавливаясь на секциях любого из следующих блоков
+    # (📊 QE/QT, 🤝 Честно о боте, ⚠️ дисклеймер и т.д.) чтобы не втягивать их в блок.
+    # Раньше фильтр `len < 200` ловил эти короткие заголовки и совал в "Дайджест/Простыми словами".
+    plain_text = digest_context.extract_plain_language(full)
+    if plain_text:
+        lines.append("💬 *ПРОСТЫМИ СЛОВАМИ:*")
+        lines.append(f"▫️ {plain_text}")
+        lines.append("")
 
     # ─── ЭФФЕКТЫ 2-ГО ПОРЯДКА ───
     effects_start = full.find("📌" if "📌" in full else "ЭФФЕКТ")
