@@ -282,6 +282,23 @@ class SessionManager:
 
         return "\n".join(lines)
 
+    def hard_reset(self, start_capital: float = SESSION_START_CAPITAL) -> None:
+        """Полный сброс: чистая текущая сессия + пустая история. Используется
+        командой /autotrade_reset когда юзер хочет «всё заново»."""
+        new_session = SessionState()
+        new_session.session_id = 1
+        new_session.start_time = datetime.now().strftime("%Y-%m-%d %H:%M")
+        new_session.start_capital = start_capital
+        new_session.current_capital = start_capital
+        new_session.peak_capital = start_capital
+        self.current_session = new_session
+        self.past_sessions = []
+        self._params = dict(DEFAULT_PARAMS)
+        # Помечаем как «загружено» чтобы фоновый цикл не подтянул старое
+        # состояние из BACKTEST.md ниже по коду.
+        self._loaded = True
+        logger.info("SessionManager hard reset, start_capital=%s", start_capital)
+
     def update_capital(self, new_capital: float):
         """Обновляет капитал текущей сессии."""
         old_capital = self.current_session.current_capital

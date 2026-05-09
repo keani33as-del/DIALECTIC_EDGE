@@ -1442,6 +1442,17 @@ async def _check_and_trade_locked(bot, admin_ids: list[int]) -> list[dict]:
     for c in ranked:
         c["mvrv"] = mvrv
 
+    # ═══ MACRO REGIME (S&P EMA200/SMA50 + breadth + DXY) ═══
+    # Один глобальный фон для всех кандидатов. RISK_OFF → не открываем
+    # лонги, RISK_ON → не открываем шорты. Также модифицируем размер.
+    macro = None
+    try:
+        from core.macro_regime import get_macro_regime
+        macro = await get_macro_regime()
+        logger.info(f"[MACRO] {macro.short_summary()} | mult={macro.position_size_mult}")
+    except Exception as _e:
+        logger.debug(f"macro_regime unavailable: {_e}")
+
     for candidate in ranked:
         if len(open_positions) >= 5:
             break
@@ -1452,6 +1463,16 @@ async def _check_and_trade_locked(bot, admin_ids: list[int]) -> list[dict]:
             reason = candidate.get("blocked_reason") or f"score={candidate.get('total_score',0):.1f}<{OPEN_SCORE_THRESHOLD}"
             logger.debug(f"⏭ {candidate['symbol']} {candidate['direction']}: не готов — {reason}")
             continue
+
+        # ═══ MACRO FILTER ═══
+        if macro is not None:
+            cdir = (candidate.get("direction") or "").upper()
+            if cdir == "BUY" and not macro.allow_longs:
+                logger.info(f"⏭ {candidate['symbol']} BUY: blocked by macro {macro.regime}")
+                continue
+            if cdir == "SELL" and not macro.allow_shorts:
+                logger.info(f"⏭ {candidate['symbol']} SELL: blocked by macro {macro.regime}")
+                continue
 
         # ═══ DEFENSE MODE BLOCK ═══
         if defense_active:
@@ -1513,7 +1534,21 @@ async def _check_and_trade_locked(bot, admin_ids: list[int]) -> list[dict]:
         # Используем динамические стопы если они лучше базовых
         final_stop = risk_calc.get("stop_price", base_stop)
         final_target = risk_calc.get("take_profit", base_target)
-        quantity_pct = risk_calc.get("risk_pct", 0.02) / 100  # Convert to fraction
+        # ВАЖНО: risk_pct — это % капитала ПОД РИСКОМ (по дистанции до стопа),
+        # а add_backtest_signal ждёт ДОЛЮ КАПИТАЛА на покупку. Это разные
+        # величины. Раньше путали → размер позиции получался ~1% капитала
+        # ($0.50 на счёт $51), сделки топтались на месте. Теперь берём
+        # рассчитанный position_value напрямую и нормируем на капитал.
+        risk_position_value = float(risk_calc.get("position_value") or 0.0)
+        if risk_position_value > 0 and current_capital > 0:
+            quantity_pct = risk_position_value / current_capital
+        else:
+            # fallback: 2% риска при ~5% стопе ≈ 40% позиции; clamp ниже
+            quantity_pct = max(float(risk_calc.get("risk_pct") or 2.0) / 100, 0.05)
+        # Гайдрейлы: минимум 5% капитала на позицию (иначе торговля шумом),
+        # максимум 25% (дальше — концентрация). add_backtest_signal ещё раз
+        # клампит до 15%, оставляем тут запас сверху.
+        quantity_pct = max(0.05, min(quantity_pct, 0.25))
 
 # Минимальный R/R 1.5
         rr = abs(final_target - entry) / abs(entry - final_stop) if entry != final_stop else 0
@@ -1582,6 +1617,17 @@ async def _check_and_trade_locked(bot, admin_ids: list[int]) -> list[dict]:
                 logger.info(f"⚡ {sym}: высокая волатильность {vol_pct:.1f}% — уменьшаем размер {old_q:.4f} -> {quantity_pct:.4f}")
         except Exception:
             pass
+
+        # Macro-режим тоже урезает/оставляет размер (RISK_OFF → 0.4, etc.)
+        if macro is not None:
+            try:
+                quantity_pct = quantity_pct * float(macro.position_size_mult or 1.0)
+            except Exception:
+                pass
+
+        # Финальный пол. Не даём всем коэффициентам схлопнуть позицию в пыль —
+        # минимум 5% капитала на сделку, иначе автотрейд буксует на $0.50.
+        quantity_pct = max(quantity_pct, 0.05)
 
         try:
             result = await add_backtest_signal(
