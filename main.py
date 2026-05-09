@@ -459,10 +459,13 @@ def build_short_report(parts: dict, stars: str, pct: int, horizon: HorizonPack |
     verdict_emoji = digest_ctx.get("verdict_emoji", "⚪️")
     verdict_reason = digest_ctx.get("verdict_reason", "")
     plans = digest_ctx.get("plans") or []
+    watch_levels = digest_ctx.get("watch_levels") or []
     monitoring_points = digest_ctx.get("monitoring_points") or []
     plain_language = digest_ctx.get("plain_language", "")
+    eli5 = digest_ctx.get("eli5", "")
     key_trigger = digest_ctx.get("key_trigger", "")
     invalidation = digest_ctx.get("invalidation", "")
+    only_watch = (not plans) and bool(watch_levels)
 
     lines: list[str] = [
         "📊 *DIALECTIC EDGE — ЕЖЕДНЕВНЫЙ ДАЙДЖЕСТ*",
@@ -480,14 +483,49 @@ def build_short_report(parts: dict, stars: str, pct: int, horizon: HorizonPack |
     if verdict_reason:
         lines.extend(["", f"🧠 *Почему:* {verdict_reason}"])
 
-    lines.extend(["", "📋 *Торговый план:*"])
-    if plans:
-        for plan in plans[:5]:
-            lines.append(f"• {_digest_plan_line(plan)}")
-    elif key_trigger:
-        lines.append(f"• {key_trigger}")
+    if only_watch:
+        # Все «планы» — на самом деле watch-уровни. Меняем заголовок,
+        # чтобы юзер не путал «у нас есть план» и «у нас нет плана,
+        # просто следим за уровнями».
+        lines.extend(["", "📊 *Сейчас не торгуем — следим за уровнями:*"])
+        for w in watch_levels[:6]:
+            chunks = []
+            sym = (w.get("symbol") or "").strip()
+            level = (w.get("level") or "").strip()
+            note = (w.get("note") or "").strip()
+            if sym:
+                chunks.append(sym)
+            if level:
+                chunks.append(level)
+            if note:
+                chunks.append(note)
+            if chunks:
+                lines.append("• " + " | ".join(chunks))
     else:
-        lines.append("• Явной сделки нет — ждём подтверждения по триггерам.")
+        lines.extend(["", "📋 *Торговый план:*"])
+        if plans:
+            for plan in plans[:5]:
+                lines.append(f"• {_digest_plan_line(plan)}")
+        elif key_trigger:
+            lines.append(f"• {key_trigger}")
+        else:
+            lines.append("• Явной сделки нет — ждём подтверждения по триггерам.")
+
+        if watch_levels:
+            lines.extend(["", "👁 *Наблюдение (без сделки):*"])
+            for w in watch_levels[:4]:
+                chunks = []
+                sym = (w.get("symbol") or "").strip()
+                level = (w.get("level") or "").strip()
+                note = (w.get("note") or "").strip()
+                if sym:
+                    chunks.append(sym)
+                if level:
+                    chunks.append(level)
+                if note:
+                    chunks.append(note)
+                if chunks:
+                    lines.append("• " + " | ".join(chunks))
 
     if key_trigger and not any(key_trigger.lower() in p.lower() for p in monitoring_points):
         lines.extend(["", f"👀 *Ключевой триггер:* {key_trigger}"])
@@ -502,6 +540,9 @@ def build_short_report(parts: dict, stars: str, pct: int, horizon: HorizonPack |
 
     if plain_language:
         lines.extend(["", f"💬 *Простыми словами:* {plain_language}"])
+
+    if eli5:
+        lines.extend(["", f"👶 *Как 5-летнему:* {eli5}"])
 
     lines.extend([
         "",
@@ -667,6 +708,16 @@ async def send_daily_digest_bundle(
 def main_report_keyboard(user_id: int, has_debates: bool = True) -> InlineKeyboardMarkup:
     """Клавиатура под основным отчётом."""
     buttons = []
+    # «💰 БАБЛО» наверху — главная action-кнопка: одной нажимкой юзер
+    # получает либо конкретный план (вход/стоп/цель/размер), либо чёткое
+    # «торговать не надо + условия флипа». Без болтовни. Цель — чтобы
+    # пользователь понимал что делать прямо сейчас.
+    buttons.append([
+        InlineKeyboardButton(
+            text="💰 БАБЛО — конкретная сделка",
+            callback_data=f"money:{user_id}"
+        )
+    ])
     buttons.append([
         InlineKeyboardButton(
             text="📜 Показать всё",
@@ -733,6 +784,159 @@ async def handle_full_report_callback(callback: CallbackQuery):
 
     await callback.answer("Отправляю полный raw-отчёт")
     await send_full_report_attachment(callback.message.chat.id, full_report)
+
+
+def _money_format_price(value) -> str:
+    """Деньги: $79,502.20. None/мусор → «—»."""
+    if value is None or value == "":
+        return "—"
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return str(value)[:20] or "—"
+    if f >= 1000:
+        return f"${f:,.2f}"
+    if f >= 1:
+        return f"${f:,.4f}".rstrip("0").rstrip(".")
+    return f"${f:.6f}".rstrip("0").rstrip(".")
+
+
+def format_money_button_message(report_text: str) -> str:
+    """Сборка сообщения для кнопки «💰 БАБЛО».
+
+    Логика:
+    - Если есть хоть один LONG/SHORT-план → показываем КОНКРЕТНУЮ сделку
+      (вход / стоп / цель / R/R / размер / какой ордер ставить).
+    - Если планов нет / все CASH демоутнуты в watch → говорим «торговать
+      НЕ надо» + условия флипа из watch-уровней (что должно произойти,
+      чтобы открылся LONG/SHORT).
+
+    Без воды. Юзер хочет одной кнопкой увидеть «делать / не делать», и
+    если делать — «куда жать». Бот не должен здесь рассуждать, только
+    инструкция.
+    """
+    ctx = build_digest_context(report_text or "")
+    plans = ctx.get("plans") or []
+    watch_levels = ctx.get("watch_levels") or []
+    verdict_label = ctx.get("verdict_label") or "Нейтральный"
+    verdict_emoji = ctx.get("verdict_emoji") or "⚪️"
+    invalidation = (ctx.get("invalidation") or "").strip()
+
+    actionable = [
+        p for p in plans
+        if isinstance(p, dict)
+        and (p.get("direction") or "").upper().strip() in {"LONG", "SHORT"}
+    ]
+
+    out: list[str] = []
+    out.append(f"💰 *БАБЛО — что делать прямо сейчас*")
+    out.append(f"🎯 Вердикт: {verdict_emoji} *{verdict_label}*")
+    out.append("")
+
+    if actionable:
+        out.append("✅ *Конкретная сделка:*")
+        for p in actionable[:3]:
+            sym = (p.get("symbol") or "?").upper()
+            direction = (p.get("direction") or "").upper()
+            entry = _money_format_price(p.get("entry"))
+            stop = _money_format_price(p.get("stop"))
+            target = _money_format_price(p.get("target"))
+            rr = str(p.get("rr") or "").strip() or "—"
+            size = str(p.get("size") or "").strip() or "—"
+            trigger = str(p.get("trigger") or "").strip()
+            out.append(
+                f"• *{sym} {direction}* — вход {entry}, стоп {stop}, цель {target}, R/R {rr}, размер {size} депозита"
+            )
+            if trigger:
+                out.append(f"  Триггер: {trigger}")
+            # «Как ставить» — детерминированный how-to. Без него юзер
+            # начинает гадать «лимит или маркет», ловит проскальзывание.
+            tf = "4h" if direction in {"LONG", "SHORT"} else "4h"
+            out.append(
+                f"  ⚙️ Как ставить: stop-limit на стоп {stop}, "
+                f"entry — лимит {entry} (или ждать закрытия {tf}-свечи "
+                f"за уровень и брать маркет с проскальзыванием ≤0.3%), "
+                f"тейк {target}."
+            )
+        if invalidation:
+            out.append("")
+            out.append(f"🛑 *Инвалидация:* {invalidation}")
+        out.append("")
+        out.append("⚠️ Считай размер от ТВОЕГО депозита. Не подгоняй стоп под лосс — двигай размер.")
+        return "\n".join(out)
+
+    # Нет actionable планов → объясняем условия флипа из watch.
+    out.append("⏳ *Торговать НЕ надо.* Все идеи — без однозначного направления.")
+    out.append("")
+    if watch_levels:
+        out.append("📊 *Когда вернёмся в рынок (условия флипа):*")
+        for w in watch_levels[:5]:
+            sym = (w.get("symbol") or "").strip() or "—"
+            level = (w.get("level") or "").strip()
+            note = (w.get("note") or "").strip()
+            chunks = [f"*{sym}*"]
+            if level:
+                chunks.append(level)
+            if note:
+                chunks.append(note)
+            out.append("• " + " — ".join(chunks))
+        out.append("")
+        out.append(
+            "Правило: ждём ЗАКРЫТИЯ 4h-свечи за уровень "
+            "(не «прокол хвостом») — только тогда новый сигнал. "
+            "До этого — кеш."
+        )
+    else:
+        out.append(
+            "Нет ни одного триггера с положительным ожиданием. "
+            "Сидим в кеше до следующего /daily."
+        )
+
+    if invalidation:
+        out.append("")
+        out.append(f"🛑 *Что отменит этот сценарий:* {invalidation}")
+
+    out.append("")
+    out.append("⚠️ Не натягивай сделку под скуку. «Не торговать» — это тоже решение.")
+    return "\n".join(out)
+
+
+@dp.callback_query(F.data.startswith("money:"))
+async def handle_money_button_callback(callback: CallbackQuery):
+    parts = callback.data.split(":")
+    if len(parts) != 2:
+        await callback.answer()
+        return
+    try:
+        kb_uid = int(parts[1])
+    except ValueError:
+        await callback.answer()
+        return
+    if kb_uid != callback.from_user.id:
+        await callback.answer("Кнопка не с твоего аккаунта", show_alert=True)
+        return
+
+    debate = await get_debate_handler().get_debate(callback.from_user.id)
+    full_report = (debate or {}).get("full", "")
+    if not full_report:
+        await callback.answer("Сначала запусти /daily", show_alert=True)
+        return
+
+    await callback.answer("Считаю что делать прямо сейчас")
+    try:
+        msg = format_money_button_message(full_report)
+    except Exception as e:
+        logger.warning("format_money_button_message failed: %s", e)
+        await bot.send_message(
+            callback.message.chat.id,
+            "Не смог распарсить план — попробуй /daily заново.",
+        )
+        return
+    await bot.send_message(
+        callback.message.chat.id,
+        clean_markdown(msg),
+        parse_mode="Markdown",
+    )
 
 
 def format_signal_trader_status_message(status: dict) -> str:
