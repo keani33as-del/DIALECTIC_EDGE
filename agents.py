@@ -344,12 +344,17 @@ SYNTH_BASE_SYSTEM = """
   "verdict": "МЕДВЕЖИЙ",
   "reason": "COT NET SHORT -4935 контрактов, SPY RSI 73.1 перекуплен",
   "plans": [
-    {"symbol": "BTC", "direction": "SHORT", "entry": 79800, "stop": 82000, "target": 77000, "rr": "1:2", "size": "10%", "horizon": "7-14 дней", "trigger": "пробой $82000 вниз"},
-    {"symbol": "SOL", "direction": "CASH", "horizon": "7-14 дней", "trigger": "пробой $92"}
+    {"symbol": "BTC", "direction": "SHORT", "entry": 79800, "stop": 82000, "target": 77000, "rr": "1:2", "size": "10%", "horizon": "7-14 дней", "trigger": "пробой $82000 вниз → подтверждение SHORT"},
+    {"symbol": "SOL", "direction": "CASH", "horizon": "7-14 дней", "trigger": "закрытие выше $92 → откроем LONG"}
+  ],
+  "watch": [
+    {"symbol": "BTC", "level": "$82879", "note": "ключевой ATR-уровень, ждём резолюции в любую сторону"},
+    {"symbol": "SPY", "level": "RSI 75", "note": "перекупленность сохраняется — мониторим коррекцию"}
   ],
   "key_trigger": "пробой $82000 → подтверждение медвежьего тренда",
   "invalidation": "BTC закрытие выше $82500 → весь медвежий сценарий отменяется, переход в LONG/CASH",
   "simple": "Фонды шортят BTC, SPY перекуплен — готовься к коррекции. COT NET SHORT -4935.",
+  "eli5": "Представь, что у тебя яблоки и они дешевеют — большие дяди продают, значит сейчас не покупаем, ждём когда подешевеют ещё.",
   "qe_qt": "QT",
   "confidence": "HIGH"
 }
@@ -359,11 +364,22 @@ SYNTH_BASE_SYSTEM = """
 - SHORT: target < entry < stop (обычные числа)
 - В каждом плане ОБЯЗАТЕЛЬНО поле "horizon" (одна из строк, см. оверлей ниже)
 - В каждом плане ОБЯЗАТЕЛЬНО поле "trigger" — конкретный уровень/событие входа
-- CASH-план: только {"symbol", "direction": "CASH", "trigger", "horizon"}
-- Если ни одного качественного сетапа — plans = [{"symbol": "CASH", "direction": "CASH", "trigger": "...", "horizon": "..."}]
-- plans: максимум 3 позиции
+- CASH-план: только {"symbol", "direction": "CASH", "trigger", "horizon"} — но trigger ОБЯЗАН быть однонаправленным с явным флипом:
+    ✅ "закрытие выше $82000 → откроем LONG"
+    ✅ "пробой $79000 вниз → откроем SHORT"
+    ❌ "пробой $82879 вниз ИЛИ закрытие выше $82879" — это watch, не план
+    ❌ "ожидание коррекции" / "ждём подтверждения" — это watch, не план
+- Двунаправленные триггеры и абстрактные «ждём чего-то» — НЕ В plans, а в watch ниже
+- plans: максимум 3 позиции; ТОЛЬКО actionable идеи с однозначным направлением
+- Если ни одного качественного сетапа НЕТ — plans = [], а уровни закидываем в watch
 - "rr" — строка вида "1:2" / "1:1.5" / "1:3"
 - "size" — строка вида "10%" (доля депо)
+
+WATCH (наблюдение, НЕ план):
+- watch — массив объектов {"symbol", "level", "note"} (max 4)
+- Сюда идут уровни, по которым нет однозначного направления — «$X важный, дождёмся резолюции»
+- Если CASH-плану некуда воткнуть однонаправленный флип — его место здесь, а не в plans
+- watch может быть пустым, но если plans пусты — обязательно дай watch с конкретными уровнями
 
 ВЕРХНИЕ ПОЛЯ:
 - "verdict": "БЫЧИЙ" / "МЕДВЕЖИЙ" / "НЕЙТРАЛЬНЫЙ"
@@ -694,6 +710,73 @@ def _strip_field_lead(value) -> str:
     return _FIELD_LEAD_RE.sub("", s, count=1).strip()
 
 
+# Двунаправленные триггеры — Synth иногда выдаёт «пробой $X вниз ИЛИ
+# закрытие выше $X» как «универсальный план». Это не план: один уровень
+# не может одновременно быть пробит вверх И вниз; и направление сделки
+# (LONG/SHORT) остаётся неопределённым. Такие записи демоутим в watch.
+_BIDIRECTIONAL_TRIGGER_RE = re.compile(
+    r"(?:вниз|внизу|ниже|вверх|выше|сверху).*(?:или|либо|или\s+/|\s+/\s+).*"
+    r"(?:вверх|выше|сверху|вниз|внизу|ниже)",
+    re.IGNORECASE | re.DOTALL,
+)
+_PRICE_LEVEL_RE = re.compile(r"\$?\s*\d[\d.,]*\s*[KkКк]?")
+
+
+def _is_bidirectional_trigger(text: str) -> bool:
+    """True если триггер указывает оба направления (классический non-actionable
+    «watch level»). Пример: «пробой $82879 вниз или закрытие выше $82879»."""
+    if not text:
+        return False
+    s = str(text).lower()
+    if _BIDIRECTIONAL_TRIGGER_RE.search(s):
+        return True
+    has_up = any(tok in s for tok in ("вверх", "выше", "сверху", "above", "up"))
+    has_down = any(tok in s for tok in ("вниз", "ниже", "снизу", "below", "down"))
+    has_or = any(tok in s for tok in (" или ", " либо ", " / ", " or "))
+    return has_up and has_down and has_or
+
+
+def _is_vague_trigger(text: str) -> bool:
+    """True если триггер не содержит конкретного уровня/события — типа
+    «ожидание коррекции SPY/нефти». Без числа и без чёткого события
+    это не торговый триггер, это эмоция."""
+    if not text:
+        return True
+    s = str(text).strip()
+    if len(s) < 6:
+        return True
+    has_level = bool(_PRICE_LEVEL_RE.search(s))
+    has_concrete_event = any(
+        tok in s.lower()
+        for tok in (
+            "пробой", "закрытие", "тест", "ретест", "касание",
+            "rsi", "atr", "vix", "ema", "sma", "macd",
+            "fomc", "cpi", "nfp", "ставк", "fed", "ecb",
+            "breakout", "break", "close above", "close below",
+        )
+    )
+    return not (has_level or has_concrete_event)
+
+
+def _is_unactionable_cash(plan: dict) -> tuple[bool, str]:
+    """CASH-план считается неактивным (демоут в watch) если:
+       - нет триггера вообще
+       - триггер двунаправленный (см. _is_bidirectional_trigger)
+       - триггер абстрактный (см. _is_vague_trigger)
+    Возвращает (is_unactionable, reason)."""
+    direction = str(plan.get("direction", "")).upper().strip()
+    if direction not in {"CASH", "WAIT", "FLAT"}:
+        return False, ""
+    trigger = str(plan.get("trigger") or "").strip()
+    if not trigger or trigger == "—":
+        return True, "no trigger"
+    if _is_bidirectional_trigger(trigger):
+        return True, "bidirectional trigger"
+    if _is_vague_trigger(trigger):
+        return True, "vague trigger (no level/event)"
+    return False, ""
+
+
 def _stop_factor_block(direction: str, stop_factor: str | None) -> tuple[bool, str]:
     """Code-side stop-factor override.
 
@@ -734,12 +817,63 @@ def _render_trade_plan_from_json(
     verdict = str(data.get("verdict", "НЕЙТРАЛЬНЫЙ")).upper().strip() or "НЕЙТРАЛЬНЫЙ"
     reason = _strip_field_lead(data.get("reason", ""))
     plans = data.get("plans") or []
+    raw_watch = data.get("watch") or []
     key_trigger = _strip_field_lead(data.get("key_trigger", ""))
     invalidation = _strip_field_lead(data.get("invalidation", ""))
     # Synth-модель иногда повторяет имя ключа в значении: ":SPY перекуплен" /
     # "simple: SPY перекуплен". Снимаем оба варианта (двоеточие + повтор поля).
     simple = _strip_field_lead(data.get("simple", ""))
+    eli5 = _strip_field_lead(data.get("eli5", ""))
     qe_qt = str(data.get("qe_qt", "NEUTRAL")).upper().strip() or "NEUTRAL"
+
+    # Прогон через 2 уровня валидации:
+    #   1. _validate_plan_geometry — геометрия LONG/SHORT (stop<entry<target etc.)
+    #   2. _is_unactionable_cash — двунаправленные / абстрактные CASH-триггеры,
+    #      которые на UI выглядят как «BTC CASH | пробой $X вниз ИЛИ выше $X» —
+    #      это не план, это watch-уровень. Демоутим в watch-список и НЕ
+    #      рендерим в блоке «📋 ТОРГОВЫЙ ПЛАН».
+    actionable_plans: list[dict] = []
+    demoted_to_watch: list[dict] = []
+    if isinstance(plans, list):
+        for raw in plans:
+            if not isinstance(raw, dict):
+                continue
+            ok, why = _validate_plan_geometry(raw, min_rr=min_rr)
+            p = raw if ok else _coerce_to_cash(raw, why)
+            if not ok:
+                logger.warning(f"[PLAN-GUARD] Coerced impossible plan to CASH: {why} | raw={raw}")
+            blocked, sf_why = _stop_factor_block(str(p.get("direction", "")), stop_factor)
+            if blocked:
+                logger.warning(f"[STOP-FACTOR] Coerced plan to CASH: {sf_why} | raw={raw}")
+                p = _coerce_to_cash(raw, sf_why)
+            unactionable, ua_why = _is_unactionable_cash(p)
+            if unactionable:
+                logger.warning(f"[PLAN-GUARD] Demoted CASH plan to watch: {ua_why} | raw={raw}")
+                trigger_txt = str(p.get("trigger") or "").strip()
+                demoted_to_watch.append({
+                    "symbol": str(p.get("symbol") or "?").upper(),
+                    "level": "",
+                    "note": trigger_txt or ua_why,
+                })
+                continue
+            actionable_plans.append(p)
+
+    # Watch из самого Synth (новое поле): нормализуем в тот же формат.
+    explicit_watch: list[dict] = []
+    if isinstance(raw_watch, list):
+        for w in raw_watch:
+            if not isinstance(w, dict):
+                continue
+            sym = str(w.get("symbol") or "").upper().strip()
+            level = str(w.get("level") or "").strip()
+            note = str(w.get("note") or "").strip()
+            if not (sym or level or note):
+                continue
+            explicit_watch.append({"symbol": sym or "?", "level": level, "note": note})
+
+    watch_list = explicit_watch + demoted_to_watch
+
+    only_watch = (not actionable_plans) and bool(watch_list)
 
     lines: list[str] = []
     lines.append(f"🏆 ВЕРДИКТ СУДЬИ: {verdict}")
@@ -751,37 +885,47 @@ def _render_trade_plan_from_json(
     elif stop_factor == "bullish":
         lines.append("🔵 СТОП-ФАКТОР: критический бычий (SHORT-планы автоматически снимаются)")
     lines.append("")
-    lines.append("📋 ТОРГОВЫЙ ПЛАН:")
-    if isinstance(plans, list) and plans:
-        for raw in plans:
-            if not isinstance(raw, dict):
-                continue
-            # 1. Sanity на геометрию (stop/entry/target + R/R).
-            ok, why = _validate_plan_geometry(raw, min_rr=min_rr)
-            p = raw if ok else _coerce_to_cash(raw, why)
-            if not ok:
-                logger.warning(f"[PLAN-GUARD] Coerced impossible plan to CASH: {why} | raw={raw}")
-            # 2. Code-side stop-factor override (MVRV/VIX/F&G критические значения).
-            blocked, sf_why = _stop_factor_block(str(p.get("direction", "")), stop_factor)
-            if blocked:
-                logger.warning(f"[STOP-FACTOR] Coerced plan to CASH: {sf_why} | raw={raw}")
-                p = _coerce_to_cash(raw, sf_why)
-            sym = str(p.get("symbol", "")).upper() or "?"
-            direction = str(p.get("direction", "")).upper()
-            if direction in {"CASH", "WAIT", "FLAT"}:
-                trigger = str(p.get("trigger") or p.get("entry") or "—")
-                lines.append(f"• {sym} | CASH | Триггер: {trigger}")
-                continue
-            entry = _format_price(p.get("entry"))
-            stop = _format_price(p.get("stop"))
-            target = _format_price(p.get("target"))
-            rr = str(p.get("rr", "")).strip() or "—"
-            size = str(p.get("size", "")).strip() or "—"
-            lines.append(
-                f"• {sym} | {direction or '—'} | Вход: {entry} | Стоп: {stop} | Цель: {target} | R/R: {rr} | {size} депозита"
-            )
+    if only_watch:
+        # Все «планы» — на самом деле watch-уровни. Меняем заголовок,
+        # чтобы юзер не путал «у нас есть план» и «у нас нет плана,
+        # просто следим за уровнями».
+        lines.append("📊 СЕЙЧАС НЕ ТОРГУЕМ — СЛЕДИМ ЗА УРОВНЯМИ:")
     else:
-        lines.append("• нет идей с положительным ожиданием — стой в стороне")
+        lines.append("📋 ТОРГОВЫЙ ПЛАН:")
+        if actionable_plans:
+            for p in actionable_plans:
+                sym = str(p.get("symbol", "")).upper() or "?"
+                direction = str(p.get("direction", "")).upper()
+                if direction in {"CASH", "WAIT", "FLAT"}:
+                    trigger = str(p.get("trigger") or p.get("entry") or "—")
+                    lines.append(f"• {sym} | CASH | Триггер: {trigger}")
+                    continue
+                entry = _format_price(p.get("entry"))
+                stop = _format_price(p.get("stop"))
+                target = _format_price(p.get("target"))
+                rr = str(p.get("rr", "")).strip() or "—"
+                size = str(p.get("size", "")).strip() or "—"
+                lines.append(
+                    f"• {sym} | {direction or '—'} | Вход: {entry} | Стоп: {stop} | Цель: {target} | R/R: {rr} | {size} депозита"
+                )
+        else:
+            lines.append("• нет идей с положительным ожиданием — стой в стороне")
+
+    if watch_list:
+        if not only_watch:
+            lines.append("")
+            lines.append("👁 НАБЛЮДЕНИЕ (без сделки):")
+        for w in watch_list[:6]:
+            sym = w.get("symbol") or "?"
+            level = w.get("level") or ""
+            note = w.get("note") or ""
+            chunks = [sym]
+            if level:
+                chunks.append(level)
+            if note:
+                chunks.append(note)
+            lines.append("• " + " | ".join(chunks))
+
     lines.append("")
     if key_trigger:
         lines.append(f"👀 КЛЮЧЕВОЙ ТРИГГЕР: {key_trigger}")
@@ -791,6 +935,9 @@ def _render_trade_plan_from_json(
         lines.append("")
     if simple:
         lines.append(f"💬 ПРОСТЫМИ СЛОВАМИ: {simple}")
+        lines.append("")
+    if eli5:
+        lines.append(f"👶 КАК 5-ЛЕТНЕМУ: {eli5}")
         lines.append("")
     qe_qt_word = {"QE": "растёт", "QT": "падает"}.get(qe_qt, "нейтральна")
     lines.append(f"📊 QE/QT РЕЖИМ: {qe_qt} — ликвидность {qe_qt_word}")

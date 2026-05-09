@@ -127,6 +127,66 @@ def _strip_leading_punct(text: str) -> str:
     return _LEADING_PUNCT_RE.sub("", text or "").strip()
 
 
+# ───── plan-actionability helpers (зеркало agents._is_*_trigger) ─────
+# Дублируем здесь, а не импортируем из agents.py: digest_context — leaf-модуль
+# под core/, agents.py тащит за собой LLM-провайдеров и тяжёлый рантайм. Делать
+# core/ зависимым от agents.py — гарантированный круговой импорт в будущем.
+
+_BIDIRECTIONAL_TRIGGER_RE = re.compile(
+    r"(?:вниз|внизу|ниже|вверх|выше|сверху).*(?:или|либо|или\s+/|\s+/\s+).*"
+    r"(?:вверх|выше|сверху|вниз|внизу|ниже)",
+    re.IGNORECASE | re.DOTALL,
+)
+_PRICE_LEVEL_RE = re.compile(r"\$?\s*\d[\d.,]*\s*[KkКк]?")
+
+
+def _is_bidirectional_trigger(text: str) -> bool:
+    if not text:
+        return False
+    s = str(text).lower()
+    if _BIDIRECTIONAL_TRIGGER_RE.search(s):
+        return True
+    has_up = any(tok in s for tok in ("вверх", "выше", "сверху", "above", "up"))
+    has_down = any(tok in s for tok in ("вниз", "ниже", "снизу", "below", "down"))
+    has_or = any(tok in s for tok in (" или ", " либо ", " / ", " or "))
+    return has_up and has_down and has_or
+
+
+def _is_vague_trigger(text: str) -> bool:
+    if not text:
+        return True
+    s = str(text).strip()
+    if len(s) < 6:
+        return True
+    has_level = bool(_PRICE_LEVEL_RE.search(s))
+    has_concrete_event = any(
+        tok in s.lower()
+        for tok in (
+            "пробой", "закрытие", "тест", "ретест", "касание",
+            "rsi", "atr", "vix", "ema", "sma", "macd",
+            "fomc", "cpi", "nfp", "ставк", "fed", "ecb",
+            "breakout", "break", "close above", "close below",
+        )
+    )
+    return not (has_level or has_concrete_event)
+
+
+def _is_unactionable_cash_plan(plan: dict) -> tuple[bool, str]:
+    """CASH-план без однозначного направления (двунаправленный или абстрактный
+    триггер) → демоут в watch. Возвращает (is_unactionable, reason)."""
+    direction = (plan.get("direction") or "").upper().strip()
+    if direction not in {"CASH", "WAIT", "FLAT"}:
+        return False, ""
+    trigger = str(plan.get("trigger") or "").strip()
+    if not trigger or trigger == "—":
+        return True, "no trigger"
+    if _is_bidirectional_trigger(trigger):
+        return True, "bidirectional"
+    if _is_vague_trigger(trigger):
+        return True, "vague"
+    return False, ""
+
+
 def extract_plain_language(report_text: str) -> str:
     clean = _strip_markup(report_text)
     markers = (
@@ -158,18 +218,133 @@ def extract_plain_language(report_text: str) -> str:
     return ""
 
 
+def extract_eli5(report_text: str) -> str:
+    """«👶 КАК 5-ЛЕТНЕМУ: …» — отдельное поле от Synth, дополняющее «простыми
+    словами». Юзер просил оставить «простыми словами» как есть и **дополнить**
+    супер-простым объяснением.
+    """
+    clean = _strip_markup(report_text)
+    markers = (
+        "КАК 5-ЛЕТНЕМУ",
+        "👶 КАК 5-ЛЕТНЕМУ",
+        "5-ЛЕТНЕМУ",
+        "ELI5",
+    )
+    upper = clean.upper()
+    for marker in markers:
+        idx = upper.find(marker)
+        if idx == -1:
+            continue
+        block = clean[idx + len(marker) : idx + len(marker) + 600]
+        lines: list[str] = []
+        for raw_line in block.splitlines():
+            line = _clean_line(raw_line)
+            if not line:
+                if lines:
+                    break
+                continue
+            if _SECTION_BREAK_RE.match(line) and lines:
+                break
+            if len(line) < 6:
+                continue
+            lines.append(line)
+            if len(" ".join(lines)) >= 280:
+                break
+        if lines:
+            return _strip_leading_punct(" ".join(lines))[:320]
+    return ""
+
+
+_WATCH_HEADERS = (
+    "СЕЙЧАС НЕ ТОРГУЕМ — СЛЕДИМ ЗА УРОВНЯМИ",
+    "СЕЙЧАС НЕ ТОРГУЕМ",
+    "НАБЛЮДЕНИЕ (БЕЗ СДЕЛКИ)",
+    "👁 НАБЛЮДЕНИЕ",
+    "WATCH",
+)
+
+_WATCH_END_MARKERS = (
+    "👀 КЛЮЧЕВОЙ",
+    "🛑 ИНВАЛИДАЦИЯ",
+    "💬 ПРОСТЫМИ",
+    "👶 КАК",
+    "📊 QE",
+    "📌",
+    "📡",
+    "🤝",
+    "⚠️",
+    "🚨",
+)
+
+
+def extract_watch_levels(report_text: str) -> list[dict]:
+    """Парсит блок «📊 СЕЙЧАС НЕ ТОРГУЕМ — СЛЕДИМ ЗА УРОВНЯМИ» / «👁 НАБЛЮДЕНИЕ»
+    из Synth-выхода. Возвращает список {symbol, level, note} — то же что
+    рендерится в _render_trade_plan_from_json.
+    """
+    clean = _strip_markup(report_text)
+    upper = clean.upper()
+
+    start_idx = -1
+    header_len = 0
+    for header in _WATCH_HEADERS:
+        i = upper.find(header)
+        if i != -1 and (start_idx == -1 or i < start_idx):
+            start_idx = i
+            header_len = len(header)
+    if start_idx == -1:
+        return []
+
+    body = clean[start_idx + header_len : start_idx + header_len + 1200]
+    end_idx = len(body)
+    for em in _WATCH_END_MARKERS:
+        i = body.find(em)
+        if i != -1 and i < end_idx:
+            end_idx = i
+    body = body[:end_idx]
+
+    items: list[dict] = []
+    for raw in body.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if not (line.startswith("•") or line.startswith("-") or line.startswith("—") or line.startswith("–")):
+            continue
+        cleaned = _clean_line(line.lstrip("•-—– \t"))
+        if len(cleaned) < 3:
+            continue
+        # Формат «<sym> | <level> | <note>» из render. Может прийти и без pipe
+        # (free-form bullet от модели).
+        parts = [p.strip() for p in cleaned.split("|") if p.strip()]
+        if len(parts) >= 2:
+            items.append({
+                "symbol": parts[0][:32],
+                "level": parts[1][:64],
+                "note": " ".join(parts[2:])[:200],
+            })
+        else:
+            items.append({"symbol": "", "level": "", "note": cleaned[:240]})
+    return items[:6]
+
+
 def _extract_symbol(label: str) -> str:
     cleaned = _clean_line(label)
     if not cleaned:
         return ""
-    if "CASH" in cleaned.upper():
-        return "CASH"
+    # Сначала ищем тикер: «BTC CASH» → BTC, не CASH. До этого было наоборот —
+    # любая фраза с CASH сворачивалась в symbol="CASH" даже если рядом стоял
+    # реальный тикер. Только если ни тикера, ни paren-нотации не нашли —
+    # фолбэчим на CASH (для строк типа «CASH CASH | …»).
     paren_match = re.search(r"\(([A-Z]{1,10}(?:=F)?)\)", cleaned)
     if paren_match:
         return paren_match.group(1)
     match = _SYMBOL_RE.search(cleaned)
     if match:
-        return match.group(1)
+        sym = match.group(1)
+        # «BTC CASH» → BTC, но «CASH» сам по себе → CASH (а не «CASH»→tail).
+        return sym
+    if "CASH" in cleaned.upper():
+        return "CASH"
     return cleaned[:24]
 
 
@@ -218,8 +393,16 @@ def _parse_pipe_plan_line(line: str) -> Optional[dict]:
         return None
 
     direction = _normalize_direction(parts[1])
+    field_chunks = parts[2:]
     if direction not in {"LONG", "SHORT", "CASH", "WATCH"}:
-        return None
+        # Real-world Synth-выход бывает «BTC CASH | триггер пробой $X» —
+        # тикер и направление слиплись в parts[0]. Раньше парсер бросал
+        # такие строки, юзер видел пустой план. Берём direction из parts[0]
+        # как фолбэк, а parts[1:] — это уже поля (entry/stop/trigger).
+        direction = _normalize_direction(parts[0])
+        if direction not in {"LONG", "SHORT", "CASH", "WATCH"}:
+            return None
+        field_chunks = parts[1:]
 
     plan = {
         "label": parts[0],
@@ -234,7 +417,7 @@ def _parse_pipe_plan_line(line: str) -> Optional[dict]:
         "size": "",
     }
 
-    for chunk in parts[2:]:
+    for chunk in field_chunks:
         chunk_clean = _clean_line(chunk)
         lower = chunk_clean.lower()
         if "вход" in lower or "entry" in lower:
@@ -687,6 +870,30 @@ def _try_parse_synth_json(report_text: str) -> list[dict]:
     return []
 
 
+def _split_actionable_and_watch(plans: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Делит план-список на actionable (LONG/SHORT/конкретный CASH) и
+    демоутится-в-watch (двунаправленный/абстрактный CASH-триггер).
+    LONG/SHORT всегда actionable. Только CASH/WAIT/FLAT с плохим триггером
+    падают в watch.
+    """
+    actionable: list[dict] = []
+    watch: list[dict] = []
+    for plan in plans or []:
+        if not isinstance(plan, dict):
+            continue
+        unactionable, reason = _is_unactionable_cash_plan(plan)
+        if unactionable:
+            trigger_txt = str(plan.get("trigger") or "").strip()
+            watch.append({
+                "symbol": (plan.get("symbol") or plan.get("label") or "?").upper(),
+                "level": "",
+                "note": trigger_txt or reason,
+            })
+        else:
+            actionable.append(plan)
+    return actionable, watch
+
+
 def _extract_invalidation(report_text: str) -> str:
     """Synth-блок `🛑 ИНВАЛИДАЦИЯ: …` — что отменит весь сценарий."""
     synth_section = _extract_synth_section(report_text)
@@ -706,6 +913,14 @@ def build_digest_context(report_text: str, source_news: str = "") -> dict:
         json_plans = _try_parse_synth_json(report_text)
         if json_plans:
             plans = json_plans
+
+    # Демоут двунаправленных/абстрактных CASH-планов в watch-уровни.
+    # На Telegram-UI «BTC CASH | пробой $X вниз ИЛИ выше $X» выглядит как
+    # план-сделка (с маркером CASH, как сделка-в-кеше), но это watch-уровень
+    # без направления. Юзер видит «3 плана» хотя ни одного нет.
+    actionable, demoted_watch = _split_actionable_and_watch(plans)
+    extracted_watch = extract_watch_levels(report_text)
+    watch_levels = extracted_watch + demoted_watch
 
     monitoring_points = extract_monitoring_points(report_text)
     # Speechwriter рендерит «🧠 Почему: …», старый Synth писал «Потому что: …».
@@ -732,6 +947,7 @@ def build_digest_context(report_text: str, source_news: str = "") -> dict:
     monitoring_level = ""
     plain_language = extract_plain_language(report_text) or _clean_line(source_news)[:320]
     plain_language = _strip_leading_punct(plain_language)
+    eli5 = extract_eli5(report_text)
 
     return {
         "verdict": verdict,
@@ -743,7 +959,9 @@ def build_digest_context(report_text: str, source_news: str = "") -> dict:
         "monitoring_level": monitoring_level,
         "monitoring_points": monitoring_points,
         "plain_language": plain_language,
-        "plans": plans,
+        "eli5": eli5,
+        "plans": actionable,
+        "watch_levels": watch_levels,
         "full_report": report_text or "",
     }
 
