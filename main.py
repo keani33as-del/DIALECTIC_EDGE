@@ -462,13 +462,15 @@ def build_short_report(parts: dict, stars: str, pct: int, horizon: HorizonPack |
     monitoring_points = digest_ctx.get("monitoring_points") or []
     plain_language = digest_ctx.get("plain_language", "")
     key_trigger = digest_ctx.get("key_trigger", "")
+    invalidation = digest_ctx.get("invalidation", "")
 
     lines: list[str] = [
         "📊 *DIALECTIC EDGE — ЕЖЕДНЕВНЫЙ ДАЙДЖЕСТ*",
         f"🕒 {now}",
     ]
     if isinstance(horizon, HorizonPack):
-        lines.append(f"⏱ *Горизонт:* {horizon.label_pretty} ({horizon.label})")
+        # `label_pretty` уже содержит label («⚡ 1-3 дня»), не дублируем в скобках.
+        lines.append(f"⏱ *Горизонт:* {horizon.label_pretty}")
     lines.extend([
         "",
         f"🎯 *Вердикт:* {verdict_emoji} *{verdict_label}*",
@@ -486,6 +488,12 @@ def build_short_report(parts: dict, stars: str, pct: int, horizon: HorizonPack |
         lines.append(f"• {key_trigger}")
     else:
         lines.append("• Явной сделки нет — ждём подтверждения по триггерам.")
+
+    if key_trigger and not any(key_trigger.lower() in p.lower() for p in monitoring_points):
+        lines.extend(["", f"👀 *Ключевой триггер:* {key_trigger}"])
+
+    if invalidation:
+        lines.extend(["", f"🛑 *Инвалидация сценария:* {invalidation}"])
 
     if monitoring_points:
         lines.extend(["", "👀 *Точки наблюдения:*"])
@@ -1720,7 +1728,7 @@ def _horizon_picker_keyboard(force_fresh: bool = False) -> InlineKeyboardMarkup:
         pack = HORIZON_PACKS[key]
         rows.append([
             InlineKeyboardButton(
-                text=f"{pack.label_pretty} ({pack.label})",
+                text=f"{pack.label_pretty}",
                 callback_data=f"dh:{key}{suffix}",
             )
         ])
