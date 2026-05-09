@@ -44,6 +44,14 @@ from core.digest_context import (
     build_digest_context,
     format_digest_telegram_summary,
 )
+from core.horizons import (
+    DEFAULT_HORIZON_KEY,
+    HORIZONS as HORIZON_PACKS,
+    HorizonPack,
+    all_horizon_keys,
+    get_horizon,
+    speechwriter_horizon_line,
+)
 from storage import Storage
 from analysis_service import (
     run_full_analysis as analysis_service_run_full_analysis,
@@ -415,12 +423,13 @@ def extract_symbols_from_report(report: str, prices: dict) -> tuple[dict, dict, 
     return entries, stop_losses, targets, timeframes
 
 
-def build_short_report(parts: dict, stars: str, pct: int) -> list:
+def build_short_report(parts: dict, stars: str, pct: int, horizon: HorizonPack | None = None) -> list:
     """
     Собирает ОДНО сообщение для пользователя в фиксированном layout'е:
 
       📊 DIALECTIC EDGE — ЕЖЕДНЕВНЫЙ ДАЙДЖЕСТ
       🕒 dd.mm.yyyy HH:MM
+      ⏱ Горизонт: <emoji> <label>           ← опционально, если передан horizon
 
       🎯 Вердикт: <emoji> <Бычий/Медвежий/Нейтральный>
       📊 Сигнал: ⭐⭐⭐⭐⭐ (NN%)
@@ -457,10 +466,14 @@ def build_short_report(parts: dict, stars: str, pct: int) -> list:
     lines: list[str] = [
         "📊 *DIALECTIC EDGE — ЕЖЕДНЕВНЫЙ ДАЙДЖЕСТ*",
         f"🕒 {now}",
+    ]
+    if isinstance(horizon, HorizonPack):
+        lines.append(f"⏱ *Горизонт:* {horizon.label_pretty} ({horizon.label})")
+    lines.extend([
         "",
         f"🎯 *Вердикт:* {verdict_emoji} *{verdict_label}*",
         f"📊 *Сигнал:* {stars} ({pct}%)",
-    ]
+    ])
 
     if verdict_reason:
         lines.extend(["", f"🧠 *Почему:* {verdict_reason}"])
@@ -580,8 +593,13 @@ async def send_daily_digest_bundle(
     user_id: int,
     report: str,
     prices_dict: dict,
+    horizon: HorizonPack | str | None = None,
 ) -> None:
-    """Текст дайджеста + график (после первого блока) + клавиатура."""
+    """Текст дайджеста + график (после первого блока) + клавиатура.
+
+    `horizon` (если задан) рендерится отдельной строкой в шапке дайджеста,
+    чтобы юзер видел под какой горизонт построены план/стопы/R/R.
+    """
     parts = parse_report_parts(report)
     pct_val, stars_str = extract_signal_pct_and_stars(report)
     hid = hydrate_debate_from_report(report)
@@ -602,7 +620,10 @@ async def send_daily_digest_bundle(
     except Exception as e:
         logger.warning("save_user_debate_snapshot: %s", e)
 
-    messages = build_short_report(parts, stars_str, pct_val)
+    pack = horizon if isinstance(horizon, HorizonPack) else (
+        get_horizon(horizon) if horizon is not None else None
+    )
+    messages = build_short_report(parts, stars_str, pct_val, horizon=pack)
     logger.info(f"Отправляю {len(messages)} сообщений. Размеры: {[len(m) for m in messages]}")
 
     rounds_out = debate_cache.get(user_id, {}).get("rounds") or []
@@ -1615,9 +1636,15 @@ async def run_daily_analysis(user_id: int) -> str:
 
 
 async def deliver_scheduled_daily(user_id: int) -> None:
-    """Рассылка подписчикам: как /daily — сначала общий кэш (без токенов), иначе полный прогон."""
+    """Рассылка подписчикам: как /daily — сначала общий кэш (без токенов), иначе полный прогон.
+
+    Шедулер всегда отдаёт swing-горизонт (DEFAULT_HORIZON_KEY): подписки до
+    Tier-1 не имели понятия горизонта, и менять расписание под intraday/position
+    мы будем уже в /subscribe (отдельный PR).
+    """
     try:
-        cached = storage.get_cached_report()
+        pack = get_horizon(DEFAULT_HORIZON_KEY)
+        cached = storage.get_cached_report(horizon=pack.key)
         if cached:
             report = cached["report"]
             prices = cached.get("prices") or {}
@@ -1625,12 +1652,185 @@ async def deliver_scheduled_daily(user_id: int) -> None:
                 await save_predictions_from_report(report, source_news="")
             except Exception as e:
                 logger.warning("deliver_scheduled_daily: sync daily_context failed: %s", e)
-            await send_daily_digest_bundle(user_id, user_id, report, prices)
+            await send_daily_digest_bundle(user_id, user_id, report, prices, horizon=pack)
             return
-        report, prices = await analysis_service_run_full_analysis(user_id)
-        await send_daily_digest_bundle(user_id, user_id, report, prices)
+        report, prices = await analysis_service_run_full_analysis(user_id, horizon=pack)
+        await send_daily_digest_bundle(user_id, user_id, report, prices, horizon=pack)
     except Exception as e:
         logger.warning("Рассылка дайджеста user %s: %s", user_id, e)
+
+
+# ─── Multi-horizon picker ─────────────────────────────────────────────────────
+
+# Алиасы CLI-аргументов /daily для обратной совместимости. `force/fresh/new/новый`
+# поддерживаются как и раньше, плюс ключи горизонтов и человекочитаемые синонимы.
+_HORIZON_ARG_ALIASES = {
+    "intraday": "intraday",
+    "intra": "intraday",
+    "интрадей": "intraday",
+    "fast": "intraday",
+    "scalp": "intraday",
+    "скальп": "intraday",
+    "1-3": "intraday",
+    "1-3д": "intraday",
+    "1-3d": "intraday",
+    "swing": "swing",
+    "свинг": "swing",
+    "default": "swing",
+    "standard": "swing",
+    "стандарт": "swing",
+    "7-14": "swing",
+    "7-14д": "swing",
+    "7-14d": "swing",
+    "position": "position",
+    "позиция": "position",
+    "позиционный": "position",
+    "long": "position",
+    "лонг": "position",
+    "30+": "position",
+    "30+д": "position",
+    "30+d": "position",
+}
+_FORCE_TOKENS = {"force", "fresh", "новый", "new", "f"}
+
+
+def _parse_daily_args(text: str) -> tuple[str | None, bool]:
+    """`/daily intraday force` → ("intraday", True). Возвращает (horizon_key|None, force_fresh)."""
+    horizon_key: str | None = None
+    force_fresh = False
+    for token in (text or "").split()[1:]:
+        norm = token.strip().lower()
+        if not norm:
+            continue
+        if norm in _FORCE_TOKENS:
+            force_fresh = True
+            continue
+        mapped = _HORIZON_ARG_ALIASES.get(norm)
+        if mapped and horizon_key is None:
+            horizon_key = mapped
+    return horizon_key, force_fresh
+
+
+def _horizon_picker_keyboard(force_fresh: bool = False) -> InlineKeyboardMarkup:
+    """3 кнопки выбора горизонта. `force` зашиваем в callback_data, чтобы
+    обработчик не зависел от внешнего состояния."""
+    suffix = ":f" if force_fresh else ""
+    rows = []
+    for key in all_horizon_keys():
+        pack = HORIZON_PACKS[key]
+        rows.append([
+            InlineKeyboardButton(
+                text=f"{pack.label_pretty} ({pack.label})",
+                callback_data=f"dh:{key}{suffix}",
+            )
+        ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _send_horizon_picker(message: Message, force_fresh: bool = False) -> None:
+    note = "" if not force_fresh else " (без кэша)"
+    await message.answer(
+        "🎯 *Выбери горизонт планирования* ⤵️" + note + "\n\n"
+        "⚡️ *1–3 дня* — стопы плотные, R/R от 1:1.5, доля депо мелкая.\n"
+        "📈 *7–14 дней* — свинг, стандартный режим (по умолчанию).\n"
+        "🏔 *30+ дней* — макро-позиция, R/R от 1:3, входим осторожнее.\n\n"
+        "Можно сразу командой: `/daily intraday`, `/daily swing`, `/daily position`. "
+        "`/daily force` — сбросить кэш.",
+        parse_mode="Markdown",
+        reply_markup=_horizon_picker_keyboard(force_fresh=force_fresh),
+    )
+
+
+async def _run_daily_for_horizon(
+    chat_id: int,
+    user_id: int,
+    horizon_key: str,
+    *,
+    force_fresh: bool,
+    wait_msg_id: int | None = None,
+    reply_to: Message | None = None,
+) -> None:
+    """Общий движок /daily: используется и из Message, и из callback горизонт-пикера.
+
+    `wait_msg_id` — ID сообщения «⏳ Запускаю анализ...», которое мы обновляем/удаляем.
+    `reply_to` — Message от которого пришла команда (нужен для фолбэк-ответов на
+    ошибках, когда edit_message_text недоступен).
+    """
+    pack = get_horizon(horizon_key)
+    cached = None if force_fresh else storage.get_cached_report(horizon=pack.key)
+    if cached:
+        report = cached["report"]
+        prices = cached.get("prices") or {}
+        try:
+            await save_predictions_from_report(report, source_news="")
+        except Exception as e:
+            logger.warning("cmd_daily cache: sync daily_context failed: %s", e)
+        # Удаляем «⏳ Запускаю» если он есть, чтобы не путать пользователя
+        if wait_msg_id is not None:
+            try:
+                await bot.delete_message(chat_id=chat_id, message_id=wait_msg_id)
+            except Exception:
+                pass
+        await send_daily_digest_bundle(chat_id, user_id, report, prices, horizon=pack)
+        await bot.send_message(
+            chat_id,
+            f"📦 Кэш {pack.label_pretty} от {cached['timestamp']}. "
+            f"Повтор без AI до ~{CACHE_TTL_HOURS} ч. "
+            f"Сброс: `/daily {pack.key} force`",
+            parse_mode="Markdown",
+        )
+        return
+
+    if wait_msg_id is None:
+        wait = await bot.send_message(
+            chat_id,
+            f"⏳ *Запускаю анализ — {pack.label_pretty} ({pack.label})...*\n\n"
+            "🔄 Живые цены → новости → геополитика → дебаты агентов\n"
+            "_Займёт 2–5 минут..._",
+            parse_mode="Markdown",
+        )
+        wait_msg_id = wait.message_id
+    else:
+        try:
+            await bot.edit_message_text(
+                f"⏳ *Запускаю анализ — {pack.label_pretty} ({pack.label})...*\n\n"
+                "🔄 Живые цены → новости → геополитика → дебаты агентов\n"
+                "_Займёт 2–5 минут..._",
+                chat_id=chat_id,
+                message_id=wait_msg_id,
+                parse_mode="Markdown",
+            )
+        except Exception:
+            pass
+
+    try:
+        await increment_requests(user_id)
+        report, prices = await analysis_service_run_full_analysis(user_id, horizon=pack)
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=wait_msg_id)
+        except Exception:
+            pass
+        await send_daily_digest_bundle(chat_id, user_id, report, prices, horizon=pack)
+    except Exception as e:
+        logger.error(f"Daily error (horizon={pack.key}): {e}", exc_info=True)
+        try:
+            await bot.edit_message_text(
+                f"❌ *Ошибка ({pack.label_pretty}):* `{str(e)[:200]}`\n\n"
+                "Проверь: API ключи, интернет, BOT_TOKEN.",
+                chat_id=chat_id,
+                message_id=wait_msg_id,
+                parse_mode="Markdown",
+            )
+        except Exception:
+            target = reply_to.answer if reply_to else lambda *a, **kw: bot.send_message(chat_id, *a, **kw)
+            try:
+                await target(
+                    f"❌ *Ошибка ({pack.label_pretty}):* `{str(e)[:200]}`\n\n"
+                    "Проверь: API ключи, интернет, BOT_TOKEN.",
+                    parse_mode="Markdown",
+                )
+            except Exception:
+                pass
 
 
 @dp.message(Command("daily"))
@@ -1646,59 +1846,80 @@ async def cmd_daily(message: Message):
         )
         return
 
-    text_parts = (message.text or "").split(maxsplit=1)
-    force_fresh = (
-        len(text_parts) > 1
-        and text_parts[1].strip().lower() in ("force", "fresh", "новый", "new")
-    )
+    horizon_key, force_fresh = _parse_daily_args(message.text or "")
 
-    cached = None if force_fresh else storage.get_cached_report()
-    if cached:
-        report = cached["report"]
-        prices = cached.get("prices") or {}
-        try:
-            await save_predictions_from_report(report, source_news="")
-        except Exception as e:
-            logger.warning("cmd_daily cache: sync daily_context failed: %s", e)
-        await send_daily_digest_bundle(message.chat.id, user_id, report, prices)
-        await message.answer(
-            f"Кэш от {cached['timestamp']}. Повтор без AI до ~{CACHE_TTL_HOURS} ч. "
-            f"Сброс: `/daily force`",
-            parse_mode="Markdown",
-        )
+    if horizon_key is None:
+        # Без аргументов — показываем пикер. force, если был, не теряется.
+        await _send_horizon_picker(message, force_fresh=force_fresh)
         return
 
-    wait_msg = await message.answer(
-        "⏳ *Запускаю анализ...*\n\n"
-        "🔄 Живые цены → новости → геополитика → дебаты агентов\n"
-        "_Займёт 2–5 минут..._",
-        parse_mode="Markdown"
+    await _run_daily_for_horizon(
+        chat_id=message.chat.id,
+        user_id=user_id,
+        horizon_key=horizon_key,
+        force_fresh=force_fresh,
+        reply_to=message,
     )
 
-    try:
-        await increment_requests(user_id)
-        report, prices = await analysis_service_run_full_analysis(user_id)
-        try:
-            await bot.delete_message(chat_id=message.chat.id, message_id=wait_msg.message_id)
-        except Exception:
-            pass  # сообщение уже удалено или недоступно — не критично
-        await send_daily_digest_bundle(message.chat.id, user_id, report, prices)
 
-    except Exception as e:
-        logger.error(f"Daily error: {e}", exc_info=True)
+@dp.callback_query(F.data.startswith("dh:"))
+async def handle_daily_horizon_pick(callback: CallbackQuery):
+    """Колбэк горизонт-пикера: dh:{key} или dh:{key}:f."""
+    await callback.answer()
+    parts = (callback.data or "").split(":")
+    if len(parts) < 2:
+        return
+    horizon_key = parts[1]
+    force_fresh = (len(parts) >= 3 and parts[2] == "f")
+    if horizon_key not in HORIZON_PACKS:
+        return
+
+    user_id = callback.from_user.id
+    await upsert_user(user_id, callback.from_user.username or "")
+
+    if not await check_limit(user_id):
+        if callback.message:
+            try:
+                await callback.message.edit_text(
+                    f"⛔ *Лимит* — {FREE_DAILY_LIMIT} запросов/день (free)\n"
+                    "Попробуй завтра или /subscribe для авторассылки.",
+                    parse_mode="Markdown",
+                )
+            except Exception:
+                await bot.send_message(
+                    user_id,
+                    f"⛔ *Лимит* — {FREE_DAILY_LIMIT} запросов/день (free)\n"
+                    "Попробуй завтра или /subscribe для авторассылки.",
+                    parse_mode="Markdown",
+                )
+        return
+
+    chat_id = callback.message.chat.id if callback.message else user_id
+    wait_msg_id = callback.message.message_id if callback.message else None
+
+    pack = HORIZON_PACKS[horizon_key]
+    if wait_msg_id is not None:
         try:
             await bot.edit_message_text(
-                f"❌ *Ошибка:* `{str(e)[:200]}`\n\n"
-                "Проверь: API ключи, интернет, BOT_TOKEN.",
-                chat_id=message.chat.id,
-                message_id=wait_msg.message_id,
-                parse_mode="Markdown"
+                f"⏳ *Запускаю анализ — {pack.label_pretty} ({pack.label})...*\n\n"
+                "🔄 Живые цены → новости → геополитика → дебаты агентов\n"
+                "_Займёт 2–5 минут..._",
+                chat_id=chat_id,
+                message_id=wait_msg_id,
+                parse_mode="Markdown",
+                reply_markup=None,
             )
         except Exception:
-            await message.answer(
-                f"❌ *Ошибка:* `{str(e)[:200]}`\n\nПроверь: API ключи, интернет, BOT_TOKEN.",
-                parse_mode="Markdown"
-            )
+            wait_msg_id = None
+
+    await _run_daily_for_horizon(
+        chat_id=chat_id,
+        user_id=user_id,
+        horizon_key=horizon_key,
+        force_fresh=force_fresh,
+        wait_msg_id=wait_msg_id,
+        reply_to=callback.message,
+    )
 
 
 # ─── /analyze ─────────────────────────────────────────────────────────────────

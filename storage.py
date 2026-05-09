@@ -1,5 +1,10 @@
 """
 storage.py — Простое кэширование отчётов в JSON-файл.
+
+Кэш-ключи теперь намёрты на горизонт планирования: /daily intraday не отдаёт
+кэш от /daily swing и наоборот. По умолчанию (legacy-вызовы без horizon)
+используется swing — это совпадает с DEFAULT_HORIZON_KEY и сохраняет старое
+поведение.
 """
 
 import json
@@ -10,6 +15,16 @@ from pathlib import Path
 from config import CACHE_FILE, CACHE_TTL_HOURS, DEBATE_SNAPSHOT_HOURS
 
 logger = logging.getLogger(__name__)
+
+
+def _norm_horizon(horizon: str | None) -> str:
+    """Resolve horizon to a stable cache-key string, even on stale data."""
+    try:
+        from core.horizons import get_horizon
+        return get_horizon(horizon).key
+    except Exception:
+        # Soft fallback so cache stays functional even if horizons module is mid-import.
+        return (horizon or "swing").strip().lower() or "swing"
 
 
 class Storage:
@@ -42,45 +57,74 @@ class Storage:
         report: str,
         prices: dict | None = None,
         owner_user_id: int | None = None,
+        horizon: str | None = None,
     ):
         """Кэширует последний отчёт и снимок цен (для графика при отдаче из кэша)."""
+        h = _norm_horizon(horizon)
         entry = {
             "report": report,
             "timestamp": datetime.now().strftime("%d.%m.%Y %H:%M"),
             "expires": (datetime.now() + timedelta(hours=CACHE_TTL_HOURS)).isoformat(),
+            "horizon": h,
         }
         if prices is not None:
             entry["prices"] = prices
         self.reload_from_disk()
+        # last_report остаётся для обратной совместимости (старые места кода
+        # которые ничего не знают про горизонт). Параллельно пишем
+        # last_report_by_horizon[h] — это новый канонический ключ.
         self._data["last_report"] = entry
+        self._data.setdefault("last_report_by_horizon", {})
+        self._data["last_report_by_horizon"][h] = entry
         if owner_user_id is not None:
             # Отдельно на пользователя — fallback для кнопки «дебаты» на том же воркере/диске
             self._data.setdefault("user_report_cache", {})
-            self._data["user_report_cache"][str(owner_user_id)] = {
+            user_bucket = self._data["user_report_cache"].setdefault(str(owner_user_id), {})
+            # Backward-compat: top-level keys = последний отчёт (любой горизонт)
+            user_bucket["report"] = report
+            user_bucket["expires"] = entry["expires"]
+            user_bucket["timestamp"] = entry["timestamp"]
+            user_bucket["horizon"] = h
+            # И в namespaced bucket по горизонту
+            user_bucket.setdefault("by_horizon", {})
+            user_bucket["by_horizon"][h] = {
                 "report": report,
                 "expires": entry["expires"],
                 "timestamp": entry["timestamp"],
             }
         self._save()
-        logger.info("Отчёт кэширован")
+        logger.info(f"Отчёт кэширован (horizon={h})")
 
-    def get_cached_report(self) -> dict | None:
-        """Возвращает кэшированный отчёт, если он ещё актуален."""
+    def get_cached_report(self, horizon: str | None = None) -> dict | None:
+        """Возвращает кэшированный отчёт, если он ещё актуален.
+
+        Если horizon не указан — отдаём legacy-кэш `last_report` (горизонт-агностик).
+        Если указан — отдаём только кэш с совпадающим горизонтом, чтобы не
+        смешивать intraday/swing/position в одной отдаче.
+        """
         # Всегда читаем с диска: на Railway несколько воркеров / ephemeral — память процесса устаревает.
         self.reload_from_disk()
-        cached = self._data.get("last_report")
+        if horizon is not None:
+            h = _norm_horizon(horizon)
+            bucket = self._data.get("last_report_by_horizon", {})
+            cached = bucket.get(h) if isinstance(bucket, dict) else None
+        else:
+            cached = self._data.get("last_report")
         if not cached:
             return None
-        
+
         expires = datetime.fromisoformat(cached.get("expires", "2000-01-01"))
         if datetime.now() > expires:
             logger.info("Кэш устарел")
             return None
-        
+
         return cached
 
-    def get_user_last_cached_report(self, user_id: int) -> str | None:
-        """Последний полный отчёт, сохранённый при /daily для этого user_id (тот же TTL что last_report)."""
+    def get_user_last_cached_report(self, user_id: int, horizon: str | None = None) -> str | None:
+        """Последний полный отчёт, сохранённый при /daily для этого user_id (тот же TTL что last_report).
+
+        Если horizon указан — отдаём только отчёт с совпадающим горизонтом.
+        """
         self.reload_from_disk()
         bucket = self._data.get("user_report_cache")
         if not isinstance(bucket, dict):
@@ -88,6 +132,13 @@ class Storage:
         ent = bucket.get(str(user_id))
         if not isinstance(ent, dict):
             return None
+        if horizon is not None:
+            h = _norm_horizon(horizon)
+            by_h = ent.get("by_horizon")
+            if isinstance(by_h, dict) and h in by_h:
+                ent = by_h[h]
+            else:
+                return None
         try:
             exp = datetime.fromisoformat(ent.get("expires", "2000-01-01"))
         except Exception:

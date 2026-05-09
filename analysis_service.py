@@ -10,6 +10,7 @@ from datetime import datetime
 from typing import Dict, Tuple
 
 from agents import DebateOrchestrator
+from core.horizons import DEFAULT_HORIZON_KEY, HorizonPack, get_horizon
 # fetch_full_context из старого файла data_sources.py
 from data_sources import fetch_full_context
 from database import log_report
@@ -130,12 +131,20 @@ async def run_full_analysis(
     user_id: int,
     custom_news: str = "",
     custom_mode: bool = False,
+    horizon: str | HorizonPack | None = None,
 ) -> Tuple[str, Dict]:
     """
     Run the current production analysis pipeline and return full report + prices.
+
+    `horizon` selects the planning timeframe (intraday/swing/position) and is
+    propagated into Synth's prompt overlay, the deterministic plan renderer and
+    the digest cache key. Defaults to swing for backward compatibility.
     """
     from database import get_predictions_summary
-    
+
+    pack = horizon if isinstance(horizon, HorizonPack) else get_horizon(horizon if isinstance(horizon, str) else None)
+    logger.info(f"[ANALYSIS] run_full_analysis user={user_id} custom={custom_mode} horizon={pack.key}")
+
     tasks = [
         _fetcher.fetch_all(),
         fetch_full_context(),
@@ -220,6 +229,7 @@ async def run_full_analysis(
 
     # ═══ ON-CHAIN + EXTENDED MACRO + SCORING ═══
     # Добавляем MVRV, SOPR, Fed Balance, Yields, Yield Curve, система баллов
+    stop_factor: str | None = None  # 'bearish'|'bullish'|None — code-side override into renderer
     if not custom_mode:
         try:
             from market_indicators import build_enriched_context, enrich_prices_with_scores
@@ -237,8 +247,18 @@ async def run_full_analysis(
             # Обогащаем prices_dict для отчёта и графиков
             if enriched_data:
                 prices_dict = enrich_prices_with_scores(prices_dict, enriched_data.score, enriched_data)
-            
-            logger.info(f"[ANALYSIS] On-chain + Macro + Scoring: OK (verdict={enriched_data.score.final_verdict}, score={enriched_data.score.total_score:+d})")
+            # Code-side stop-factor override: MVRV/VIX/F&G в экстремальных зонах →
+            # запрещаем направленные планы, чтобы LLM не натянул LONG в эйфории /
+            # SHORT на историческом дне. Bearish имеет приоритет — он опаснее.
+            if enriched_data and enriched_data.score:
+                if enriched_data.score.has_critical_bearish:
+                    stop_factor = "bearish"
+                elif enriched_data.score.has_critical_bullish:
+                    stop_factor = "bullish"
+                if stop_factor:
+                    logger.warning(f"[STOP-FACTOR] active: {stop_factor} → directional plans will be coerced to CASH")
+
+            logger.info(f"[ANALYSIS] On-chain + Macro + Scoring: OK (verdict={enriched_data.score.final_verdict}, score={enriched_data.score.total_score:+d}, stop_factor={stop_factor})")
             
             # Сохраняем в GitHub cache
             try:
@@ -268,6 +288,8 @@ async def run_full_analysis(
         live_prices=live_prices,
         profile_instruction=profile_instruction + sentiment_block,
         custom_mode=custom_mode,
+        horizon=pack,
+        stop_factor=stop_factor,
     )
     report, removed_lines = sanitize_full_report(report)
     if removed_lines:
@@ -316,7 +338,7 @@ async def run_full_analysis(
     )
 
     if not custom_mode:
-        _storage.cache_report(report, prices_dict, owner_user_id=user_id)
+        _storage.cache_report(report, prices_dict, owner_user_id=user_id, horizon=pack.key)
         try:
             date_str = datetime.now().strftime("%d.%m.%Y %H:%M")
             from main import parse_report_parts
