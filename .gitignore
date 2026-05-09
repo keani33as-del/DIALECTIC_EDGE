@@ -8,3 +8,4 @@ venv/
 dialectic_edge.db
 .cache/
 .vscode/
+cache.json

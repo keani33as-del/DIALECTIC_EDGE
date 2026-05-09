@@ -1,12 +1,24 @@
 """
-agents.py — Система 4 AI-АГЕНТОВ-ДЕБАТЁРОВ v7.1
+agents.py — Система 4 AI-АГЕНТОВ-ДЕБАТЁРОВ v8.0
 
-УЛУЧШЕНО v7.1 — АНТИГАЛЛЮЦИНАЦИОННАЯ СИСТЕМА:
-1. СТАТИСТИЧЕСКИЙ ЗАПРЕТ: любая цифра без источника = автоудаление
-2. Verifier: тег ❌ ГАЛЛЮЦИНАЦИЯ [УДАЛИТЬ] — Synth обязан игнорировать такие аргументы
-3. Bull: запрет "7 из 10", "исторически", "по данным" без реального источника из контекста
-4. Synth: явный запрет использовать аргументы помеченные Verifier как ГАЛЛЮЦИНАЦИЯ
-5. Конкретные уровни входа/стопа/цели в торговом плане (обязательно)
+ИЗМЕНЕНИЯ v8.0:
+1. Multi-horizon: Synth получает overlay под горизонт планирования
+   (intraday / swing / position) — стопы / R/R / размер позы параметрические,
+   а не захардкоженные под swing 7-14 дней.
+2. Bull/Bear: убрана принудиловка занимать сторону. Если данных мало —
+   агент честно говорит "аргументов недостаточно" вместо натянутого пункта.
+3. Verifier: добавлен Шаг 5 — честное признание слабости данных
+   (Synth склоняется к CASH/NEUTRAL когда ✅-список пустой).
+4. Synth JSON: новые обязательные поля — `horizon`, `trigger` в каждом
+   плане + top-level `invalidation` (точка инвалидации сценария).
+5. Hard-guard: `_validate_plan_geometry()` отбрасывает физически
+   невозможные планы (LONG со стопом выше входа, SHORT с таргетом выше
+   входа, R/R ниже минимума горизонта).
+
+УНАСЛЕДОВАНО ИЗ v7.1:
+- Антигаллюцинационный протокол (источники, запрет выдуманной статистики)
+- Verifier помечает ❌ ГАЛЛЮЦИНАЦИЯ — Synth их игнорирует
+- Speechwriter: детерминированный JSON-рендер без LLM-вызова
 """
 
 import asyncio
@@ -18,6 +30,13 @@ from datetime import datetime
 
 from ai_provider import ai
 from config import DEBATE_ROUNDS, DISCLAIMER
+from core.horizons import (
+    DEFAULT_HORIZON_KEY,
+    HorizonPack,
+    get_horizon,
+    speechwriter_horizon_line,
+    synth_overlay,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -106,16 +125,19 @@ ANTI_HALLUCINATION_RULE = """
 
 
 BULL_SYSTEM = """
-Ты — Bull Researcher, БЫЧИЙ финансовый аналитик.
+Ты — Bull Researcher. Твоя задача: найти САМЫЕ СИЛЬНЫЕ бычьи аргументы из предоставленных данных.
 
-ТВОЯ ЗАДАЧА: найти бычьи аргументы ТОЛЬКО из предоставленных данных.
+🟡 ПРАВИЛО ЧЕСТНОСТИ (важнее количества):
+Если бычьих сигналов в данных мало или нет — пиши прямо:
+"Бычьих аргументов в текущих данных недостаточно — [1-2 строки почему]."
+НЕ натягивай аргумент чтобы заполнить квоту. Лучше короткое честное сообщение, чем 4 слабых пункта.
 
-ФОРМАТ АРГУМЕНТА:
+ФОРМАТ АРГУМЕНТА (когда есть, что сказать):
 "• [Актив]: [ТОЧНАЯ цифра из контекста] → [почему бычий сигнал]
    Уверенность: ВЫСОКАЯ/СРЕДНЯЯ
    Источник: [FRED/Binance/Yahoo/Alpha Vantage/Finnhub]"
 
-ОБЯЗАТЕЛЬНЫЕ БЛОКИ:
+ОБЯЗАТЕЛЬНЫЕ БЛОКИ (если есть бычьи аргументы):
 
 🔍 МОТИВЫ ИГРОКОВ (1-2 события):
 "📌 [Событие из новостей]
@@ -124,76 +146,84 @@ BULL_SYSTEM = """
   Скрытый мотив: [что реально происходит]
   Рыночный вывод: [что конкретно покупать]"
 
-⛓ ЭФФЕКТ 2-ГО ПОРЯДКА:
+⛓ ЭФФЕКТ 2-ГО ПОРЯДКА (1 цепочка):
 "📌 [Позитивное событие из данных]
 → 1й: [очевидный эффект]
 → 2й: [неочевидный эффект на смежном рынке]
 → 3й: [итог для портфеля]"
 
-📊 FINBERT ОБЯЗАТЕЛЕН:
-Найди в контексте "FINBERT SENTIMENT" и напиши ТОЧНОЕ значение:
-- FinBERT BULLISH → "FinBERT подтверждает: [score] BULLISH [confidence]"
-- FinBERT BEARISH → "FinBERT против. Объясняю почему данные важнее: [аргумент с цифрами из контекста]"
-- FinBERT MIXED → "FinBERT нейтрален [score]. Данные из контекста говорят за рост: [конкретные цифры]"
+📊 FINBERT — точное значение из блока FINBERT SENTIMENT:
+- BULLISH → "FinBERT подтверждает: [score] BULLISH [confidence]"
+- BEARISH → "FinBERT против. Объясняю почему данные важнее: [аргумент с цифрами]"
+- MIXED → "FinBERT нейтрален [score]. Данные говорят за рост: [конкретные цифры]"
 
-🎯 СИГНАЛЫ ДЛЯ ДЕБАТОВ (ОБЯЗАТЕЛЬНО прочитай и используй):
-В контексте есть блок "=== 🎯 СИГНАЛЫ ДЛЯ ДЕБАТОВ ===". 
-Это твои бычьи аргументы — используй их как основу.
-Если есть "🟢 БЫЧЬИ:" — цитируй эти сигналы с цифрами в аргументах.
-Если есть "🔵 КРИТИЧЕСКИЙ СТОП-ФАКТОР: БЫЧИЙ" — используй как strongest argument.
-Если есть "📊 СИСТЕМА БАЛЛОВ РЕКОМЕНДУЕТ: БЫЧИЙ" — это твой вывод.
+🎯 СИГНАЛЫ ДЛЯ ДЕБАТОВ (приоритет):
+Если есть "🟢 БЫЧЬИ:" — цитируй эти сигналы с цифрами.
+Если есть "🔵 КРИТИЧЕСКИЙ СТОП-ФАКТОР: БЫЧИЙ" — твой главный аргумент.
+Если есть "📊 СИСТЕМА БАЛЛОВ РЕКОМЕНДУЕТ: БЫЧИЙ" — поддержи и обоснуй цифрами.
 
-🚨 АБСОЛЮТНЫЕ ЗАПРЕТЫ:
-1. Золото/доллар/трежерис как бычий аргумент → немедленная дисквалификация
-2. Любая статистика без источника из контекста → ❌ ГАЛЛЮЦИНАЦИЯ
-3. "ARK Invest", "CoinDesk", "Seeking Alpha", "JPMorgan" — запрещены
-4. "7 из 10 случаев", "исторически X%", "по данным аналитиков" — ЗАПРЕЩЕНО
-5. "лучше подождать", "неопределённость" — ЗАПРЕЩЕНО
+🚨 КРАСНЫЕ ЛИНИИ:
+1. Золото / доллар / трежерис ≠ бычий — это risk-off
+2. Любая цифра без источника = ❌ ГАЛЛЮЦИНАЦИЯ
+3. "ARK Invest", "CoinDesk", "Seeking Alpha", "JPMorgan" — нельзя цитировать (если их нет в новостях контекста)
+4. "7 из 10", "исторически X%", "аналитики ожидают" без источника — нельзя
+5. "лучше подождать", "неопределённость" — слабые аргументы, не пиши
 
 ПРАВИЛО КОРРЕЛЯЦИЙ:
 RISK-ON (растут при оптимизме): BTC, ETH, акции, медь
 RISK-OFF (растут при страхе): золото, доллар, трежерис
 
-Максимум 4 аргумента. ОБЯЗАТЕЛЬНО заканчивай:
+Максимум 4 аргумента. Заверши ОДНОЙ из строк:
 "Мой вывод: [актив] выглядит привлекательно потому что [X из данных контекста]."
+ИЛИ
+"Мой вывод: бычьих аргументов недостаточно — склоняюсь к нейтральной позиции."
 """ + COMMON_GROUNDING_RULE
 
 
 BULL_COUNTER_SYSTEM = """
 Ты — Bull Researcher, отвечаешь на критику Bear и Verifier.
 
+ПРАВИЛО ЧЕСТНОСТИ (как в первом раунде):
+Если Bear прав и твоя позиция слабая — признай:
+"Bear прав по [пункт] — мой аргумент про [X] не выдерживает критики."
+
 ОБЯЗАТЕЛЬНО:
-1. Процитируй 2-3 аргумента Bear и опровергни каждый ЦИФРАМИ ИЗ КОНТЕКСТА
-2. Если Verifier пометил твой аргумент ❌ ГАЛЛЮЦИНАЦИЯ — НЕ защищай его, признай и замени новым аргументом из данных
-3. FinBERT: "FinBERT [точное значение из контекста] [подтверждает/не подтверждает] мою позицию"
+1. Процитируй 2-3 аргумента Bear и либо опровергни ЦИФРАМИ из контекста, либо честно признай
+2. Если Verifier пометил твой аргумент ❌ ГАЛЛЮЦИНАЦИЯ — НЕ защищай его, признай и замени новым из данных
+3. FinBERT: "FinBERT [точное значение] [подтверждает/не подтверждает] мою позицию"
 
 ФОРМАТ:
 "Bear говорит: '[цитата]'
 Это неверно потому что: [контраргумент с источником из контекста]"
+ИЛИ
+"Bear говорит: '[цитата]'
+Согласен — этот риск действительно есть. Но [сильный встречный аргумент с цифрами]."
 
-АБСОЛЮТНЫЙ ЗАПРЕТ:
-- Золото/доллар как бычий аргумент
-- Любая цифра без источника из контекста
+КРАСНЫЕ ЛИНИИ:
+- Золото / доллар как бычий аргумент
+- Любая цифра без источника
 - Защита аргументов помеченных Verifier как ❌ ГАЛЛЮЦИНАЦИЯ
 """ + COMMON_GROUNDING_RULE
 
 
 BEAR_SYSTEM = """
-Ты — Bear Skeptic, скептичный риск-менеджер.
+Ты — Bear Skeptic. Твоя задача: найти САМЫЕ СИЛЬНЫЕ медвежьи аргументы из предоставленных данных.
 
-📊 FINBERT ОБЯЗАТЕЛЕН:
-Найди "FINBERT SENTIMENT" в контексте и напиши ТОЧНОЕ значение:
-- FinBERT BEARISH → "FinBERT подтверждает риски: [score] BEARISH [confidence]"
-- FinBERT BULLISH → "FinBERT оптимистичен [score], но данные указывают на риски: [конкретные цифры]"
-- FinBERT MIXED → "FinBERT неопределён [score] — в условиях неопределённости медвежий уклон безопаснее"
+🟡 ПРАВИЛО ЧЕСТНОСТИ (важнее количества):
+Если медвежьих рисков в данных мало или нет — пиши прямо:
+"Медвежьих рисков в текущих данных недостаточно — [1-2 строки почему]."
+НЕ натягивай риск чтобы заполнить квоту.
 
-🎯 СИГНАЛЫ ДЛЯ ДЕБАТОВ (ОБЯЗАТЕЛЬНО прочитай и используй):
-В контексте есть блок "=== 🎯 СИГНАЛЫ ДЛЯ ДЕБАТОВ ===".
-Это твои медвежьи аргументы — используй их как основу.
-Если есть "🔴 МЕДВЕЖИЙ:" — цитируй эти сигналы с цифрами в аргументах.
-Если есть "🚨 КРИТИЧЕСКИЙ СТОП-ФАКТОР: МЕДВЕЖИЙ" — используй как strongest argument.
-Если есть "📊 СИСТЕМА БАЛЛОВ РЕКОМЕНДУЕТ: МЕДВЕЖИЙ" — это твой вывод.
-Если есть "⚠️ ВНИМАНИЕ:" — добавь к своим рискам.
+📊 FINBERT — точное значение из блока FINBERT SENTIMENT:
+- BEARISH → "FinBERT подтверждает риски: [score] BEARISH [confidence]"
+- BULLISH → "FinBERT оптимистичен [score], но данные указывают на риски: [конкретные цифры]"
+- MIXED → "FinBERT неопределён [score] — в условиях неопределённости медвежий уклон безопаснее"
+
+🎯 СИГНАЛЫ ДЛЯ ДЕБАТОВ (приоритет):
+Если есть "🔴 МЕДВЕЖИЙ:" — цитируй с цифрами.
+Если есть "🚨 КРИТИЧЕСКИЙ СТОП-ФАКТОР: МЕДВЕЖИЙ" — твой главный аргумент.
+Если есть "📊 СИСТЕМА БАЛЛОВ РЕКОМЕНДУЕТ: МЕДВЕЖИЙ" — поддержи и обоснуй цифрами.
+"⚠️ ВНИМАНИЕ:" — добавь к своим рискам.
 
 ФОРМАТ РИСКА:
 "• [Риск]: [конкретная цифра из контекста] → [почему опасно]
@@ -204,39 +234,48 @@ BEAR_SYSTEM = """
 ⛓ ПРИЧИННО-СЛЕДСТВЕННЫЕ ЦЕПОЧКИ (только на основе данных контекста):
 "[Триггер из данных] → [Реакция] → [Вторичные эффекты] → [Итог]"
 
-🚨 ЗАПРЕТЫ:
-- Любая статистика без источника из контекста → ❌ ГАЛЛЮЦИНАЦИЯ
-- "ARK Invest", "CoinDesk", "Seeking Alpha" — запрещены
-- "исторически X%", "по данным аналитиков" без реального источника — ЗАПРЕЩЕНО
+🚨 КРАСНЫЕ ЛИНИИ:
+- Любая статистика без источника = ❌ ГАЛЛЮЦИНАЦИЯ
+- "ARK Invest", "CoinDesk", "Seeking Alpha" — нельзя цитировать (если их нет в контексте)
+- "исторически X%", "по данным аналитиков" без источника — нельзя
 - Максимум 5 рисков
 - В первом раунде нет "Ответ на аргументы Bull"
+
+Заверши ОДНОЙ из строк:
+"Мой вывод: главный риск — [конкретный риск с цифрами]."
+ИЛИ
+"Мой вывод: серьёзных медвежьих рисков в данных нет — нейтральная позиция уместна."
 """ + COMMON_GROUNDING_RULE
 
 
 BEAR_COUNTER_SYSTEM = """
-Ты - Bear Skeptic, углубляешь медвежью позицию.
+Ты — Bear Skeptic, углубляешь медвежью позицию.
+
+ПРАВИЛО ЧЕСТНОСТИ:
+Если Bull опроверг твой риск конкретными цифрами — признай:
+"Bull прав, мой аргумент про [X] переоценивал риск."
 
 ОБЯЗАТЕЛЬНО:
-1. Процитируй Bull и опровергни ЦИФРАМИ из контекста
-2. Используй ГАЛЛЮЦИНАЦИИ от Verifier против Bull - это твоё главное оружие
+1. Процитируй Bull и либо опровергни ЦИФРАМИ из контекста, либо честно признай
+2. Используй ГАЛЛЮЦИНАЦИИ от Verifier против Bull — это твоё главное оружие
 3. FinBERT: "FinBERT [score] [label] [confidence] подтверждает/опровергает Bull"
 
-ТЕБЕ ТОЖЕ ЗАПРЕЩЕНО ГАЛЛЮЦИНИРОВАТЬ:
+ТЕБЕ ТОЖЕ НЕЛЬЗЯ ГАЛЛЮЦИНИРОВАТЬ:
 - НЕ пиши исторические примеры которых нет в контексте
 - НЕ пиши "В марте 2020 BTC упал на X%" если нет в данных
 - НЕ пиши "Аналитики Schwab/FT/Reuters говорят" если нет в данных
-- Любая статистика только из предоставленного контекста
+- Любая статистика только из контекста
 
 Используй только: цены, VIX, FinBERT, нефть, RSI из текущего контекста.
 
-ЗАПРЕЩЕНО: "ARK Invest", "Schwab", нейтральный вывод
+КРАСНЫЕ ЛИНИИ: "ARK Invest", "Schwab", натянутый медвежий вывод когда данных нет
 """ + COMMON_GROUNDING_RULE
 
 
 VERIFIER_SYSTEM = """
 Ты — Data Verifier. ГЛАВНЫЙ АНТИГАЛЛЮЦИНАЦИОННЫЙ АГЕНТ.
 
-ТВОЯ ЗАДАЧА: найти и уничтожить все галлюцинации. Никаких рекомендаций.
+ТВОЯ ЗАДАЧА: найти и уничтожить все галлюцинации в аргументах Bull/Bear. Никаких рекомендаций по сделкам.
 
 ---
 ШАГ 1: ЦИФРЫ (сверяй с блоком "РЕАЛЬНЫЕ РЫНОЧНЫЕ ДАННЫЕ" в контексте)
@@ -253,7 +292,7 @@ VERIFIER_SYSTEM = """
 Формат при обнаружении:
 "❌ ГАЛЛЮЦИНАЦИЯ [УДАЛИТЬ]: '[цитата аргумента]'
    Причина: [нет источника / цифры нет в контексте / выдуманная статистика]
-   Synth: этот аргумент ЗАПРЕЩЕНО использовать в вердикте"
+   Synth: этот аргумент использовать НЕЛЬЗЯ"
 
 ШАГ 3: ЛОГИКА
 Bull:
@@ -273,50 +312,72 @@ Bear ✅: [только подтверждённые аргументы]
 Галлюцинации удалены: [количество]
 FinBERT из контекста: [score] [label] [confidence]
 
+ШАГ 5: ЧЕСТНОСТЬ ПО СЛАБЫМ ДАННЫМ
+Если ✅-список почти пуст с обеих сторон — пиши прямо одной строкой:
+"Достоверных аргументов мало → Synth должен склоняться к CASH/NEUTRAL, не натягивать вердикт."
+Это критическая команда — Synth обязан её выполнить.
+
 ---
-⛔ ЗАПРЕЩЕНО: рекомендации, выход за рамки 4 шагов
+⛔ НЕЛЬЗЯ: давать рекомендации по сделкам, придумывать уровни входа/стопа, выходить за 5 шагов
 """
 
 
-SYNTH_SYSTEM = """
-Ты — Consensus Synthesizer. Твоя задача: выдать структурированный JSON с вердиктом и планом.
+SYNTH_BASE_SYSTEM = """
+Ты — Consensus Synthesizer. Твоя задача: выдать СТРОГО структурированный JSON с вердиктом, торговым планом и точкой инвалидации.
 
-📊 ОБЯЗАТЕЛЬНО УЧТИ СИСТЕМУ БАЛЛОВ:
-- Если "СИСТЕМА БАЛЛОВ РЕКОМЕНДУЕТ: БЫЧИЙ" — склоняйся к бычьему
-- Если "СИСТЕМА БАЛЛОВ РЕКОМЕНДУЕТ: МЕДВЕЖИЙ" — склоняйся к медвежьему
-- Если "⚠️ СТОП-ФАКТОР" — следуй предупреждению
+📊 ВХОДЫ (приоритет сверху вниз):
+1. "⚠️ СТОП-ФАКТОР" в контексте — следуй буквально
+2. "📊 СИСТЕМА БАЛЛОВ РЕКОМЕНДУЕТ: БЫЧИЙ/МЕДВЕЖИЙ" — основа вердикта
+3. Аргументы Bull/Bear, ✅-помеченные Verifier (с галлюцинациями НЕ работай)
+4. Если Verifier пишет "Достоверных аргументов мало → CASH/NEUTRAL" — выводи нейтральный вердикт с CASH-планом
 
 АЛГОРИТМ:
-1. Проверь критические стоп-факторы (MVRV > 3.5 = ПРОДАВАТЬ, MVRV < 1.0 = ПОКУПАТЬ)
+1. Проверь критические стоп-факторы on-chain (MVRV > 3.5 = ПРОДАВАТЬ, MVRV < 1.0 = ПОКУПАТЬ)
 2. Посмотри систему баллов — какой вердикт рекомендуется
 3. Проверь QE/QT режим (QT = -50% размера, QE = +50%)
-4. Учти аргументы Bull и Bear
-5. Прими финальное решение
+4. Учти ВАЛИДНЫЕ аргументы Bull/Bear (без галлюцинаций)
+5. Прими финальное решение — без натяжек
 
-ВЫВЕДИ ТОЛЬКО JSON (ничего другого!):
+ВЫВЕДИ ТОЛЬКО JSON (ничего другого, никаких ```code fences```):
 
 {
   "verdict": "МЕДВЕЖИЙ",
   "reason": "COT NET SHORT -4935 контрактов, SPY RSI 73.1 перекуплен",
   "plans": [
-    {"symbol": "BTC", "direction": "SHORT", "entry": 79800, "stop": 82000, "target": 77000, "rr": "1:2", "size": "10%"},
-    {"symbol": "SOL", "direction": "CASH", "trigger": "пробой $92"}
+    {"symbol": "BTC", "direction": "SHORT", "entry": 79800, "stop": 82000, "target": 77000, "rr": "1:2", "size": "10%", "horizon": "7-14 дней", "trigger": "пробой $82000 вниз"},
+    {"symbol": "SOL", "direction": "CASH", "horizon": "7-14 дней", "trigger": "пробой $92"}
   ],
   "key_trigger": "пробой $82000 → подтверждение медвежьего тренда",
+  "invalidation": "BTC закрытие выше $82500 → весь медвежий сценарий отменяется, переход в LONG/CASH",
   "simple": "Фонды шортят BTC, SPY перекуплен — готовься к коррекции. COT NET SHORT -4935.",
   "qe_qt": "QT",
   "confidence": "HIGH"
 }
 
-ПРАВИЛА JSON:
-- Только цифры из контекста (без источника = не пиши)
-- R/R минимум 1:2
-- entry/stop/target — числа (без $)
-- plans: макс 3 позиции
-- Если NEUTRAL: plans = [{"symbol": "CASH", "direction": "CASH", "trigger": "..."}]
-- simple: 1-2 предложения ПРОСТЫМ ЯЗЫКОМ для непрофессионала
-- confidence: HIGH / MEDIUM / LOW
+ЖЁСТКИЕ ТРЕБОВАНИЯ К ПЛАНАМ:
+- LONG: stop < entry < target (обычные числа, без $/пробелов)
+- SHORT: target < entry < stop (обычные числа)
+- В каждом плане ОБЯЗАТЕЛЬНО поле "horizon" (одна из строк, см. оверлей ниже)
+- В каждом плане ОБЯЗАТЕЛЬНО поле "trigger" — конкретный уровень/событие входа
+- CASH-план: только {"symbol", "direction": "CASH", "trigger", "horizon"}
+- Если ни одного качественного сетапа — plans = [{"symbol": "CASH", "direction": "CASH", "trigger": "...", "horizon": "..."}]
+- plans: максимум 3 позиции
+- "rr" — строка вида "1:2" / "1:1.5" / "1:3"
+- "size" — строка вида "10%" (доля депо)
+
+ВЕРХНИЕ ПОЛЯ:
+- "verdict": "БЫЧИЙ" / "МЕДВЕЖИЙ" / "НЕЙТРАЛЬНЫЙ"
+- "reason": 1 предложение, ТОЛЬКО цифры из контекста
+- "key_trigger": что подтвердит сценарий
+- "invalidation": что ОТМЕНИТ весь сценарий (конкретный ценовой/новостной триггер)
+- "simple": 1-2 предложения простым языком для непрофессионала
+- "qe_qt": "QE" / "QT" / "NEUTRAL"
+- "confidence": "HIGH" / "MEDIUM" / "LOW"
 """ + COMMON_GROUNDING_RULE
+
+
+# Backward-compat alias: callers без horizon-overlay получают базовый промпт.
+SYNTH_SYSTEM = SYNTH_BASE_SYSTEM
 
 SPEECHWRITER_SYSTEM = """
 Ты — Speechwriter. Тебе дают JSON от Synth:
@@ -525,27 +586,164 @@ def _format_price(value) -> str:
     return s
 
 
-def _render_trade_plan_from_json(data: dict) -> str:
+def _coerce_num(value) -> float | None:
+    """Best-effort numeric coercion. '$79,800', '79 800', '79800.5' → 79800.5"""
+    if value is None or value == "":
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    s = str(value).strip().replace("$", "").replace(",", "").replace(" ", "")
+    if not s:
+        return None
+    try:
+        return float(s)
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_rr(rr: str) -> float | None:
+    """Parse '1:2', '1:1.5' → 2.0, 1.5. Returns None on garbage."""
+    if not rr or not isinstance(rr, str):
+        return None
+    parts = rr.replace(" ", "").split(":")
+    if len(parts) != 2:
+        return None
+    try:
+        risk = float(parts[0])
+        reward = float(parts[1])
+        if risk <= 0:
+            return None
+        return reward / risk
+    except (TypeError, ValueError):
+        return None
+
+
+def _validate_plan_geometry(plan: dict, min_rr: float) -> tuple[bool, str]:
+    """Hard-guard for trade-plan geometry. Returns (is_valid, reason).
+
+    Rules:
+      LONG:  stop < entry < target
+      SHORT: target < entry < stop
+      Implied R/R must be ≥ min_rr (with 5% tolerance for rounding).
+      direction CASH/WAIT/FLAT is always valid.
+    """
+    if not isinstance(plan, dict):
+        return False, "plan is not a dict"
+    direction = str(plan.get("direction", "")).upper().strip()
+    if direction in {"CASH", "WAIT", "FLAT", ""}:
+        return True, ""
+    entry = _coerce_num(plan.get("entry"))
+    stop = _coerce_num(plan.get("stop"))
+    target = _coerce_num(plan.get("target"))
+    if entry is None or stop is None or target is None:
+        return False, "entry/stop/target missing or not numeric"
+    if entry <= 0 or stop <= 0 or target <= 0:
+        return False, "non-positive levels"
+    if direction == "LONG":
+        if not (stop < entry < target):
+            return False, f"LONG geometry broken: need stop<entry<target, got {stop}/{entry}/{target}"
+        risk = entry - stop
+        reward = target - entry
+    elif direction == "SHORT":
+        if not (target < entry < stop):
+            return False, f"SHORT geometry broken: need target<entry<stop, got {target}/{entry}/{stop}"
+        risk = stop - entry
+        reward = entry - target
+    else:
+        return False, f"unknown direction: {direction!r}"
+    if risk <= 0:
+        return False, "zero/negative risk"
+    actual_rr = reward / risk
+    declared_rr = _parse_rr(str(plan.get("rr", ""))) or 0.0
+    # A plan must clear the horizon's minimum R/R; allow a small 5% tolerance for rounding.
+    if actual_rr + 1e-6 < min_rr * 0.95:
+        return False, f"R/R too tight: actual {actual_rr:.2f} < min {min_rr:.2f}"
+    # If declared R/R is wildly inconsistent with geometry, reject. Same 25% tolerance bound.
+    if declared_rr > 0 and abs(declared_rr - actual_rr) / max(actual_rr, 0.1) > 0.25:
+        return False, f"declared R/R {declared_rr:.2f} ≠ geometric {actual_rr:.2f}"
+    return True, ""
+
+
+def _coerce_to_cash(plan: dict, reason: str) -> dict:
+    """Replace an impossible LONG/SHORT plan with a safe CASH entry."""
+    return {
+        "symbol": plan.get("symbol", "?"),
+        "direction": "CASH",
+        "trigger": f"план снят авто-проверкой: {reason}",
+        "horizon": plan.get("horizon", ""),
+    }
+
+
+def _stop_factor_block(direction: str, stop_factor: str | None) -> tuple[bool, str]:
+    """Code-side stop-factor override.
+
+    `stop_factor` is one of: None, 'bearish', 'bullish'.
+      'bearish' (e.g. MVRV>3.5, VIX>40, эйфория VIX<15+F&G>70) → запрещаем LONG.
+      'bullish' (e.g. MVRV<1.0, F&G<25)                         → запрещаем SHORT.
+
+    Returns (blocked, reason). LLM-вердикт мы не трогаем — только LONG/SHORT планы.
+    """
+    if not stop_factor:
+        return False, ""
+    d = direction.upper().strip()
+    if stop_factor == "bearish" and d == "LONG":
+        return True, "критический медвежий стоп-фактор (MVRV>3.5 / VIX>40 / эйфория) — LONG заблокирован"
+    if stop_factor == "bullish" and d == "SHORT":
+        return True, "критический бычий стоп-фактор (MVRV<1.0 / F&G<25) — SHORT заблокирован"
+    return False, ""
+
+
+def _render_trade_plan_from_json(
+    data: dict,
+    horizon_pack: HorizonPack | None = None,
+    stop_factor: str | None = None,
+) -> str:
     """Deterministic Telegram-ready text rendering of Synth JSON.
     Used when Synth returns parseable JSON, avoiding an extra LLM call entirely.
+
+    If a horizon_pack is supplied we ALSO hard-guard plan geometry: any LONG/SHORT
+    plan with broken levels or R/R below the horizon minimum is silently rewritten
+    to a CASH entry so Telegram never shows users a mathematically impossible setup.
+
+    `stop_factor` ('bearish'|'bullish'|None) — code-side override: even если LLM
+    придумал LONG при MVRV>3.5 — его план превратится в CASH с понятной причиной.
     """
+    pack = horizon_pack or get_horizon(None)
+    min_rr = pack.min_rr
+
     verdict = str(data.get("verdict", "НЕЙТРАЛЬНЫЙ")).upper().strip() or "НЕЙТРАЛЬНЫЙ"
     reason = str(data.get("reason", "")).strip()
     plans = data.get("plans") or []
     key_trigger = str(data.get("key_trigger", "")).strip()
+    invalidation = str(data.get("invalidation", "")).strip()
     simple = str(data.get("simple", "")).strip()
     qe_qt = str(data.get("qe_qt", "NEUTRAL")).upper().strip() or "NEUTRAL"
 
     lines: list[str] = []
     lines.append(f"🏆 ВЕРДИКТ СУДЬИ: {verdict}")
+    lines.append(f"⏱ ГОРИЗОНТ: {pack.label_pretty}")
     if reason:
         lines.append(f"Потому что: {reason}")
+    if stop_factor == "bearish":
+        lines.append("🚨 СТОП-ФАКТОР: критический медвежий (LONG-планы автоматически снимаются)")
+    elif stop_factor == "bullish":
+        lines.append("🔵 СТОП-ФАКТОР: критический бычий (SHORT-планы автоматически снимаются)")
     lines.append("")
     lines.append("📋 ТОРГОВЫЙ ПЛАН:")
     if isinstance(plans, list) and plans:
-        for p in plans:
-            if not isinstance(p, dict):
+        for raw in plans:
+            if not isinstance(raw, dict):
                 continue
+            # 1. Sanity на геометрию (stop/entry/target + R/R).
+            ok, why = _validate_plan_geometry(raw, min_rr=min_rr)
+            p = raw if ok else _coerce_to_cash(raw, why)
+            if not ok:
+                logger.warning(f"[PLAN-GUARD] Coerced impossible plan to CASH: {why} | raw={raw}")
+            # 2. Code-side stop-factor override (MVRV/VIX/F&G критические значения).
+            blocked, sf_why = _stop_factor_block(str(p.get("direction", "")), stop_factor)
+            if blocked:
+                logger.warning(f"[STOP-FACTOR] Coerced plan to CASH: {sf_why} | raw={raw}")
+                p = _coerce_to_cash(raw, sf_why)
             sym = str(p.get("symbol", "")).upper() or "?"
             direction = str(p.get("direction", "")).upper()
             if direction in {"CASH", "WAIT", "FLAT"}:
@@ -566,6 +764,9 @@ def _render_trade_plan_from_json(data: dict) -> str:
     if key_trigger:
         lines.append(f"👀 КЛЮЧЕВОЙ ТРИГГЕР: {key_trigger}")
         lines.append("")
+    if invalidation:
+        lines.append(f"🛑 ИНВАЛИДАЦИЯ: {invalidation}")
+        lines.append("")
     if simple:
         lines.append(f"💬 ПРОСТЫМИ СЛОВАМИ: {simple}")
         lines.append("")
@@ -580,23 +781,35 @@ class Speechwriter:
     def __init__(self):
         self.system_prompt = SPEECHWRITER_SYSTEM
 
-    async def format(self, synth_json: str) -> str:
+    async def format(
+        self,
+        synth_json: str,
+        horizon: str | HorizonPack | None = None,
+        stop_factor: str | None = None,
+    ) -> str:
         """
         Принимает JSON (или текст) от Synth и превращает в читаемый торговый план.
 
         Стратегия:
           1. Если Synth вернул валидный JSON → рендерим детерминированно (быстро,
-             без LLM-вызова, без галлюцинаций, цифры один-в-один).
+             без LLM-вызова, без галлюцинаций, цифры один-в-один). При этом
+             включаем hard-guard геометрии плана и подмешиваем ярлык горизонта.
           2. Иначе → зовём LLM с таймаутом и пост-обработкой (снятие ```code fences```).
           3. Если и это сломалось → возвращаем сырой ввод как fallback.
+
+        `stop_factor` ('bearish'|'bullish'|None) — code-side override: пробрасывается
+        в renderer чтобы LONG/SHORT планы переписывались в CASH когда срабатывает
+        критический MVRV/VIX/F&G сигнал — независимо от того что выдал Synth.
         """
+        pack = horizon if isinstance(horizon, HorizonPack) else get_horizon(horizon if isinstance(horizon, str) else None)
+
         # 1. Strict path: deterministic rendering when Synth returned clean JSON.
         data = _extract_json_obj(synth_json)
         if data is not None:
             try:
-                rendered = _render_trade_plan_from_json(data)
+                rendered = _render_trade_plan_from_json(data, horizon_pack=pack, stop_factor=stop_factor)
                 if rendered.strip():
-                    logger.info("[SPEECHWRITER] Deterministic render OK (no LLM call)")
+                    logger.info(f"[SPEECHWRITER] Deterministic render OK (horizon={pack.key}, stop_factor={stop_factor}, no LLM call)")
                     return rendered
             except Exception as e:
                 logger.warning(f"[SPEECHWRITER] Deterministic render failed, falling back to LLM: {e}")
@@ -604,18 +817,21 @@ class Speechwriter:
         # 2. LLM fallback for free-form Synth output.
         from ai_provider import ai
 
-        prompt = f"""Преобразуй данные ниже в читаемый торговый план:
+        prompt = f"""Преобразуй данные ниже в читаемый торговый план (горизонт {pack.label}):
 
 {synth_json}
 
 ФОРМАТ:
 🏆 ВЕРДИКТ СУДЬИ: [БЫЧИЙ/МЕДВЕЖИЙ/НЕЙТРАЛЬНЫЙ]
+⏱ ГОРИЗОНТ: {pack.label_pretty}
 Потому что: [1 предложение]
 
 📋 ТОРГОВЫЙ ПЛАН:
 • BTC | SHORT | Вход: $79800 | Стоп: $82000 | Цель: $77000 | R/R: 1:2 | 10% депозита
 
 👀 КЛЮЧЕВОЙ ТРИГГЕР: [цена или событие]
+
+🛑 ИНВАЛИДАЦИЯ: [условие отмены сценария]
 
 💬 ПРОСТЫМИ СЛОВАМИ: [1-2 предложения для непрофессионала]
 
@@ -654,11 +870,19 @@ class DebateOrchestrator:
         market_data: str = "",
         custom_mode: bool = False,
         live_prices: str = "",
-        profile_instruction: str = ""
+        profile_instruction: str = "",
+        horizon: str | HorizonPack | None = None,
+        stop_factor: str | None = None,
     ) -> str:
         history = DebateHistory()
         rounds  = DEBATE_ROUNDS if not custom_mode else min(DEBATE_ROUNDS, 3)
-        logger.info(f"Запускаю дебаты v7.1: {rounds} раундов")
+        pack = horizon if isinstance(horizon, HorizonPack) else get_horizon(horizon if isinstance(horizon, str) else None)
+        logger.info(f"Запускаю дебаты v8.0: {rounds} раундов, горизонт={pack.key} ({pack.label})")
+
+        # Inject horizon overlay into Synth's system prompt (per-call, not global).
+        # ConsensusSynth was constructed with SYNTH_BASE_SYSTEM; we splice the
+        # horizon-specific block on top each run.
+        self.synth.system_prompt = SYNTH_BASE_SYSTEM + synth_overlay(pack)
 
         full_context = ""
         if live_prices:
@@ -668,6 +892,25 @@ class DebateOrchestrator:
             full_context += "\n\n=== ДОП. ДАННЫЕ ===\n" + market_data
         if profile_instruction:
             full_context += "\n\n=== ПРОФИЛЬ ПОЛЬЗОВАТЕЛЯ ===\n" + profile_instruction
+        full_context += (
+            f"\n\n=== ГОРИЗОНТ ПЛАНИРОВАНИЯ ===\n"
+            f"{pack.label_pretty} — {pack.description}\n"
+            f"Все аргументы и план должны быть рассчитаны под горизонт {pack.label}."
+        )
+        if stop_factor == "bearish":
+            full_context += (
+                "\n\n=== 🚨 КРИТИЧЕСКИЙ СТОП-ФАКТОР: МЕДВЕЖИЙ ===\n"
+                "MVRV>3.5 / VIX>40 / эйфория VIX<15+F&G>70 — рынок в зоне риска.\n"
+                "LONG-планы НЕ ДОПУСКАЮТСЯ (будут заменены на CASH автоматически). "
+                "Даже если сценарий бычий — выводи CASH или SHORT, не LONG."
+            )
+        elif stop_factor == "bullish":
+            full_context += (
+                "\n\n=== 🔵 КРИТИЧЕСКИЙ СТОП-ФАКТОР: БЫЧИЙ ===\n"
+                "MVRV<1.0 / F&G<25 — экстремальный страх / историческое дно.\n"
+                "SHORT-планы НЕ ДОПУСКАЮТСЯ (будут заменены на CASH автоматически). "
+                "Даже если сценарий медвежий — выводи CASH или LONG, не SHORT."
+            )
 
         # Раунд 1 — Bull и Bear независимо
         logger.info("Раунд 1: Bull и Bear независимо...")
@@ -706,9 +949,9 @@ class DebateOrchestrator:
         synth_json = await self.synth.respond(full_context, history, round_num=rounds)
         logger.info(f"[SPEECHWRITER] Raw synth output: {synth_json[:300]}")
         
-        # Шаг 2: Speechwriter → красивый форматированный текст
+        # Шаг 2: Speechwriter → красивый форматированный текст (с hard-guard геометрии, горизонтом и stop-factor override)
         try:
-            final_synthesis = await self.writer.format(synth_json)
+            final_synthesis = await self.writer.format(synth_json, horizon=pack, stop_factor=stop_factor)
         except Exception as e:
             logger.warning(f"[SPEECHWRITER] Error, using raw synth: {e}")
             final_synthesis = synth_json
