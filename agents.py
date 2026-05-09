@@ -674,6 +674,26 @@ def _coerce_to_cash(plan: dict, reason: str) -> dict:
     }
 
 
+_FIELD_LEAD_RE = re.compile(
+    r"^\s*(?:simple|reason|key_trigger|key trigger|invalidation|qe_qt|qe/qt|verdict)?\s*[:：\-—]\s*",
+    re.IGNORECASE,
+)
+
+
+def _strip_field_lead(value) -> str:
+    """Снять с начала строки повторяющийся префикс ключа и/или ведущие двоеточия.
+
+    Synth иногда отдаёт «simple: SPY перекуплен» (повторяет название поля)
+    или «: SPY перекуплен» (просто двоеточие в начале) — оба варианта
+    в дайджесте превращаются в «Простыми словами: : SPY перекуплен» и т.п.
+    Срезаем максимум один префикс, остальное оставляем как есть.
+    """
+    s = str(value or "").strip()
+    if not s:
+        return ""
+    return _FIELD_LEAD_RE.sub("", s, count=1).strip()
+
+
 def _stop_factor_block(direction: str, stop_factor: str | None) -> tuple[bool, str]:
     """Code-side stop-factor override.
 
@@ -712,11 +732,13 @@ def _render_trade_plan_from_json(
     min_rr = pack.min_rr
 
     verdict = str(data.get("verdict", "НЕЙТРАЛЬНЫЙ")).upper().strip() or "НЕЙТРАЛЬНЫЙ"
-    reason = str(data.get("reason", "")).strip()
+    reason = _strip_field_lead(data.get("reason", ""))
     plans = data.get("plans") or []
-    key_trigger = str(data.get("key_trigger", "")).strip()
-    invalidation = str(data.get("invalidation", "")).strip()
-    simple = str(data.get("simple", "")).strip()
+    key_trigger = _strip_field_lead(data.get("key_trigger", ""))
+    invalidation = _strip_field_lead(data.get("invalidation", ""))
+    # Synth-модель иногда повторяет имя ключа в значении: ":SPY перекуплен" /
+    # "simple: SPY перекуплен". Снимаем оба варианта (двоеточие + повтор поля).
+    simple = _strip_field_lead(data.get("simple", ""))
     qe_qt = str(data.get("qe_qt", "NEUTRAL")).upper().strip() or "NEUTRAL"
 
     lines: list[str] = []

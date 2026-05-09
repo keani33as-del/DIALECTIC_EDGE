@@ -117,6 +117,16 @@ def _extract_single_line(report_text: str, label: str) -> str:
     return _clean_line(match.group(1)) if match else ""
 
 
+_LEADING_PUNCT_RE = re.compile(r"^[\s:;,.—–\-]+")
+
+
+def _strip_leading_punct(text: str) -> str:
+    """«: SPY перекуплен» → «SPY перекуплен». Synth-модель иногда отдаёт значение
+    `simple` с ведущим двоеточием (паротирует формат `simple: ...`),
+    и в дайджесте это выглядит как `Простыми словами: : SPY ...`."""
+    return _LEADING_PUNCT_RE.sub("", text or "").strip()
+
+
 def extract_plain_language(report_text: str) -> str:
     clean = _strip_markup(report_text)
     markers = (
@@ -144,7 +154,7 @@ def extract_plain_language(report_text: str) -> str:
             if len(" ".join(lines)) >= 320:
                 break
         if lines:
-            return " ".join(lines)[:360]
+            return _strip_leading_punct(" ".join(lines))[:360]
     return ""
 
 
@@ -589,10 +599,18 @@ def extract_monitoring_points(report_text: str) -> list[str]:
 
 
 def _plan_line(plan: dict) -> str:
-    direction = plan.get("direction", "")
-    symbol = plan.get("symbol") or plan.get("label") or "Актив"
-    chunks = [f"{symbol} {direction}".strip()]
+    direction = (plan.get("direction") or "").upper().strip()
+    symbol = (plan.get("symbol") or plan.get("label") or "Актив").strip()
 
+    # Synth иногда выдаёт {"symbol":"CASH","direction":"CASH"} как placeholder
+    # «остальное держим в кеше». Без разыменовывания в дайджесте это выглядит
+    # как «CASH CASH | триггер …» — явный визуальный баг.
+    if symbol.upper() == "CASH" and direction == "CASH":
+        head = "Вне рынка"
+    else:
+        head = f"{symbol} {direction}".strip() if direction else symbol
+
+    chunks = [head]
     if plan.get("entry") is not None:
         chunks.append(f"вход {_format_price(plan['entry'])}")
     if plan.get("target") is not None:
@@ -611,22 +629,28 @@ def _plan_line(plan: dict) -> str:
 
 
 def _extract_key_trigger(report_text: str) -> str:
-    """Extract key trigger from report (multiple patterns)."""
-    clean = _strip_markup(report_text)
-    
+    """Extract key trigger from report (multiple patterns).
+
+    Старая версия бежала по всему отчёту и часто хватала «триггер LONG» из раунда
+    Bull/Bear вместо Synth `key_trigger`. Сначала ищем в секции Synth, потом
+    fallback на весь отчёт (чтобы не ломать старые форматы).
+    """
     patterns = [
         r"ключевой\s+триггер[^.\n]{0,200}",
         r"триггер\s+(?:l?ong|short)[^.\n]{0,200}",
         r"пробой\s+\$?[\d.,Kk]+[^.\n]{0,100}",
         r"мониторинг[уа][^\n]{0,150}",
     ]
-    
-    for pattern in patterns:
-        match = re.search(pattern, clean, re.IGNORECASE)
-        if match:
-            val = _clean_line(match.group(0))
-            if len(val) > 5:
-                return val[:200]
+    synth_section = _extract_synth_section(report_text)
+    haystacks = [synth_section] if synth_section else []
+    haystacks.append(_strip_markup(report_text))
+    for haystack in haystacks:
+        for pattern in patterns:
+            match = re.search(pattern, haystack, re.IGNORECASE)
+            if match:
+                val = _clean_line(match.group(0))
+                if len(val) > 5:
+                    return val[:200]
     return ""
 
 
@@ -663,27 +687,51 @@ def _try_parse_synth_json(report_text: str) -> list[dict]:
     return []
 
 
+def _extract_invalidation(report_text: str) -> str:
+    """Synth-блок `🛑 ИНВАЛИДАЦИЯ: …` — что отменит весь сценарий."""
+    synth_section = _extract_synth_section(report_text)
+    if synth_section:
+        match = re.search(r"ИНВАЛИДАЦИЯ\s*[:：]\s*([^\n]+)", synth_section, re.IGNORECASE)
+        if match:
+            return _clean_line(match.group(1))[:240]
+    return ""
+
+
 def build_digest_context(report_text: str, source_news: str = "") -> dict:
     verdict = extract_verdict(report_text)
     plans = extract_trade_plans(report_text)
-    
+
     # Fallback: try to parse JSON if plans still empty
     if not plans:
         json_plans = _try_parse_synth_json(report_text)
         if json_plans:
             plans = json_plans
-    
+
     monitoring_points = extract_monitoring_points(report_text)
     # Speechwriter рендерит «🧠 Почему: …», старый Synth писал «Потому что: …».
-    # Принимаем оба варианта — иначе в дайджесте просто исчезает строка
-    # «🧠 Почему», и юзер не понимает откуда вердикт.
-    verdict_reason = (
-        _extract_single_line(report_text, "Почему")
-        or _extract_single_line(report_text, "Потому что")
-    )
+    # Ищем СТРОГО в Synth-секции — иначе «Почему» ловит Bull's
+    # «Это неверно потому что: …» из раунда 2 и вставляет возражения Bull вверху
+    # дайджеста. Для обратной совместимости fallback на весь отчёт если
+    # секция не найдена.
+    synth_section = _extract_synth_section(report_text)
+    if synth_section:
+        verdict_reason = (
+            _extract_single_line(synth_section, "Почему")
+            or _extract_single_line(synth_section, "Потому что")
+            or _extract_single_line(synth_section, "reason")
+        )
+    else:
+        verdict_reason = (
+            _extract_single_line(report_text, "Почему")
+            or _extract_single_line(report_text, "Потому что")
+        )
+    verdict_reason = _strip_leading_punct(verdict_reason or "")
+
     key_trigger = _extract_key_trigger(report_text)
+    invalidation = _extract_invalidation(report_text)
     monitoring_level = ""
     plain_language = extract_plain_language(report_text) or _clean_line(source_news)[:320]
+    plain_language = _strip_leading_punct(plain_language)
 
     return {
         "verdict": verdict,
@@ -691,6 +739,7 @@ def build_digest_context(report_text: str, source_news: str = "") -> dict:
         "verdict_emoji": VERDICT_EMOJIS.get(verdict, VERDICT_EMOJIS["NEUTRAL"]),
         "verdict_reason": verdict_reason,
         "key_trigger": key_trigger,
+        "invalidation": invalidation,
         "monitoring_level": monitoring_level,
         "monitoring_points": monitoring_points,
         "plain_language": plain_language,

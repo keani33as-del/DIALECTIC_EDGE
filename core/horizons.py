@@ -128,7 +128,10 @@ def get_horizon(key: str | None) -> HorizonPack:
 def synth_overlay(pack: HorizonPack) -> str:
     """Horizon-specific overlay appended to SYNTH_SYSTEM.
 
-    Replaces the previously hardcoded "R/R минимум 1:2" / "макс 15% депо".
+    Сжатый формат — мы упёрлись в лимит контекста Cerebras (8192 токенов).
+    Старый «дружественный» оверлей (~600 chars) добавлял ~250 токенов и
+    отправлял Bull/Bear/Synth в Mistral fallback. Сжали до ~200 chars
+    без потери критичных правил.
     """
     caps = pack.size_caps
     risk_on = int(caps.get("risk_on", 0.10) * 100)
@@ -138,15 +141,12 @@ def synth_overlay(pack: HorizonPack) -> str:
     pct_stocks = int(pack.stop_pct_stocks * 100)
 
     return (
-        "\n\n═══ ГОРИЗОНТ ПЛАНИРОВАНИЯ ═══\n"
-        f"Все позиции в этом дайджесте — на горизонт {pack.label} ({pack.description})\n\n"
-        "Под этот горизонт ОБЯЗАТЕЛЬНО соблюдай:\n"
-        f"• Стоп: {pack.stop_atr_mult}×ATR из контекста, либо ~{pct_crypto}% для крипты / ~{pct_stocks}% для акций, если ATR недоступен\n"
-        f"• R/R: МИНИМУМ 1:{pack.min_rr:g} — план с меньшим R/R НЕ выводи, заменяй на CASH\n"
-        f"• Размер позиции (% депо): не больше {risk_on}% при risk-on, {neutral}% при нейтральном фоне, {risk_off}% при risk-off\n"
-        f"• Триггер: брать из {pack.candle_tf}-свечей и новостей за последние {pack.news_window_h} часов\n"
-        f"• В каждом плане в JSON ВСЕГДА указывай поле \"horizon\": \"{pack.label}\" (буквально эта строка)\n"
-        "• Если данных мало или сетап неоднозначный — выводи CASH, НЕ НАТЯГИВАЙ план под горизонт\n"
+        f"\n\n═ ГОРИЗОНТ {pack.label} ═\n"
+        f"Стоп: {pack.stop_atr_mult:g}×ATR (или {pct_crypto}%/{pct_stocks}% крипта/акции).\n"
+        f"R/R мин 1:{pack.min_rr:g}. Размер: {risk_on}/{neutral}/{risk_off}% при risk-on/neutral/risk-off.\n"
+        f"Триггеры: {pack.candle_tf}-свечи, новости ≤ {pack.news_window_h}ч.\n"
+        f"В каждом plan: \"horizon\":\"{pack.label}\". План с R/R ниже минимума → CASH.\n"
+        "Натяжек нет: данных мало / сетап шаткий — CASH.\n"
     )
 
 
