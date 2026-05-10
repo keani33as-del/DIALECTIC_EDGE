@@ -43,11 +43,47 @@ MISTRAL_API_KEY_2  = os.getenv("MISTRAL_API_KEY_2", "")   # резервный M
 MISTRAL_MODEL      = os.getenv("MISTRAL_MODEL", "mistral-small-latest")
 MISTRAL_URL        = "https://api.mistral.ai/v1/chat/completions"
 
+# OpenRouter — динамическое сканирование env. Поддерживаем неограниченное
+# число ключей: OPENROUTER_API_KEY (главный) + OPENROUTER_API_KEY_2,
+# OPENROUTER_API_KEY_3, ... (без верхнего лимита). Раньше был хардкод 4 слота;
+# юзеру нужен жирный fallback (10-12+ ключей) — поэтому собираем динамически.
 OPENROUTER_API_KEY   = os.getenv("OPENROUTER_API_KEY", "")
 OPENROUTER_API_KEY_2 = os.getenv("OPENROUTER_API_KEY_2", "")
 OPENROUTER_API_KEY_3 = os.getenv("OPENROUTER_API_KEY_3", "")  # резервный OpenRouter #3
 OPENROUTER_API_KEY_4 = os.getenv("OPENROUTER_API_KEY_4", "")  # резервный OpenRouter #4
 OPENROUTER_URL       = "https://openrouter.ai/api/v1/chat/completions"
+
+# Битые ключи помечаем сюда (по имени) при 401/«User not found» — чтобы
+# на следующем вызове не тратить время и сразу прыгнуть на следующий слот.
+# Сбрасывается с рестартом процесса (Railway деплой = новый сброс).
+_OR_BROKEN_KEYS: set = set()
+
+
+def _collect_openrouter_keys() -> list:
+    """Собрать все OPENROUTER_API_KEY[_N] из env в порядке приоритета.
+
+    Возвращает [(slot_name, key_value), ...] где slot_name — человекочитаемое
+    имя слота для логов («OpenRouter», «OpenRouter#5» и т.п.). Skip'аем
+    битые ключи (помеченные ранее в _OR_BROKEN_KEYS).
+    """
+    import re
+    keys = []
+    # Основной слот без суффикса
+    main = os.getenv("OPENROUTER_API_KEY", "").strip()
+    if main and "OpenRouter" not in _OR_BROKEN_KEYS:
+        keys.append(("OpenRouter", main))
+    # Сканируем все OPENROUTER_API_KEY_<N> где N — целое число.
+    # Сортируем по N для предсказуемого порядка.
+    numbered: list = []
+    for env_name, env_val in os.environ.items():
+        m = re.fullmatch(r"OPENROUTER_API_KEY_(\d+)", env_name)
+        if m and env_val.strip():
+            numbered.append((int(m.group(1)), env_val.strip()))
+    for n, val in sorted(numbered):
+        slot = f"OpenRouter#{n}"
+        if slot not in _OR_BROKEN_KEYS:
+            keys.append((slot, val))
+    return keys
 
 TOGETHER_API_KEY   = os.getenv("TOGETHER_API_KEY", "")
 TOGETHER_API_KEY_2 = os.getenv("TOGETHER_API_KEY_2", "")  # резервный Together
@@ -180,7 +216,7 @@ def _can_use_primary(name: str) -> bool:
     if name == "groq":
         return bool(GROQ_API_KEY or GROQ_API_KEY_2 or GROQ_API_KEY_3)
     if name == "openrouter":
-        return bool(OPENROUTER_API_KEY or OPENROUTER_API_KEY_2 or OPENROUTER_API_KEY_3 or OPENROUTER_API_KEY_4)
+        return bool(_collect_openrouter_keys())
     if name == "together":
         return bool(TOGETHER_API_KEY or TOGETHER_API_KEY_2)
     if name == "gemini":
@@ -538,18 +574,17 @@ async def _call_openrouter_model(
     model: str,
     agent_key: str = None,
 ) -> str:
-    """OpenRouter: KEY_1 → KEY_2 → KEY_3 → KEY_4 при 429/402."""
-    keys_try = []
-    if OPENROUTER_API_KEY:
-        keys_try.append(("OpenRouter", OPENROUTER_API_KEY))
-    if OPENROUTER_API_KEY_2:
-        keys_try.append(("OpenRouter#2", OPENROUTER_API_KEY_2))
-    if OPENROUTER_API_KEY_3:
-        keys_try.append(("OpenRouter#3", OPENROUTER_API_KEY_3))
-    if OPENROUTER_API_KEY_4:
-        keys_try.append(("OpenRouter#4", OPENROUTER_API_KEY_4))
+    """OpenRouter: автоматическая ротация по всем доступным ключам.
+
+    Перебираем `_collect_openrouter_keys()` (динамический скан env). При
+    429/402 (rate-limit / out-of-credits) — переход на следующий слот.
+    При 401/«User not found» / «No auth credentials» — помечаем слот как
+    битый в `_OR_BROKEN_KEYS` и больше его в этом процессе не дёргаем
+    (быстрее на следующих вызовах).
+    """
+    keys_try = _collect_openrouter_keys()
     if not keys_try:
-        raise ValueError("Нет OPENROUTER_API_KEY")
+        raise ValueError("Нет OPENROUTER_API_KEY (ни один слот не заполнен)")
     last_err = None
     for key_name, key in keys_try:
         try:
@@ -564,8 +599,19 @@ async def _call_openrouter_model(
             return result
         except RuntimeError as e:
             err = str(e)
+            # Лимит / out-of-credits — пробуем следующий ключ, не маркаем битым
             if "429" in err or "402" in err:
                 logger.warning("%s лимит OpenRouter — следующий ключ...", key_name)
+                last_err = e
+                continue
+            # Революция ключа / неверная авторизация — маркируем битым
+            # навсегда (на эту сессию), чтобы не тратить RTT каждый запрос
+            if "401" in err or "User not found" in err or "No auth" in err.lower():
+                logger.warning(
+                    "%s невалиден (%s) — помечаю битым для этой сессии",
+                    key_name, err[:80]
+                )
+                _OR_BROKEN_KEYS.add(key_name)
                 last_err = e
                 continue
             raise
@@ -785,7 +831,7 @@ async def _call_best_available(
         providers.append(("Mistral Small",
             lambda p, s, t: _call_mistral_throttled(p, s, t, agent_key=agent_name)))
 
-    if "openrouter" not in skip and (OPENROUTER_API_KEY or OPENROUTER_API_KEY_2 or OPENROUTER_API_KEY_3 or OPENROUTER_API_KEY_4):
+    if "openrouter" not in skip and _collect_openrouter_keys():
         providers.append(("OpenRouter/Llama",
             lambda p, s, t: _call_openrouter_llama(p, s, t, agent_key=agent_name)))
         providers.append(("OpenRouter/Gemma",
