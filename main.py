@@ -824,16 +824,42 @@ def format_money_button_message(report_text: str, macro=None) -> str:
     """
     ctx = build_digest_context(report_text or "")
     plans = ctx.get("plans") or []
-    watch_levels = ctx.get("watch_levels") or []
+    watch_levels = list(ctx.get("watch_levels") or [])
     verdict_label = ctx.get("verdict_label") or "Нейтральный"
     verdict_emoji = ctx.get("verdict_emoji") or "⚪️"
     invalidation = (ctx.get("invalidation") or "").strip()
 
-    actionable = [
-        p for p in plans
-        if isinstance(p, dict)
-        and (p.get("direction") or "").upper().strip() in {"LONG", "SHORT"}
-    ]
+    actionable = []
+    cash_plans = []
+    for p in plans:
+        if not isinstance(p, dict):
+            continue
+        d = (p.get("direction") or "").upper().strip()
+        if d in {"LONG", "SHORT"}:
+            # Защита: LONG/SHORT без entry/stop/target → это парсер-фантом,
+            # неактивно как сделка, но триггер показываем в watch.
+            entry = p.get("entry")
+            stop = p.get("stop")
+            target = p.get("target")
+            if not entry and not stop and not target:
+                cash_plans.append(p)
+            else:
+                actionable.append(p)
+        elif d in {"CASH", "WATCH", "WAIT", "FLAT"}:
+            cash_plans.append(p)
+
+    # CASH/WATCH-планы с триггерами → синтезируем в watch_levels (если их там
+    # ещё нет). Иначе кнопка «Стратегия» не показывает условия флипа из CASH-планов.
+    seen_watch_syms = {(w.get("symbol") or "").upper() for w in watch_levels}
+    for p in cash_plans:
+        sym = (p.get("symbol") or p.get("label") or "?").upper()
+        trigger = str(p.get("trigger") or "").strip()
+        if not trigger:
+            continue
+        if sym in seen_watch_syms:
+            continue
+        watch_levels.append({"symbol": sym, "level": "", "note": trigger})
+        seen_watch_syms.add(sym)
 
     # Макро-фильтр: убираем планы, противоречащие текущему макро-режиму.
     macro_blocked: list[dict] = []
