@@ -988,10 +988,17 @@ def _split_actionable_and_watch(plans: list[dict]) -> tuple[list[dict], list[dic
         unactionable, reason = _is_unactionable_cash_plan(plan)
         if unactionable:
             trigger_txt = str(plan.get("trigger") or "").strip()
+            # БЕЗ trigger-текста — план в watch вообще не имеет смысла:
+            # юзеру нечего наблюдать кроме внутреннего debug-reason'а.
+            # Раньше тут стояло `trigger_txt or reason`, и пользователь
+            # видел «COT | actionable plan without entry/stop/target»
+            # — это leak debug-строки, чиним.
+            if not trigger_txt:
+                continue
             watch.append({
                 "symbol": (plan.get("symbol") or plan.get("label") or "?").upper(),
                 "level": "",
-                "note": trigger_txt or reason,
+                "note": trigger_txt,
             })
         else:
             actionable.append(plan)
@@ -1024,6 +1031,10 @@ def build_digest_context(report_text: str, source_news: str = "") -> dict:
     # без направления. Юзер видит «3 плана» хотя ни одного нет.
     actionable, demoted_watch = _split_actionable_and_watch(plans)
     extracted_watch = extract_watch_levels(report_text)
+    # `extract_watch_levels` уже сам фильтрует через _is_valid_watch_level.
+    # Демоутенный watch проверяем здесь — на всякий случай, чтобы триггеры
+    # из CASH-планов с непонятным текстом не попадали в UI.
+    demoted_watch = [w for w in demoted_watch if _is_valid_watch_level(w)]
     watch_levels = extracted_watch + demoted_watch
 
     monitoring_points = extract_monitoring_points(report_text)
