@@ -464,6 +464,84 @@ def _clean_agent_response(text: str) -> str:
 
 # ─── БАЗОВЫЙ АГЕНТ ────────────────────────────────────────────────────────────
 
+_COT_LEAK_PATTERNS = (
+    "we need to", "we should", "let's pick", "let me think",
+    "let me see", "okay let's", "now let's", "we must",
+    "thus we need", "we have to", "we'll need", "we will need",
+    "the user wants", "i need to", "let me",
+)
+
+_COT_LEAK_INDICATORS_RU = (
+    "Так, мне нужно", "Давайте подумаем", "Нужно проанализировать",
+    "Мне нужно произвести",
+)
+
+
+def _looks_like_cot_leak(text: str) -> bool:
+    """Распознаёт chain-of-thought leak от агента.
+    
+    Reasoning-модели (gpt-oss, Nemotron) иногда возвращают свои
+    «мысли о том как ответить» прямо в content вместо reasoning_tokens.
+    Это видно по характерным паттернам вначале и метатекстовому стилю.
+    """
+    if not text:
+        return True
+    head = text.strip()[:600].lower()
+    if not head:
+        return True
+    # Сильный сигнал — старт с meta-фраз и >150 символов английского
+    starts_with_meta = any(head.startswith(p) for p in _COT_LEAK_PATTERNS)
+    # Считаем сколько meta-маркеров встречается
+    leak_count = sum(1 for p in _COT_LEAK_PATTERNS if p in head)
+    leak_count_ru = sum(1 for p in _COT_LEAK_INDICATORS_RU if p in text[:600])
+    # Признак что response — это нормальный структурированный output:
+    # есть кириллица + наш формат «• [Актив]» / «🐻 / 🐂 / FinBERT» и т.д.
+    has_structured_output = (
+        "FinBERT" in text or "Уверенность:" in text
+        or "Источник:" in text or "Мой вывод" in text
+        or "ВЕРДИКТ" in text or "СИГНАЛ" in text
+        or "Bear ✅" in text or "Bull ✅" in text
+    )
+    if has_structured_output and not starts_with_meta:
+        return False
+    # Старт с meta-фразы И отсутствие структуры → leak
+    if starts_with_meta and not has_structured_output:
+        return True
+    # Слишком много meta-маркеров (>=3) → leak даже без явного start
+    if leak_count >= 3 and not has_structured_output:
+        return True
+    if leak_count_ru >= 2 and not has_structured_output:
+        return True
+    return False
+
+
+def _sanitize_agent_response(text: str, agent_name: str) -> str:
+    """Если response — это leak chain-of-thought, подменяем на fallback.
+    
+    Лучше показать честное «аргументов недостаточно» чем поток meta-текста.
+    """
+    if _looks_like_cot_leak(text):
+        logger.warning(
+            "[%s] CoT leak detected, substituting fallback. Head: %r",
+            agent_name, (text or "")[:200]
+        )
+        if "Bull" in agent_name:
+            return (
+                "Бычьих аргументов в текущих данных недостаточно — "
+                "сильных сигналов с подтверждённым источником "
+                "не выделил, склоняюсь к нейтральной позиции."
+            )
+        if "Bear" in agent_name:
+            return (
+                "Сильных медвежьих сигналов не выделил — "
+                "склоняюсь к нейтрально-наблюдательной позиции."
+            )
+        # Verifier / Synth — если они leak'нули, всё совсем плохо;
+        # лучше пусть pipeline пойдёт без них чем выводить мусор.
+        return f"[{agent_name}] выход не структурирован, аргумент пропущен."
+    return text
+
+
 class BaseAgent:
     def __init__(self, name: str, emoji: str, system_prompt: str, ai_method: str):
         self.name          = name
@@ -497,7 +575,9 @@ class BaseAgent:
         try:
             caller   = getattr(ai, self.ai_method)
             response = await caller(prompt=prompt, system=self.system_prompt)
-            return response
+            # Защита от reasoning-моделей которые иногда сливают CoT
+            # в content вместо reasoning_tokens (gpt-oss, Nemotron).
+            return _sanitize_agent_response(response, self.name)
         except Exception as e:
             logger.error(f"Agent {self.name} error: {e}")
             return f"[Ошибка агента {self.name}: {e}]"

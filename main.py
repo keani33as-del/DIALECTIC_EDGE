@@ -3856,17 +3856,11 @@ def _format_pitch_message() -> str:
         f"  • Kelly engine: *{kelly_status}*\n"
         f"  • Прошедших сессий: *{sessions_str}*\n\n"
         
-        "🛠 *Tech*\n"
-        "Python 3.12 · asyncio · aiogram · OpenRouter / Cerebras / Groq / Mistral / "
-        "Together / Gemini · matplotlib · SQLite · Railway · GitHub-as-DB.\n\n"
-        
         "🚀 *Попробуй сам*\n"
         "  • `/daily` — полный AI-анализ + торговый план\n"
         "  • `/autotrade_status` — performance dashboard\n"
         "  • `/audit` — AI-аудит закрытых сделок\n"
-        "  • `/markets` — real-time контекст + сигналы\n\n"
-        
-        "📖 [Repo на GitHub](https://github.com/ANAEHY/dialectic_edge)"
+        "  • `/markets` — real-time контекст + сигналы"
     )
     return msg
 
