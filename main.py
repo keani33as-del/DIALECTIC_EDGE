@@ -890,6 +890,135 @@ def _money_format_price(value) -> str:
     return f"${f:.6f}".rstrip("0").rstrip(".")
 
 
+def _eli5_for_actionable_trade(plan: dict) -> str:
+    """Объясняет одну actionable-сделку «как пятилетнему».
+    
+    Rule-based, никаких LLM-вызовов — кнопка должна отвечать мгновенно.
+    Берёт direction/entry/stop/target/size и собирает понятную фразу.
+    """
+    sym = (plan.get("symbol") or "?").upper()
+    direction = (plan.get("direction") or "").upper()
+    entry = plan.get("entry")
+    stop = plan.get("stop")
+    target = plan.get("target")
+    size = str(plan.get("size") or "").strip()
+    
+    # Имена в винительном падеже (объект действия) для разговорной речи.
+    # «Покупаем биткоин», «шортим эфир» — звучит естественно.
+    asset_accusative = {
+        "BTC": "биткоин",
+        "ETH": "эфир",
+        "SOL": "солану",
+        "XRP": "XRP",
+        "BNB": "BNB",
+        "DOGE": "додж",
+        "ADA": "кардано",
+        "TON": "тон",
+    }.get(sym, sym)
+    
+    verb = "Покупаем" if direction == "LONG" else "Шортим"
+    
+    parts = [f"{verb} {asset_accusative} по {_money_format_price(entry)}."]
+    
+    if stop:
+        if direction == "LONG":
+            parts.append(
+                f"Если упадёт до {_money_format_price(stop)} — выходим "
+                f"(это страховка от убытка)."
+            )
+        else:
+            parts.append(
+                f"Если вырастет до {_money_format_price(stop)} — выходим "
+                f"(страховка от убытка)."
+            )
+    
+    if target:
+        if direction == "LONG":
+            parts.append(
+                f"Если вырастет до {_money_format_price(target)} — "
+                f"забираем профит."
+            )
+        else:
+            parts.append(
+                f"Если упадёт до {_money_format_price(target)} — "
+                f"забираем профит."
+            )
+    
+    if size:
+        parts.append(f"Кладём {size} депозита, не больше.")
+    
+    return " ".join(parts)
+
+
+def _eli5_for_watch_only(watch_levels: list[dict]) -> str:
+    """Объясняет «торговать не надо + ждём триггер» как пятилетнему.
+    
+    Берёт первые 3 watch-уровня и собирает фразу «сидим, ждём, если X — то Y»."""
+    asset_name = {
+        "BTC": "биткоин",
+        "ETH": "эфир",
+        "SOL": "солана",
+        "XRP": "XRP",
+        "BNB": "BNB",
+        "DOGE": "додж",
+        "ADA": "кардано",
+        "TON": "тон",
+    }
+    
+    parts = ["Сейчас ничего не делаем — рынок без явного направления."]
+    triggers_described = []
+    for w in (watch_levels or [])[:3]:
+        sym = (w.get("symbol") or "").strip().upper()
+        if not sym:
+            continue
+        note = (w.get("note") or w.get("level") or "").strip()
+        if not note:
+            continue
+        name = asset_name.get(sym, sym)
+        # Простая эвристика: понимаем "пробой $X вниз → откроем SHORT"
+        # и переводим на разговорный.
+        note_lower = note.lower()
+        is_short_signal = (
+            "shor" in note_lower or "вниз" in note_lower or
+            "падени" in note_lower or "продад" in note_lower
+        )
+        is_long_signal = (
+            "long" in note_lower or "вверх" in note_lower or
+            "выше" in note_lower or "купим" in note_lower or
+            "откроем long" in note_lower
+        )
+        # Пытаемся вытащить уровень $XXXX
+        import re as _re
+        price_match = _re.search(r"\$?([\d,]+(?:\.\d+)?)\s*[KkКк]?", note)
+        price_str = ""
+        if price_match:
+            try:
+                p_val = float(price_match.group(1).replace(",", ""))
+                price_str = f" ${p_val:,.0f}" if p_val >= 100 else f" ${p_val:.2f}"
+            except (ValueError, TypeError):
+                pass
+        
+        if is_long_signal and price_str:
+            triggers_described.append(
+                f"если {name} закроет 4h-свечу выше{price_str} — "
+                f"покупаем"
+            )
+        elif is_short_signal and price_str:
+            triggers_described.append(
+                f"если {name} упадёт ниже{price_str} — продаём (шорт)"
+            )
+        elif price_str:
+            triggers_described.append(
+                f"следим за {name}{price_str}"
+            )
+    
+    if triggers_described:
+        parts.append("Условия для входа: " + "; ".join(triggers_described) + ".")
+    
+    parts.append("До этого — сидим и не дёргаемся. «Не торговать» — это тоже решение.")
+    return " ".join(parts)
+
+
 def format_money_button_message(report_text: str, macro=None) -> str:
     """Сборка сообщения для кнопки «🎯 Стратегия по рынку».
 
@@ -1002,6 +1131,10 @@ def format_money_button_message(report_text: str, macro=None) -> str:
         if invalidation:
             out.append("")
             out.append(f"🛑 *Инвалидация:* {invalidation}")
+        # ELI5 — для тех кто не любит читать инструкции (а это все).
+        out.append("")
+        out.append("👶 *По-простому:*")
+        out.append(_eli5_for_actionable_trade(actionable[0]))
         out.append("")
         out.append("⚠️ Считай размер от ТВОЕГО депозита. Не подгоняй стоп под лосс — двигай размер.")
         return "\n".join(out)
@@ -1049,6 +1182,13 @@ def format_money_button_message(report_text: str, macro=None) -> str:
     if invalidation:
         out.append("")
         out.append(f"🛑 *Что отменит этот сценарий:* {invalidation}")
+
+    # ELI5 «по-простому» — без него юзер тыкает в кнопку и закрывает,
+    # потому что не понимает что значит «закрытие 4h-свечи за уровень».
+    if watch_levels:
+        out.append("")
+        out.append("👶 *По-простому:*")
+        out.append(_eli5_for_watch_only(watch_levels))
 
     out.append("")
     out.append("⚠️ Не натягивай сделку под скуку. «Не торговать» — это тоже решение.")
