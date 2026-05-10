@@ -29,6 +29,12 @@ from .scorer import (
     format_scored_context_for_agents,
     format_signal_block_for_debates,
 )
+from .smart_money import (
+    fetch_smart_money_signals,
+    format_smart_money_for_agents,
+    smart_money_score_contribution,
+    SmartMoneySignals,
+)
 from .aggregator import (
     build_enriched_context,
     enrich_prices_with_scores,
@@ -51,6 +57,11 @@ __all__ = [
     "get_critical_signals",
     "format_scored_context_for_agents",
     "format_signal_block_for_debates",
+    # Smart-money
+    "fetch_smart_money_signals",
+    "format_smart_money_for_agents",
+    "smart_money_score_contribution",
+    "SmartMoneySignals",
     # Aggregator
     "build_enriched_context",
     "enrich_prices_with_scores",
