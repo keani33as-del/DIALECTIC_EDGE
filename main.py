@@ -23,7 +23,8 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
 from aiogram.types import (
     Message, CallbackQuery, BufferedInputFile,
-    InlineKeyboardMarkup, InlineKeyboardButton, BotCommand
+    InlineKeyboardMarkup, InlineKeyboardButton, BotCommand,
+    ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove,
 )
 
 from config import (
@@ -173,6 +174,36 @@ def feedback_keyboard(report_type: str) -> InlineKeyboardMarkup:
         InlineKeyboardButton(text="👍 Полезно", callback_data=f"fb:1:{report_type}"),
         InlineKeyboardButton(text="👎 Мимо",    callback_data=f"fb:-1:{report_type}"),
     ]])
+
+
+# ─── Persistent ReplyKeyboard ────────────────────────────────────────────────
+# Постоянное меню снизу — заменяет QWERTY-клавиатуру на 4 главных кнопки.
+# Юзеру не надо помнить /команды — он просто тыкает в нижний ряд.
+# Подписи к кнопкам строго совпадают с тем что обрабатывают
+# `_PERSISTENT_KB_TRIGGERS` ниже (любое расхождение → кнопка не сработает).
+PERSISTENT_BTN_DAILY    = "📊 Прогноз"
+PERSISTENT_BTN_PITCH    = "💎 Питч"
+PERSISTENT_BTN_MARKETS  = "🏛 Рынки"
+PERSISTENT_BTN_SETTINGS = "⚙️ Настройки"
+
+
+def persistent_kb() -> ReplyKeyboardMarkup:
+    """Главное меню снизу. Висит постоянно. 2 ряда по 2 кнопки."""
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [
+                KeyboardButton(text=PERSISTENT_BTN_DAILY),
+                KeyboardButton(text=PERSISTENT_BTN_PITCH),
+            ],
+            [
+                KeyboardButton(text=PERSISTENT_BTN_MARKETS),
+                KeyboardButton(text=PERSISTENT_BTN_SETTINGS),
+            ],
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
+        input_field_placeholder="Тыкай кнопку или пиши команду…",
+    )
 
 
 def signal_to_stars(confidence) -> str:
@@ -2072,6 +2103,7 @@ async def handle_cmd_shortcuts(callback: CallbackQuery):
         "daily": cmd_daily,
         "markets": cmd_markets,
         "status": cmd_status,
+        "pitch": cmd_pitch,
         "trackrecord": cmd_trackrecord,
         "trackrecordglobal": lambda m: _cmd_trackrecord(m, report_type="global", title="GLOBAL", filter_type="all"),
         "trackrecordrussia": lambda m: _cmd_trackrecord(m, report_type="russia", title="РОССИЯ EDGE", filter_type="all"),
@@ -2105,33 +2137,63 @@ async def cmd_start(message: Message):
         message.from_user.first_name or ""
     )
     name = message.from_user.first_name or "трейдер"
-    
-    kb = _main_menu_kb()
-    
+
+    # Карточка приветствия. Никаких списков команд — только 4 главных
+    # action-кнопки. Юзер тыкает что хочет, инструкции для тех кто хочет
+    # лежат под отдельной кнопкой.
+    welcome_inline = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📊 Покажи прогноз сейчас", callback_data="cmd:daily")],
+        [InlineKeyboardButton(text="🏛 Что на рынках сейчас", callback_data="cmd:markets")],
+        [
+            InlineKeyboardButton(text="💎 Что я умею",       callback_data="cmd:pitch"),
+            InlineKeyboardButton(text="⚙️ Настройки",       callback_data="cmd:profile"),
+        ],
+        [InlineKeyboardButton(text="📘 Полная инструкция",  callback_data="cmd:guide")],
+    ])
+
+    # Сначала отдельным сообщением «приклеиваем» постоянное меню снизу —
+    # дальше юзер видит его всегда вместо QWERTY.
+    await message.answer(
+        "🚀 _Подключаюсь к рынкам…_",
+        reply_markup=persistent_kb(),
+        parse_mode="Markdown",
+    )
+
     await message.answer(
         f"👋 Привет, *{name}*!\n\n"
-        "🧠 *Dialectic Edge* — честный AI-аналитик рынков\n\n"
-        "4 агента спорят используя *живые данные*:\n"
-        "🐂 *Bull* — ищет возможности роста\n"
-        "🐻 *Bear* — указывает риски\n"
-        "🔍 *Verifier* — проверяет каждую цифру\n"
-        "⚖️ *Synth* — итог адаптированный под тебя\n\n"
-        "📋 *Команды:*\n"
-        "• /profile — настрой риск-профиль (важно сделать первым)\n"
-        "• /daily — дайджест рынков\n"
-        "• /analyze [текст] — анализ новости\n"
-        "• /trackrecord — история точности (всё)\n"
-        "• /trackrecordglobal — Global прогнозы\n"
-        "• /trackrecordrussia — Россия Edge 🇷🇺\n"
-        "• /weeklyreport — отчёт за неделю\n"
-        "• /subscribe — авторассылка\n"
-        "• /markets — рынки + сигналы (копитрейдинг), подписка на пуши\n"
-        "• /status — краткий статус (можно закрепить)\n"
-        "• /portfolio — твой портфель\n\n"
-        "⚠️ _Не финансовый совет. Будущее неизвестно никому._",
-        reply_markup=kb,
-        parse_mode="Markdown"
+        "🧠 *Dialectic Edge* — честный AI-аналитик рынков.\n"
+        "4 агента спорят на живых данных и выдают понятный план.\n\n"
+        "🐂 Bull · 🐻 Bear · 🔍 Verifier · ⚖️ Synth\n\n"
+        "👇 *Тыкни что нужно:*",
+        reply_markup=welcome_inline,
+        parse_mode="Markdown",
     )
+
+
+# ─── ReplyKeyboard shortcuts ─────────────────────────────────────────────────
+# Юзер тапнул на одну из 4 кнопок постоянного нижнего меню — Telegram
+# присылает их подпись как обычное текстовое сообщение. Перехватываем
+# по точному совпадению текста и проксируем в соответствующую команду,
+# чтобы не дублировать логику.
+
+@dp.message(F.text == PERSISTENT_BTN_DAILY)
+async def _kb_daily(message: Message):
+    await cmd_daily(message)
+
+
+@dp.message(F.text == PERSISTENT_BTN_PITCH)
+async def _kb_pitch(message: Message):
+    await cmd_pitch(message)
+
+
+@dp.message(F.text == PERSISTENT_BTN_MARKETS)
+async def _kb_markets(message: Message):
+    await cmd_markets(message)
+
+
+@dp.message(F.text == PERSISTENT_BTN_SETTINGS)
+async def _kb_settings(message: Message):
+    await cmd_profile(message)
 
 
 # ─── /profile ─────────────────────────────────────────────────────────────────
