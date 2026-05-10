@@ -147,7 +147,15 @@ scheduler: Scheduler = None
 
 # Кэш РФ анализа (обновляется вместе с /daily)
 russia_cache: dict = {}  # {"report": str, "timestamp": str, "sections": {...}, "ts": float}
-debate_cache: dict = {}  # {user_id: {"rounds": [...], "full": str}}
+
+# debate_cache: один и тот же dict с refactor.handlers.debate_handler.
+# Раньше тут был свой `debate_cache: dict = {}` — отдельная in-memory копия.
+# Из-за этого после /daily кнопка «🎯 Стратегия по рынку» (callback money:*),
+# которая читает кэш через `get_debate_handler().get_debate(user_id)`, не
+# находила свежий дебат и писала «Сначала запусти /daily» — хотя дайджест
+# секунду назад приходил. Шарим один и тот же dict — теперь обе стороны
+# видят одинаковое состояние.
+from refactor.handlers.debate_handler import debate_cache  # noqa: E402  # {user_id: {"rounds": [...], "full": str}}
 
 
 def get_bot() -> Bot:
@@ -795,9 +803,12 @@ async def send_daily_digest_bundle(
     pct_val, stars_str = extract_signal_pct_and_stars(report)
     hid = hydrate_debate_from_report(report)
     if hid:
+        # `total` нужен refactor-хэндлеру навигации по раундам.
+        hid["total"] = len(hid.get("rounds", []) or [])
         debate_cache[user_id] = hid
     else:
-        debate_cache[user_id] = {"rounds": parts["rounds"], "full": report}
+        rounds_fb = parts["rounds"]
+        debate_cache[user_id] = {"rounds": rounds_fb, "full": report, "total": len(rounds_fb or [])}
     try:
         await save_debate_session(user_id, report)
     except Exception as e:
