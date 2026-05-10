@@ -708,13 +708,15 @@ async def send_daily_digest_bundle(
 def main_report_keyboard(user_id: int, has_debates: bool = True) -> InlineKeyboardMarkup:
     """Клавиатура под основным отчётом."""
     buttons = []
-    # «💰 БАБЛО» наверху — главная action-кнопка: одной нажимкой юзер
-    # получает либо конкретный план (вход/стоп/цель/размер), либо чёткое
-    # «торговать не надо + условия флипа». Без болтовни. Цель — чтобы
-    # пользователь понимал что делать прямо сейчас.
+    # «🎯 Стратегия по рынку» наверху — главная action-кнопка: бот считает
+    # макро-фон (S&P EMA200/SMA50 + breadth + DXY) и подбирает стратегию,
+    # которая ему соответствует: либо конкретный план (вход/стоп/цель/
+    # размер), либо чёткое «торговать не надо + условия флипа». Без воды.
+    # Раньше кнопка называлась «БАБЛО» — оказалось это была фигура речи
+    # юзера, не имя. Переименовали в нейтральное.
     buttons.append([
         InlineKeyboardButton(
-            text="💰 БАБЛО — конкретная сделка",
+            text="🎯 Стратегия по рынку",
             callback_data=f"money:{user_id}"
         )
     ])
@@ -801,15 +803,19 @@ def _money_format_price(value) -> str:
     return f"${f:.6f}".rstrip("0").rstrip(".")
 
 
-def format_money_button_message(report_text: str) -> str:
-    """Сборка сообщения для кнопки «💰 БАБЛО».
+def format_money_button_message(report_text: str, macro=None) -> str:
+    """Сборка сообщения для кнопки «🎯 Стратегия по рынку».
 
     Логика:
-    - Если есть хоть один LONG/SHORT-план → показываем КОНКРЕТНУЮ сделку
-      (вход / стоп / цель / R/R / размер / какой ордер ставить).
-    - Если планов нет / все CASH демоутнуты в watch → говорим «торговать
-      НЕ надо» + условия флипа из watch-уровней (что должно произойти,
-      чтобы открылся LONG/SHORT).
+    - Считаем макро-фон (S&P EMA200/SMA50 + breadth + DXY).
+    - Если макро RISK_OFF → лонги отбрасываем, оставляем только шорты.
+      Если RISK_ON → наоборот.
+    - Если есть хоть один разрешённый LONG/SHORT-план → показываем
+      КОНКРЕТНУЮ сделку (вход / стоп / цель / R/R / размер / какой ордер
+      ставить).
+    - Если планов нет / все CASH демоутнуты в watch / все планы зарезаны
+      макро-фильтром → говорим «торговать НЕ надо» + условия флипа из
+      watch-уровней.
 
     Без воды. Юзер хочет одной кнопкой увидеть «делать / не делать», и
     если делать — «куда жать». Бот не должен здесь рассуждать, только
@@ -828,9 +834,31 @@ def format_money_button_message(report_text: str) -> str:
         and (p.get("direction") or "").upper().strip() in {"LONG", "SHORT"}
     ]
 
+    # Макро-фильтр: убираем планы, противоречащие текущему макро-режиму.
+    macro_blocked: list[dict] = []
+    if macro is not None:
+        kept = []
+        for p in actionable:
+            d = (p.get("direction") or "").upper().strip()
+            if d == "LONG" and not getattr(macro, "allow_longs", True):
+                macro_blocked.append(p)
+                continue
+            if d == "SHORT" and not getattr(macro, "allow_shorts", True):
+                macro_blocked.append(p)
+                continue
+            kept.append(p)
+        actionable = kept
+
     out: list[str] = []
-    out.append(f"💰 *БАБЛО — что делать прямо сейчас*")
-    out.append(f"🎯 Вердикт: {verdict_emoji} *{verdict_label}*")
+    out.append("🎯 *Стратегия по рынку — что делать прямо сейчас*")
+    out.append(f"📍 Вердикт дайджеста: {verdict_emoji} *{verdict_label}*")
+    if macro is not None:
+        try:
+            from core.macro_regime import format_macro_block
+            out.append("")
+            out.append(format_macro_block(macro))
+        except Exception:
+            pass
     out.append("")
 
     if actionable:
@@ -866,8 +894,21 @@ def format_money_button_message(report_text: str) -> str:
         return "\n".join(out)
 
     # Нет actionable планов → объясняем условия флипа из watch.
-    out.append("⏳ *Торговать НЕ надо.* Все идеи — без однозначного направления.")
-    out.append("")
+    if macro_blocked:
+        out.append(
+            "⏳ *Торговать НЕ надо.* Идеи в дайджесте противоречат текущему "
+            "макро-режиму — открывать против тренда S&P/breadth/DXY не будем."
+        )
+        out.append("")
+        out.append("🚫 *Зарезано макро-фильтром:*")
+        for p in macro_blocked[:3]:
+            sym = (p.get("symbol") or "?").upper()
+            d = (p.get("direction") or "?").upper()
+            out.append(f"• {sym} {d} — против макро ({getattr(macro, 'regime', '—')})")
+        out.append("")
+    else:
+        out.append("⏳ *Торговать НЕ надо.* Все идеи — без однозначного направления.")
+        out.append("")
     if watch_levels:
         out.append("📊 *Когда вернёмся в рынок (условия флипа):*")
         for w in watch_levels[:5]:
@@ -923,8 +964,14 @@ async def handle_money_button_callback(callback: CallbackQuery):
         return
 
     await callback.answer("Считаю что делать прямо сейчас")
+    macro = None
     try:
-        msg = format_money_button_message(full_report)
+        from core.macro_regime import get_macro_regime
+        macro = await get_macro_regime()
+    except Exception as e:
+        logger.debug("macro_regime fetch failed: %s", e)
+    try:
+        msg = format_money_button_message(full_report, macro=macro)
     except Exception as e:
         logger.warning("format_money_button_message failed: %s", e)
         await bot.send_message(
@@ -3721,6 +3768,54 @@ async def cmd_backtest_clear(message: Message):
     """Clear backtest signals and reset capital."""
     await clear_backtest_signals(reset_capital=100.0)
     await message.answer("🗑 Бэктест очищен, капитал сброшен до $100")
+
+
+@dp.message(Command("autotrade_reset"))
+async def cmd_autotrade_reset(message: Message):
+    """Полный сброс автотрейда: SQLite, сессии и BACKTEST.md на GitHub.
+
+    Без этой команды /backtest_clear только чистит SQLite, но фоновый цикл
+    автотрейда тут же подтягивает старый капитал из BACKTEST.md и продолжает
+    топтаться на $51. Эта команда синхронно сбрасывает все три источника.
+    """
+    parts = message.text.split()
+    new_capital = 100.0
+    if len(parts) >= 2:
+        try:
+            new_capital = float(parts[1].replace(",", ""))
+            if new_capital <= 0:
+                await message.answer("Сумма должна быть больше 0. Пример: /autotrade_reset 100")
+                return
+        except ValueError:
+            await message.answer("Неверная сумма. Пример: /autotrade_reset 100")
+            return
+
+    from session_manager import session_manager as _sm
+
+    # 1. Чистим SQLite-сигналы и капитал
+    await clear_backtest_signals(reset_capital=new_capital)
+    # 2. Сбрасываем менеджер сессий полностью (чтобы _loaded=True не дал
+    #    подтянуть старое из GitHub в следующем цикле автотрейдера)
+    _sm.hard_reset(start_capital=new_capital)
+    # 3. Пушим свежий BACKTEST.md — иначе цикл прочитает «Текущий: $51»
+    pushed_ok = False
+    try:
+        from signal_trader import _export_backtest_snapshot
+        await _export_backtest_snapshot()
+        pushed_ok = True
+    except Exception as e:
+        logger.warning("autotrade_reset: BACKTEST.md push failed: %s", e)
+
+    extra = "✅ BACKTEST.md обновлён на GitHub" if pushed_ok else "⚠️ BACKTEST.md не запушился (см. логи)"
+    await message.answer(
+        f"🔄 *Автотрейд сброшен*\n"
+        f"• Капитал: ${new_capital:,.2f}\n"
+        f"• Открытые позиции: 0 (все закрыты)\n"
+        f"• Сессия #1, история обнулена\n"
+        f"• {extra}\n\n"
+        f"Следующий цикл автотрейда стартует с чистого листа.",
+        parse_mode="Markdown",
+    )
 
 
 if __name__ == "__main__":
