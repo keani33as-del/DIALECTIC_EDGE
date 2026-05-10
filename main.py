@@ -631,6 +631,30 @@ def build_short_report(parts: dict, stars: str, pct: int, horizon: HorizonPack |
     if eli5:
         lines.extend(["", f"👶 *Как 5-летнему:* {eli5}"])
 
+    # «Кто думал» — для пиtch'а: видно что это не один LLM, а debate из
+    # 4 разных моделей по ролям (Bull/Bear/Verifier/Synth). Делаем
+    # компактно одной строкой; полный _format_report() остаётся в
+    # «Полные дебаты» с расширенной версией.
+    try:
+        from ai_provider import MODELS_USED
+        roles = []
+        for role_key, role_emoji in (
+            ("bull", "🐂"),
+            ("bear", "🐻"),
+            ("verifier", "🔍"),
+            ("synth", "⚖️"),
+        ):
+            model_label = MODELS_USED.get(role_key)
+            if model_label:
+                # Сокращаем длинные label'ы (например «OpenRouter/Llama 3.3 70B»
+                # → «Llama-3.3-70B») чтобы строка влезала в одну Telegram-стрку.
+                short = model_label.split("/", 1)[-1].split(" 🚀")[0].split(" 🧠")[0]
+                roles.append(f"{role_emoji} {short}")
+        if roles:
+            lines.extend(["", "🤖 *Кто думал:* " + " · ".join(roles)])
+    except Exception:
+        pass
+
     lines.extend([
         "",
         "📜 Полный raw-ответ модели и полные дебаты доступны кнопками ниже.",
