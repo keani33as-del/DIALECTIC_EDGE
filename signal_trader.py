@@ -67,6 +67,62 @@ _last_mvrv_alert = 0.0  # timestamp of last MVRV alert to avoid spam
 
 _regime_detector = RegimeDetector()
 _risk_manager = DynamicRiskManager()
+
+
+def _bootstrap_risk_manager_from_history() -> None:
+    """Подсадить DynamicRiskManager статистикой из session_manager,
+    чтобы Kelly заработал с первого дня после рестарта Railway.
+    
+    Берём:
+    - текущую сессию (wins/losses/trades с pnl_pct)
+    - последние 5 завершённых сессий (для среднего)
+    """
+    try:
+        wins = 0
+        losses = 0
+        win_pnls: list[float] = []
+        loss_pnls: list[float] = []
+        total_pnl_pct = 0.0
+        
+        cur = session_manager.current_session
+        if cur:
+            for t in (cur.trades or []):
+                pnl_pct = float(t.get("pnl_pct") or 0.0)
+                if t.get("pnl", 0) > 0:
+                    wins += 1
+                    win_pnls.append(abs(pnl_pct))
+                elif t.get("pnl", 0) < 0:
+                    losses += 1
+                    loss_pnls.append(abs(pnl_pct))
+                total_pnl_pct += pnl_pct
+        
+        # Завершённые сессии — просто wins/losses, без pnl_pct по сделкам
+        for s in (session_manager.past_sessions or [])[-5:]:
+            wins += int(s.get("wins") or 0)
+            losses += int(s.get("losses") or 0)
+            total_pnl_pct += float(s.get("pnl_pct") or 0.0)
+        
+        if wins + losses == 0:
+            logger.info("[RISK] Нет истории сделок — Kelly будет на base_risk_pct до 10 закрытий")
+            return
+        
+        avg_win = (sum(win_pnls) / len(win_pnls)) if win_pnls else 1.0
+        avg_loss = (sum(loss_pnls) / len(loss_pnls)) if loss_pnls else 1.0
+        
+        _risk_manager.bootstrap_from_history(
+            wins=wins,
+            losses=losses,
+            avg_win_pct=avg_win,
+            avg_loss_pct=avg_loss,
+            total_pnl_pct=total_pnl_pct,
+        )
+    except Exception as e:
+        logger.debug(f"[RISK] bootstrap error: {e}")
+
+
+# Бутстрапим при импорте — session_manager уже загрузил BACKTEST.md
+_bootstrap_risk_manager_from_history()
+
 _tf_analyzer = MultiTimeframeAnalyzer()
 _whale_detector = WhaleDetector()
 _correlation = CorrelationMatrix(threshold=0.85)
@@ -972,6 +1028,14 @@ async def _close_position_if_needed(position: dict, prices: dict, signal_bias: d
         "reason": reason,
     })
     session_manager.update_capital(new_capital)
+    
+    # Пробрасываем результат в DynamicRiskManager для динамического Kelly + персистить.
+    try:
+        is_win = pnl > 0
+        _risk_manager.update_capital(new_capital)
+        _risk_manager.record_trade(pnl_pct=float(pnl_pct), is_win=is_win, persist=True)
+    except Exception as _e:
+        logger.debug("DynamicRiskManager.record_trade error: %s", _e)
 
     # Сразу пишем в BACKTEST.md после каждого закрытия
     try:
@@ -1057,6 +1121,14 @@ async def _close_on_signal_reversal(position: dict, prices: dict, signal_bias: d
         "reason": reason,
     })
     session_manager.update_capital(new_capital_rev)
+    
+    # Пробрасываем результат в DynamicRiskManager для динамического Kelly + персистить.
+    try:
+        is_win_rev = pnl_rev > 0
+        _risk_manager.update_capital(new_capital_rev)
+        _risk_manager.record_trade(pnl_pct=float(pnl_pct_rev), is_win=is_win_rev, persist=True)
+    except Exception as _e:
+        logger.debug("DynamicRiskManager.record_trade error: %s", _e)
 
     try:
         await _export_backtest_snapshot()
@@ -1524,6 +1596,8 @@ async def _check_and_trade_locked(bot, admin_ids: list[int]) -> list[dict]:
             atr=entry * volatility / 100 if volatility > 0 else 0,
             regime=regime,
             correlation_count=len(held_symbols & CRYPTO_SIGNAL_SYMBOLS),
+            realized_vol_pct=volatility,  # vol-targeting: режем размер на high-vol
+            direction=candidate.get("direction", "BUY"),
         )
 
         # Defense mode: уменьшаем размер позиции
@@ -1608,13 +1682,15 @@ async def _check_and_trade_locked(bot, admin_ids: list[int]) -> list[dict]:
                 logger.debug("append_trade_decision_log error: %s", _e)
             continue
 
-        # Volatility adjustment: reduce size on high volatility (simple safeguard)
+        # Volatility-targeting уже применён внутри calculate_position_size()
+        # через realized_vol_pct → vol_targeting_multiplier. Дополнительный
+        # safeguard на экстремальный vol (>10%) — пол 0.4x от размера.
         try:
             vol_pct = float(candidate.get("volatility_pct") or 0.0)
-            if vol_pct > 5.0:
+            if vol_pct > 10.0:
                 old_q = quantity_pct
                 quantity_pct = quantity_pct * 0.5
-                logger.info(f"⚡ {sym}: высокая волатильность {vol_pct:.1f}% — уменьшаем размер {old_q:.4f} -> {quantity_pct:.4f}")
+                logger.info(f"⚡ {sym}: экстремальная волатильность {vol_pct:.1f}% — extra cut {old_q:.4f} -> {quantity_pct:.4f}")
         except Exception:
             pass
 
