@@ -24,6 +24,12 @@ from .scorer import (
     format_signal_block_for_debates,
     MarketScore
 )
+from .smart_money import (
+    fetch_smart_money_signals,
+    format_smart_money_for_agents,
+    smart_money_score_contribution,
+    SmartMoneySignals,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +40,7 @@ class EnrichedData:
     onchain: OnChainMetrics = None
     macro: MacroExtended = None
     score: MarketScore = None
+    smart_money: SmartMoneySignals = None
     
     def __post_init__(self):
         if self.onchain is None:
@@ -42,6 +49,8 @@ class EnrichedData:
             self.macro = MacroExtended()
         if self.score is None:
             self.score = MarketScore()
+        if self.smart_money is None:
+            self.smart_money = SmartMoneySignals()
 
 
 async def build_enriched_context(
@@ -64,13 +73,17 @@ async def build_enriched_context(
     # Параллельно собираем данные
     onchain_task = fetch_onchain_metrics()
     macro_task = fetch_extended_macro()
+    smart_money_task = fetch_smart_money_signals()
     
-    logger.info("[AGGREGATOR] Fetching on-chain + macro data in parallel...")
-    onchain_data, macro_data = await asyncio.gather(onchain_task, macro_task)
+    logger.info("[AGGREGATOR] Fetching on-chain + macro + smart-money data in parallel...")
+    onchain_data, macro_data, smart_money_data = await asyncio.gather(
+        onchain_task, macro_task, smart_money_task
+    )
     
     enriched.onchain = onchain_data
     enriched.macro = macro_data
-    logger.info("[AGGREGATOR] On-chain + macro fetched OK")
+    enriched.smart_money = smart_money_data
+    logger.info("[AGGREGATOR] On-chain + macro + smart-money fetched OK")
     
     # Проверяем критические стоп-факторы
     critical_bearish, critical_bullish = get_critical_signals(
@@ -102,7 +115,26 @@ async def build_enriched_context(
         sentiment=sentiment_label,
     )
     
-    # Добавляем стоп-факторы
+    # Smart-money вклад в общий скор — применяем ДО финального вердикта,
+    # чтобы verdict учитывал институциональные сигналы.
+    sm_delta, sm_bull, sm_bear = smart_money_score_contribution(enriched.smart_money)
+    if sm_delta != 0:
+        score.total_score += sm_delta
+        # Не льём в macro/onchain/tech/sentiment — смарт-мани отдельный класс,
+        # но выводим причины в explanation через bullish/bearish_signals.
+        score.bullish_signals.extend(sm_bull)
+        score.bearish_signals.extend(sm_bear)
+        logger.info(f"[AGGREGATOR] Smart-money score delta: {sm_delta:+d} (bull={len(sm_bull)} bear={len(sm_bear)})")
+        
+        # Пересчитываем preliminary verdict после добавки smart-money
+        if score.total_score >= 4:
+            score.preliminary_verdict = "BULLISH"
+        elif score.total_score <= -4:
+            score.preliminary_verdict = "BEARISH"
+        else:
+            score.preliminary_verdict = "NEUTRAL"
+    
+    # Добавляем стоп-факторы (могут оверрайднуть verdict)
     score.has_critical_bearish = critical_bearish
     score.has_critical_bullish = critical_bullish
     
@@ -136,7 +168,12 @@ async def build_enriched_context(
     context_parts.append("")
     context_parts.append(scored_str)
     
-    # 4. СИГНАЛ БЛОК для Bull/Bear дебатов (НОВЫЙ!)
+    # 4. SMART-MONEY блок (институциональные сигналы)
+    smart_money_str = format_smart_money_for_agents(enriched.smart_money)
+    context_parts.append("")
+    context_parts.append(smart_money_str)
+    
+    # 5. СИГНАЛ БЛОК для Bull/Bear дебатов
     signal_block = format_signal_block_for_debates(enriched.score, enriched.onchain, enriched.macro)
     context_parts.append("")
     context_parts.append(signal_block)
@@ -190,6 +227,20 @@ def enrich_prices_with_scores(
         enriched_prices["SCORE_ONCHAIN"] = score.onchain_score
         enriched_prices["SCORE_TECHNICAL"] = score.technical_score
         enriched_prices["SCORE_SENTIMENT"] = score.sentiment_score
+    
+    # Smart-money
+    if enriched.smart_money:
+        sm = enriched.smart_money
+        if sm.top_trader_ls_ratio is not None:
+            enriched_prices["SM_TOP_TRADER_LS"] = sm.top_trader_ls_ratio
+        if sm.coinbase_premium_pct is not None:
+            enriched_prices["SM_COINBASE_PREMIUM"] = sm.coinbase_premium_pct
+        if sm.cme_basis_pct is not None:
+            enriched_prices["SM_CME_BASIS"] = sm.cme_basis_pct
+        if sm.funding_avg_pct is not None:
+            enriched_prices["SM_FUNDING_AVG"] = sm.funding_avg_pct
+        if sm.funding_alignment:
+            enriched_prices["SM_FUNDING_ALIGN"] = sm.funding_alignment
     
     return enriched_prices
 
