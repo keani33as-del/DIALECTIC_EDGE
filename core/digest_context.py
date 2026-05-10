@@ -303,6 +303,62 @@ _WATCH_END_MARKERS = (
 )
 
 
+# Известные тикеры — нужны чтобы фильтровать «watch levels» которые на
+# самом деле просто новостные булеты (типа «Fibermaxxing → benefits»),
+# случайно попавшие в блок наблюдения через chain-of-thought leak от
+# Bull/Bear агента.
+_KNOWN_TICKERS = {
+    # Крипта
+    "BTC", "ETH", "SOL", "XRP", "BNB", "DOGE", "ADA", "TON", "TRX",
+    "AVAX", "DOT", "LINK", "MATIC", "LTC", "BCH", "USDT", "USDC",
+    # Equity / индексы
+    "SPY", "QQQ", "IWM", "DIA", "VIX", "SPX", "NDX", "DJI", "GLD",
+    "SLV", "TLT", "HYG", "DXY", "USO", "VWO", "EFA", "S&P",
+    # Watch для производных
+    "ES=F", "NQ=F", "GC=F", "CL=F",
+}
+
+_TRIGGER_KEYWORDS = (
+    "ПРОБОЙ", "ЗАКРЫТИЕ", "ПРОБИВ", "ОТКРОЕМ", "ШОРТ", "LONG", "SHORT",
+    "BREAKOUT", "FLIP", "BREAK", "ПОДДЕРЖК", "СОПРОТИВЛЕНИ",
+    "MA50", "MA200", "EMA", "SMA",
+)
+
+
+def _is_valid_watch_level(item: dict) -> bool:
+    """Watch-уровень должен содержать тикер + либо цену, либо триггер.
+    
+    Иначе это мусор: AI-агент в chain-of-thought пишет «Fibermaxxing →
+    benefits…», синт случайно копирует булет в блок наблюдения, и юзер
+    видит на кнопке «Стратегия» эти заметки вместо реальных уровней.
+    Фильтр не пропускает строки без явного тикера/цены/триггера.
+    """
+    symbol_upper = (item.get("symbol") or "").strip().upper()
+    level = (item.get("level") or "").strip()
+    note = (item.get("note") or "").strip()
+    full_text = f"{symbol_upper} {level} {note}".upper()
+    
+    has_ticker = any(t in symbol_upper for t in _KNOWN_TICKERS) or any(
+        re.search(rf"\b{re.escape(t)}\b", full_text) for t in _KNOWN_TICKERS
+    )
+    has_price = bool(re.search(r"\$\s*\d|\d{2,}\s*(?:USD|usd|долл)", full_text))
+    has_trigger = any(t in full_text for t in _TRIGGER_KEYWORDS)
+    
+    # Sanity: должна быть либо комбинация (тикер + цена/триггер), либо
+    # тикер с явным числом. Голые текстовые булеты без чисел и тикеров
+    # — отбрасываем.
+    if has_ticker and (has_price or has_trigger):
+        return True
+    if has_price and has_trigger:
+        return True
+    # Явный анти-паттерн: новостной булет с «benefits / loses / not market»
+    # — это leak Bull-агента.
+    leak_markers = ("BENEFITS", "LOSES?", "NOT MARKET", "MAYBE CRITICS")
+    if any(m in full_text for m in leak_markers):
+        return False
+    return False
+
+
 def extract_watch_levels(report_text: str) -> list[dict]:
     """Парсит блок «📊 СЕЙЧАС НЕ ТОРГУЕМ — СЛЕДИМ ЗА УРОВНЯМИ» / «👁 НАБЛЮДЕНИЕ»
     из Synth-выхода. Возвращает список {symbol, level, note} — то же что
@@ -350,7 +406,12 @@ def extract_watch_levels(report_text: str) -> list[dict]:
             })
         else:
             items.append({"symbol": "", "level": "", "note": cleaned[:240]})
-    return items[:6]
+    
+    # Фильтруем мусор от агента который протёк в watch-блок (новостные
+    # булеты без цен/тикеров). Без этого юзер видит «Fibermaxxing →
+    # benefits» в качестве условия флипа — хуже чем пустой блок.
+    cleaned_items = [it for it in items if _is_valid_watch_level(it)]
+    return cleaned_items[:6]
 
 
 def _extract_symbol(label: str) -> str:
