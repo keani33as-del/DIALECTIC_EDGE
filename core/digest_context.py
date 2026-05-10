@@ -173,8 +173,34 @@ def _is_vague_trigger(text: str) -> bool:
 
 def _is_unactionable_cash_plan(plan: dict) -> tuple[bool, str]:
     """CASH-план без однозначного направления (двунаправленный или абстрактный
-    триггер) → демоут в watch. Возвращает (is_unactionable, reason)."""
+    триггер) → демоут в watch. Также демоутим LONG/SHORT-планы у которых нет
+    ни одного из (entry, stop, target) — это значит парсер поймал направление
+    из текста triggera, но реальной сделки не сформулировано.
+    Возвращает (is_unactionable, reason)."""
     direction = (plan.get("direction") or "").upper().strip()
+    label_upper = str(plan.get("label") or "").upper()
+    
+    # Defense-in-depth: WATCH или label-CASH/WATCH/ВНЕ РЫНКА → всегда watch.
+    if direction in {"WATCH", "WAIT", "FLAT"}:
+        return True, "watch direction"
+    if any(x in label_upper for x in ("CASH", "WATCH", "ВНЕ РЫНКА", "НАБЛЮД")):
+        # Явно cash/watch — даже если direction неправильно тегнут как LONG.
+        if direction in {"LONG", "SHORT"}:
+            entry = plan.get("entry")
+            stop = plan.get("stop")
+            target = plan.get("target")
+            if not entry and not stop and not target:
+                return True, "label says CASH but direction got tagged from trigger text"
+    
+    # LONG/SHORT-план без вход/стоп/цели — мусор от парсера (или AI не дал
+    # цифр). Не показываем юзеру «BTC LONG — вход —, стоп —, цель —».
+    if direction in {"LONG", "SHORT"}:
+        entry = plan.get("entry")
+        stop = plan.get("stop")
+        target = plan.get("target")
+        if not entry and not stop and not target:
+            return True, "actionable plan without entry/stop/target"
+    
     if direction not in {"CASH", "WAIT", "FLAT"}:
         return False, ""
     trigger = str(plan.get("trigger") or "").strip()
@@ -402,6 +428,23 @@ def _parse_pipe_plan_line(line: str) -> Optional[dict]:
         direction = _normalize_direction(parts[0])
         if direction not in {"LONG", "SHORT", "CASH", "WATCH"}:
             return None
+        field_chunks = parts[1:]
+
+    # Label-приоритет: если label явно говорит CASH/WATCH/ВНЕ РЫНКА — это
+    # watch-уровень, даже если в trigger-чанке встретилось «→ откроем LONG».
+    # Без этого parts[1]="триггер пробой $X → откроем LONG" парсится как
+    # direction=LONG, и юзер видит фантомную сделку BTC LONG без вход/стоп/цели.
+    label_upper = parts[0].upper()
+    if direction in {"LONG", "SHORT"} and any(
+        x in label_upper for x in ("CASH", "WATCH", "ВНЕ РЫНКА", "НАБЛЮД")
+    ):
+        if "CASH" in label_upper or "ВНЕ РЫНКА" in label_upper:
+            direction = "CASH"
+        else:
+            direction = "WATCH"
+        # parts[1] было ошибочно прочитано как direction. На самом деле это
+        # data-поле (обычно trigger). Возвращаем его в обработку field_chunks,
+        # иначе watch-уровень потеряет текст триггера.
         field_chunks = parts[1:]
 
     plan = {
