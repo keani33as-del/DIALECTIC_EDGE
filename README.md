@@ -1,6 +1,65 @@
 # Dialectic Edge — AI Trading System
 
-> Multi-agent autonomous trading system with AI debate, regime-adaptive risk management, and real-time market signals.
+> Autonomous AI trading system на **smart-money signals + adaptive Kelly + self-audit**. Не retail sentiment как у конкурентов.
+
+[![Python](https://img.shields.io/badge/Python-3.12-blue)](https://www.python.org/) [![License](https://img.shields.io/badge/License-Private-red)]() [![Status](https://img.shields.io/badge/Status-Production-success)]() [![Deploy](https://img.shields.io/badge/Deploy-Railway-purple)](https://railway.app/) [![Telegram](https://img.shields.io/badge/Frontend-Telegram-blue)](https://telegram.org/)
+
+---
+
+## 🎯 Что это
+
+**Dialectic Edge** — автономная торговая система, которая работает на принципах системного фонда, а не retail-трейдера:
+
+| Слой | Источники / методы |
+|------|--------------------|
+| **🏛️ Smart-money signals** *(NEW)* | Top-trader L/S ratio, Coinbase Premium, CME basis, Funding dispersion |
+| **📊 Multi-agent AI debate** | 4 агента (Bull / Bear / Verifier / Synth) на разных моделях через OpenRouter |
+| **⚖️ Adaptive risk** *(NEW)* | Vol-targeting (CTA-стиль) + dynamic Kelly на real win-rate, persistent state |
+| **🛡️ Macro regime** | S&P EMA200 / SMA50, breadth, DXY, VIX → blocks trades against trend |
+| **🔄 On-chain** | MVRV, SOPR, Exchange Reserves, Whale Detection |
+| **🔍 AI self-audit** *(NEW)* | LLM пишет performance review закрытых сделок раз в неделю |
+| **📡 Signal trader** | 5-мин loop, vol-target sizing, ATR stops, Split TP, Trailing |
+
+**Pitch line:** *«мы — vol-targeted CTA-фонд + Kelly на реальных метриках, а не retail trader с 2% от капитала на каждой сделке»*.
+
+## 🚀 Quick demo
+
+| Команда | Что показывает |
+|---------|----------------|
+| `/daily` | Полный AI-анализ рынка с дебатами, smart-money сигналами, торговый план |
+| `/markets` | Real-time контекст + сигналы + цены |
+| `/autotrade_status` | Performance: PnL, win-rate, R-ratio, Kelly, vol-target, drawdown |
+| `/audit [N дней]` | AI-аудит закрытых сделок: «что работает / что нет / правило на завтра» |
+| `/usage` | Расход AI-токенов по провайдерам |
+| `/why BTC` | Почему открыта позиция: входной отчёт + текущее состояние |
+
+## 🏆 Что отличает от конкурентов
+
+1. **Smart-money first**: 4 institutional indicator'а (top-trader, Coinbase premium, CME basis, funding dispersion) применяются к scoring **до** retail sentiment'а. Большинство retail-ботов начинают с Twitter / Reddit sentiment.
+
+2. **Adaptive Kelly на реальной истории**: размер позиции считается из `wins / losses / avg_win / avg_loss` собственной торговой истории, persisted в `risk_state.json`. Не статичные «2% риска».
+
+3. **Vol-targeting** *(институциональный стандарт)*: размер позиции обратно пропорционален реализованной волатильности. Quiet day → 2x, panic day → 0.37x. Это ровно то что делают AQR / Renaissance / vol-targeted CTA.
+
+4. **AI self-audit**: LLM раз в неделю смотрит на закрытые сделки, выдаёт performance review с конкретным правилом на следующую неделю. «AI которая учится на своих ошибках».
+
+5. **Multi-provider AI router**: 6 провайдеров (Cerebras, Groq, Mistral, OpenRouter, Together, Gemini), per-role routing — Bull/Bear/Verifier/Synth каждый на оптимальной для его задачи модели. Если один падает — fallback цепочка.
+
+6. **Honest UX**: `/audit` без воды («сегодня винрейт 38% — это плохо, причина X, правило Y»), `/usage` показывает сколько токенов реально потратили, графики с реальными цифрами без cherry-picking.
+
+## ⚙️ Tech stack
+
+| Слой | Технология |
+|------|-----------|
+| Backend | Python 3.12, asyncio, aiohttp, aiosqlite |
+| AI | OpenRouter, Cerebras, Groq, Mistral, Together, Gemini |
+| Frontend | Telegram Bot API (aiogram 3) |
+| Хранение | SQLite (state) + GitHub Markdown (BACKTEST.md, DIGEST_CACHE.md) |
+| Charting | matplotlib (DejaVu Sans) |
+| Deployment | Railway (worker dyno + cron) |
+| ML/NLP | FinBERT (sentiment classification) |
+
+---
 
 *English version below Russian*
 

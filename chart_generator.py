@@ -307,9 +307,23 @@ def _parse_russia_items(text: str, marker: str) -> list:
 
     return items
 
+def _stars_for_chart(stars: str) -> str:
+    """Конвертирует emoji-звёзды в Unicode-символы которые matplotlib рендерит
+    стандартным шрифтом (DejaVu Sans).
+    
+    `⭐` (U+2B50) → `★` (U+2605, Black Star) — есть в DejaVu Sans.
+    `☆` (U+2606) — уже рендерится в DejaVu Sans, не трогаем.
+    """
+    if not stars:
+        return ""
+    return stars.replace("⭐", "★")
+
+
 def generate_main_chart(report: str, prices: dict, stars: str, pct: int):
     if not MATPLOTLIB_OK:
         return None
+    # Star fix: для matplotlib используем ★ (U+2605) вместо ⭐ (U+2B50)
+    stars = _stars_for_chart(stars)
     if not prices:
         prices = {}
 
