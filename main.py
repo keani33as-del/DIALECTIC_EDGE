@@ -424,7 +424,87 @@ def extract_symbols_from_report(report: str, prices: dict) -> tuple[dict, dict, 
     return entries, stop_losses, targets, timeframes
 
 
-def build_short_report(parts: dict, stars: str, pct: int, horizon: HorizonPack | None = None) -> list:
+def _format_smart_money_card(prices: dict | None) -> str | None:
+    """Делает короткую карточку институциональных сигналов для пользователя.
+    Использует SM_* ключи которые уже есть в prices_dict (заполняются
+    `enrich_prices_with_scores` в market_indicators/aggregator.py).
+    
+    Возвращает None если данные недоступны (карточка не показывается).
+    """
+    if not prices:
+        return None
+    
+    ls = prices.get("SM_TOP_TRADER_LS")
+    cb_prem = prices.get("SM_COINBASE_PREMIUM")
+    cme_basis = prices.get("SM_CME_BASIS")
+    funding_avg = prices.get("SM_FUNDING_AVG")
+    funding_align = prices.get("SM_FUNDING_ALIGN")
+    
+    bullets: list[str] = []
+    
+    if isinstance(ls, (int, float)):
+        if ls >= 1.5:
+            tag = "лонгят сильно"
+            emoji = "🟢"
+        elif ls >= 1.2:
+            tag = "лонгят"
+            emoji = "🟢"
+        elif ls <= 0.7:
+            tag = "шортят сильно"
+            emoji = "🔴"
+        elif ls <= 0.85:
+            tag = "шортят"
+            emoji = "🔴"
+        else:
+            tag = "нейтрал"
+            emoji = "⚪️"
+        bullets.append(f"{emoji} *Top-trader L/S:* {ls:.2f} → {tag}")
+    
+    if isinstance(cb_prem, (int, float)):
+        if cb_prem >= 0.20:
+            tag = "🇺🇸 US-биды (бычий)"
+        elif cb_prem >= 0.05:
+            tag = "🇺🇸 US-bid pressure"
+        elif cb_prem <= -0.20:
+            tag = "🇺🇸 US-sell (медвежий)"
+        elif cb_prem <= -0.05:
+            tag = "🇺🇸 US-sell pressure"
+        else:
+            tag = "нейтрал"
+        bullets.append(f"  *Coinbase Premium:* {cb_prem:+.2f}% — {tag}")
+    
+    if isinstance(cme_basis, (int, float)):
+        if cme_basis >= 0.30:
+            tag = "📜 contango (бычий)"
+        elif cme_basis <= -0.30:
+            tag = "📜 backwardation (медвежий)"
+        else:
+            tag = "📜 нейтрал"
+        bullets.append(f"  *CME Basis:* {cme_basis:+.2f}% — {tag}")
+    
+    if isinstance(funding_avg, (int, float)) and funding_align:
+        align = str(funding_align).upper()
+        if align == "ALL_LONG" and funding_avg > 0.05:
+            tag = "⚠️ перегретый лонг — squeeze risk"
+        elif align == "ALL_SHORT" and funding_avg < -0.005:
+            tag = "⚡ массовый шорт — contrarian-бычий"
+        elif align == "ALL_LONG":
+            tag = "лонг-настроение"
+        elif align == "ALL_SHORT":
+            tag = "шорт-настроение"
+        elif align == "MIXED":
+            tag = "нет консенсуса"
+        else:
+            tag = align.lower()
+        bullets.append(f"  *Funding:* {funding_avg:+.4f}% [{align}] — {tag}")
+    
+    if not bullets:
+        return None
+    
+    return "\n".join(["🏛 *Институциональные сигналы (Smart-money):*", *bullets])
+
+
+def build_short_report(parts: dict, stars: str, pct: int, horizon: HorizonPack | None = None, prices: dict | None = None) -> list:
     """
     Собирает ОДНО сообщение для пользователя в фиксированном layout'е:
 
@@ -483,6 +563,12 @@ def build_short_report(parts: dict, stars: str, pct: int, horizon: HorizonPack |
 
     if verdict_reason:
         lines.extend(["", f"🧠 *Почему:* {verdict_reason}"])
+
+    # Smart-money card (институциональные сигналы) — pitch differentiator.
+    # Показываем после verdict/reason, перед планом. Если данных нет — пропускаем.
+    sm_card = _format_smart_money_card(prices)
+    if sm_card:
+        lines.extend(["", sm_card])
 
     if only_watch:
         # Все «планы» — на самом деле watch-уровни. Меняем заголовок,
@@ -673,7 +759,7 @@ async def send_daily_digest_bundle(
     pack = horizon if isinstance(horizon, HorizonPack) else (
         get_horizon(horizon) if horizon is not None else None
     )
-    messages = build_short_report(parts, stars_str, pct_val, horizon=pack)
+    messages = build_short_report(parts, stars_str, pct_val, horizon=pack, prices=prices_dict or {})
     logger.info(f"Отправляю {len(messages)} сообщений. Размеры: {[len(m) for m in messages]}")
 
     rounds_out = debate_cache.get(user_id, {}).get("rounds") or []
@@ -3545,10 +3631,115 @@ async def cmd_help(message: Message):
         "• `/stats` — твоя статистика\n"
         "• `/autotrade_status` — performance, win-rate, Kelly, vol-target 🎯\n"
         "• `/audit [N дней]` — AI-аудит закрытых сделок 📊\n"
-        "• `/usage` — расход токенов по провайдерам\n\n"
+        "• `/usage` — расход токенов по провайдерам\n"
+        "• `/pitch` — investor 1-pager 💎\n\n"
         "⚠️ _Не финансовый совет. Будущее неизвестно никому._",
         parse_mode="Markdown"
     )
+
+
+# ─── /pitch — investor 1-pager ────────────────────────────────────────────────
+
+
+def _format_pitch_message() -> str:
+    """1-message overview системы для инвестора. Читается за 30 сек.
+    
+    Структура: tagline → что делаем → отличия → live KPI → CTA.
+    Все KPI собираются из реального state'а (session_manager + risk_manager).
+    """
+    # KPIs из live state'а
+    capital_str = "—"
+    pnl_pct_str = "—"
+    win_rate_str = "—"
+    trades_str = "—"
+    kelly_status = "bootstrap"
+    sessions_str = "—"
+    try:
+        from session_manager import session_manager, SESSION_START_CAPITAL
+        from signal_trader import _risk_manager
+        
+        cur = session_manager.current_session
+        if cur:
+            capital = cur.current_capital or SESSION_START_CAPITAL
+            start_cap = cur.start_capital or SESSION_START_CAPITAL
+            pnl_pct = ((capital - start_cap) / start_cap * 100) if start_cap else 0
+            capital_str = f"${capital:,.2f}"
+            pnl_pct_str = f"{pnl_pct:+.2f}%"
+            wins = int(cur.wins or 0)
+            losses = int(cur.losses or 0)
+            total = wins + losses
+            if total:
+                win_rate_str = f"{wins / total * 100:.0f}%"
+                trades_str = f"{total} ({wins}W / {losses}L)"
+            else:
+                trades_str = "0 (новая сессия)"
+        
+        rs = _risk_manager.get_risk_summary()
+        if rs.get("kelly_using_history"):
+            kelly_status = f"активен ({rs.get('kelly_pct', 0):.2f}%)"
+        else:
+            kelly_status = f"bootstrap (база {rs.get('kelly_pct', 2):.2f}%)"
+        
+        past = session_manager.past_sessions or []
+        sessions_str = f"{len(past) + 1} (текущая)"
+    except Exception as e:
+        logger.debug("pitch KPI fetch error: %s", e)
+    
+    msg = (
+        "💎 *Dialectic Edge — investor pitch (30 sec)*\n"
+        "═════════════════════════════\n\n"
+        
+        "🎯 *Что мы строим*\n"
+        "Автономную AI-систему которая торгует крипто-активами на принципах "
+        "_систематического фонда_, а не retail-трейдера. Pipeline: "
+        "smart-money signals → 4-агентный AI debate → vol-targeted adaptive Kelly "
+        "→ self-audit раз в неделю.\n\n"
+        
+        "🏆 *Чем отличаемся от 99% retail-ботов*\n"
+        "1️⃣ *Smart-money first.* Top-trader L/S, Coinbase Premium, "
+        "CME Basis, Funding dispersion — институциональные индикаторы _до_ "
+        "retail sentiment. Не Twitter и не Reddit.\n"
+        "2️⃣ *Adaptive Kelly + Vol-targeting.* Размер позиции — функция "
+        "реализованной волатильности и собственного win-rate, "
+        "persisted в `risk_state.json`. Не статичные «2% риска».\n"
+        "3️⃣ *AI self-audit.* Раз в неделю LLM пишет performance review "
+        "закрытых сделок: что работает, что не работает, правило на "
+        "следующую неделю. AI которая учится на своих ошибках.\n"
+        "4️⃣ *Multi-provider AI router.* 6 провайдеров, per-role routing, "
+        "fallback цепочка. Никогда не падает целиком.\n\n"
+        
+        "📊 *Live KPI*\n"
+        f"  • Капитал: *{capital_str}*\n"
+        f"  • PnL текущей сессии: *{pnl_pct_str}*\n"
+        f"  • Win-rate: *{win_rate_str}*\n"
+        f"  • Закрытых сделок: *{trades_str}*\n"
+        f"  • Kelly engine: *{kelly_status}*\n"
+        f"  • Прошедших сессий: *{sessions_str}*\n\n"
+        
+        "🛠 *Tech*\n"
+        "Python 3.12 · asyncio · aiogram · OpenRouter / Cerebras / Groq / Mistral / "
+        "Together / Gemini · matplotlib · SQLite · Railway · GitHub-as-DB.\n\n"
+        
+        "🚀 *Попробуй сам*\n"
+        "  • `/daily` — полный AI-анализ + торговый план\n"
+        "  • `/autotrade_status` — performance dashboard\n"
+        "  • `/audit` — AI-аудит закрытых сделок\n"
+        "  • `/markets` — real-time контекст + сигналы\n\n"
+        
+        "📖 [Repo на GitHub](https://github.com/ANAEHY/dialectic_edge)"
+    )
+    return msg
+
+
+@dp.message(Command("pitch"))
+async def cmd_pitch(message: Message):
+    """Investor pitch — 1-message overview системы."""
+    try:
+        msg = _format_pitch_message()
+        await message.answer(msg, parse_mode="Markdown", disable_web_page_preview=True)
+    except Exception as e:
+        logger.exception("pitch error")
+        await message.answer(f"Ошибка: {e}")
 
 
 # ─── /admin ───────────────────────────────────────────────────────────────────
@@ -3629,6 +3820,7 @@ async def set_bot_commands(bot: Bot):
         BotCommand(command="autotrade_status", description="🎯 Status: PnL, win-rate, Kelly"),
         BotCommand(command="audit", description="📊 AI-аудит закрытых сделок"),
         BotCommand(command="usage", description="🔢 Расход токенов"),
+        BotCommand(command="pitch", description="💎 Investor pitch (1-pager)"),
     ]
     await bot.set_my_commands(commands)
 
