@@ -10,6 +10,7 @@ import asyncio
 import logging
 import os
 from datetime import datetime
+from pathlib import Path
 from typing import Optional, Tuple
 
 try:
@@ -1119,6 +1120,200 @@ async def cmd_signal_status(message: Message):
         await message.answer(msg, parse_mode="Markdown")
     except Exception as e:
         logger.error(f"signal_status error: {e}")
+        await message.answer(f"Ошибка: {e}")
+
+
+def _format_autotrade_status_embed(risk_summary: dict, status: dict) -> str:
+    """Красивый embed для /autotrade_status — performance + risk-state."""
+    drawdown = risk_summary.get("drawdown_pct", 0)
+    win_rate = risk_summary.get("win_rate", 0)
+    total = risk_summary.get("total_trades", 0)
+    wins = risk_summary.get("wins", 0)
+    losses = risk_summary.get("losses", 0)
+    avg_win = risk_summary.get("avg_win", 0)
+    avg_loss = risk_summary.get("avg_loss", 0)
+    kelly = risk_summary.get("kelly_pct", 0)
+    using_history = risk_summary.get("kelly_using_history", False)
+    target_vol = risk_summary.get("target_vol_pct", 3.0)
+    capital = risk_summary.get("current_capital", 0)
+    peak = risk_summary.get("peak_capital", 0)
+    total_pnl = risk_summary.get("total_pnl", 0)
+    
+    # R-ratio: avg_win / avg_loss
+    rr = (avg_win / avg_loss) if avg_loss else 0
+    # Expectancy в процентах: p*W - (1-p)*L
+    p = win_rate / 100
+    expectancy = (p * avg_win - (1 - p) * avg_loss) if total else 0
+    
+    # Sharpe-эквивалент (упрощённо: avg_pnl / std). На малых выборках ничего не считаем.
+    
+    msg = "🎯 *AUTOTRADE — STATUS*\n"
+    msg += "═" * 28 + "\n\n"
+    
+    # Capital
+    msg += "💰 *Капитал*\n"
+    msg += f"  Текущий: ${capital:,.2f}\n"
+    msg += f"  Peak: ${peak:,.2f}\n"
+    if drawdown > 0.1:
+        emoji = "🔴" if drawdown > 15 else "🟡"
+        msg += f"  {emoji} Drawdown: {drawdown:.1f}%\n"
+    else:
+        msg += f"  🟢 Drawdown: {drawdown:.1f}%\n"
+    msg += f"  Cumulative PnL: {total_pnl:+.2f}%\n\n"
+    
+    # Performance
+    msg += "📊 *Performance*\n"
+    if total == 0:
+        msg += "  _Нет закрытых сделок — нечего показать._\n"
+        msg += "  Откроется автоматически при первой закрытой сделке.\n\n"
+    else:
+        emoji = "🟢" if win_rate >= 50 else "🔴"
+        msg += f"  {emoji} Win-rate: {win_rate:.1f}% ({wins}W / {losses}L)\n"
+        msg += f"  Avg win: +{avg_win:.2f}%  |  Avg loss: -{avg_loss:.2f}%\n"
+        msg += f"  R-ratio: {rr:.2f}  |  Expectancy: {expectancy:+.2f}%\n\n"
+    
+    # Risk Engine
+    msg += "⚙️ *Risk Engine*\n"
+    if using_history:
+        msg += f"  🟢 Kelly активен (на реальной истории): {kelly:.2f}%\n"
+    else:
+        msg += f"  🟡 Kelly: bootstrap-режим (база {kelly:.2f}%)\n"
+        msg += f"  _Нужно ≥10 закрытых сделок для динамического Kelly._\n"
+    msg += f"  Target vol (vol-targeting): {target_vol:.1f}%\n\n"
+    
+    # Active positions
+    active = status.get("active_positions", []) or []
+    if active:
+        msg += f"📍 *Открытых позиций: {len(active)}*\n"
+        for pos in active[:5]:
+            msg += f"  • {pos['symbol']} {pos['direction']} @ ${pos.get('entry_price', 0):,.2f}\n"
+    else:
+        msg += "📭 Открытых позиций нет\n"
+    
+    return msg
+
+
+@dp.message(Command("autotrade_status"))
+async def cmd_autotrade_status(message: Message):
+    """Performance summary с Kelly, vol-targeting, drawdown, win-rate."""
+    try:
+        from signal_trader import get_signal_trader_status, _risk_manager
+        
+        status = await get_signal_trader_status()
+        risk_summary = _risk_manager.get_risk_summary()
+        msg = _format_autotrade_status_embed(risk_summary, status)
+        await message.answer(msg, parse_mode="Markdown")
+    except Exception as e:
+        logger.exception("autotrade_status error")
+        await message.answer(f"Ошибка: {e}")
+
+
+@dp.message(Command("audit"))
+async def cmd_audit(message: Message):
+    """AI self-audit — LLM смотрит на закрытые сделки за неделю и пишет review."""
+    try:
+        from core.audit import (
+            parse_recent_trades_from_md,
+            build_audit_prompt,
+            format_audit_for_telegram,
+        )
+        from signal_trader import _risk_manager
+        from ai_provider import AgentProvider
+        
+        # Парсим параметры: /audit или /audit 14
+        parts = (message.text or "").split()
+        days = 7
+        if len(parts) > 1:
+            try:
+                days = max(1, min(90, int(parts[1])))
+            except ValueError:
+                pass
+        period_str = f"{days} дней" if days != 7 else "неделю"
+        
+        backtest_path = Path(__file__).parent / "BACKTEST.md"
+        trades = parse_recent_trades_from_md(str(backtest_path), days=days)
+        
+        if not trades:
+            await message.answer(
+                f"📊 *AI Self-Audit ({period_str})*\n\n"
+                f"За {period_str} нет закрытых сделок — анализировать нечего.\n"
+                f"Откроется при первых закрытиях.",
+                parse_mode="Markdown",
+            )
+            return
+        
+        await message.answer(f"🔍 Анализирую {len(trades)} закрытых сделок за {period_str}…")
+        
+        risk_summary = _risk_manager.get_risk_summary()
+        prompt = build_audit_prompt(trades, risk_summary=risk_summary, period=period_str)
+        
+        # Используем verifier-роль (gpt-oss 120B по дефолту) — для аудита нужен
+        # точный, не bullish/bearish-агент.
+        provider = AgentProvider()
+        sys_msg = "Ты — risk officer количественного фонда. Отвечай по существу, на русском."
+        try:
+            audit_text = await provider.verifier(prompt=prompt, system=sys_msg, temperature=0.4)
+        except Exception as agent_err:
+            logger.warning(f"audit: verifier agent failed, fallback to synth: {agent_err}")
+            audit_text = await provider.synth(prompt=prompt, system=sys_msg, temperature=0.4)
+        
+        msg = format_audit_for_telegram(audit_text, len(trades), period_str)
+        await message.answer(msg, parse_mode="Markdown")
+    except Exception as e:
+        logger.exception("audit error")
+        await message.answer(f"Ошибка self-audit: {e}")
+
+
+@dp.message(Command("usage"))
+async def cmd_usage(message: Message):
+    """Token usage по провайдерам с момента последнего рестарта."""
+    try:
+        from ai_provider import get_usage_stats
+        
+        stats = get_usage_stats()
+        if not stats:
+            await message.answer(
+                "📊 *Token Usage*\n\nПока нет вызовов AI с момента старта."
+            )
+            return
+        
+        msg = "📊 *AI Token Usage* (с последнего рестарта)\n"
+        msg += "═" * 28 + "\n\n"
+        
+        # Сортируем по total_tokens DESC
+        providers_sorted = sorted(
+            stats.items(),
+            key=lambda kv: kv[1].get("total_tokens", 0),
+            reverse=True,
+        )
+        
+        grand_total_calls = 0
+        grand_total_tokens = 0
+        for provider, data in providers_sorted:
+            calls = data.get("calls", 0)
+            tt = data.get("total_tokens", 0)
+            pt = data.get("prompt_tokens", 0)
+            ct = data.get("completion_tokens", 0)
+            grand_total_calls += calls
+            grand_total_tokens += tt
+            
+            msg += f"*{provider}*: {calls} вызовов, {tt:,} tokens\n"
+            msg += f"  └ in: {pt:,} | out: {ct:,}\n"
+            
+            by_model = data.get("by_model", {})
+            if by_model and len(by_model) > 1:
+                # Несколько моделей — покажем их разбивку
+                for model, mdata in sorted(by_model.items(),
+                                            key=lambda kv: kv[1].get("total_tokens", 0),
+                                            reverse=True)[:3]:
+                    msg += f"    • `{model}`: {mdata.get('calls', 0)} calls, {mdata.get('total_tokens', 0):,} tok\n"
+        
+        msg += "\n" + "─" * 25 + "\n"
+        msg += f"*Итого:* {grand_total_calls} вызовов, {grand_total_tokens:,} tokens\n"
+        
+        await message.answer(msg, parse_mode="Markdown")
+    except Exception as e:
+        logger.exception("usage error")
         await message.answer(f"Ошибка: {e}")
 
 
@@ -3321,7 +3516,10 @@ async def cmd_help(message: Message):
         "• `/weeklyreport` — отчёт за неделю\n"
         "• `/subscribe on 08:00` — авторассылка\n"
         "• `/russia` — анализ для российского рынка 🇷🇺\n"
-        "• `/stats` — твоя статистика\n\n"
+        "• `/stats` — твоя статистика\n"
+        "• `/autotrade_status` — performance, win-rate, Kelly, vol-target 🎯\n"
+        "• `/audit [N дней]` — AI-аудит закрытых сделок 📊\n"
+        "• `/usage` — расход токенов по провайдерам\n\n"
         "⚠️ _Не финансовый совет. Будущее неизвестно никому._",
         parse_mode="Markdown"
     )
@@ -3402,6 +3600,9 @@ async def set_bot_commands(bot: Bot):
         BotCommand(command="russia", description="Анализ РФ 🇷🇺"),
         BotCommand(command="profile", description="Настройки профиля"),
         BotCommand(command="subscribe", description="Авторассылка"),
+        BotCommand(command="autotrade_status", description="🎯 Status: PnL, win-rate, Kelly"),
+        BotCommand(command="audit", description="📊 AI-аудит закрытых сделок"),
+        BotCommand(command="usage", description="🔢 Расход токенов"),
     ]
     await bot.set_my_commands(commands)
 

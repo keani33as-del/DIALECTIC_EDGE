@@ -97,6 +97,56 @@ CEREBRAS_URL     = "https://api.cerebras.ai/v1/chat/completions"
 # ── Трекинг моделей для честного лейбла в отчёте ─────────────────────────────
 MODELS_USED: dict = {}  # {"bull": "Mistral Small", "synth": "Mistral Large", ...}
 
+# ── Трекинг использования (токены / вызовы по провайдеру) ───────────────────
+# {provider_name: {"calls": int, "prompt_tokens": int, "completion_tokens": int,
+#                  "total_tokens": int, "by_model": {model: same dict}}}
+USAGE_STATS: dict = {}
+
+
+def _track_usage(provider: str, model: str, usage: dict | None):
+    """Запись usage data из API response. Безопасна к None/пустой usage."""
+    if not provider:
+        return
+    pt = int((usage or {}).get("prompt_tokens") or 0)
+    ct = int((usage or {}).get("completion_tokens") or 0)
+    tt = int((usage or {}).get("total_tokens") or (pt + ct))
+    
+    p = USAGE_STATS.setdefault(provider, {
+        "calls": 0, "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
+        "by_model": {},
+    })
+    p["calls"] += 1
+    p["prompt_tokens"] += pt
+    p["completion_tokens"] += ct
+    p["total_tokens"] += tt
+    
+    if model:
+        m = p["by_model"].setdefault(model, {
+            "calls": 0, "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
+        })
+        m["calls"] += 1
+        m["prompt_tokens"] += pt
+        m["completion_tokens"] += ct
+        m["total_tokens"] += tt
+
+
+def get_usage_stats() -> dict:
+    """Snapshot текущей статистики usage."""
+    return {
+        provider: {
+            "calls": data["calls"],
+            "prompt_tokens": data["prompt_tokens"],
+            "completion_tokens": data["completion_tokens"],
+            "total_tokens": data["total_tokens"],
+            "by_model": dict(data.get("by_model", {})),
+        }
+        for provider, data in USAGE_STATS.items()
+    }
+
+
+def reset_usage_stats() -> None:
+    USAGE_STATS.clear()
+
 def _track_model(agent_key: str, provider: str, model: str):
     labels = {
         "llama-3.1-70b":                                       "Cerebras/Llama 3.1 70B 🚀",
@@ -352,6 +402,10 @@ async def _call_openai_style(
                 err = await resp.text()
                 raise RuntimeError(f"{name} HTTP {resp.status}: {err[:300]}")
             data = await resp.json()
+            try:
+                _track_usage(name, model, data.get("usage"))
+            except Exception:
+                pass
             return data["choices"][0]["message"]["content"].strip()
 
 
