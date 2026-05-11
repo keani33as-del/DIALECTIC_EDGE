@@ -1887,6 +1887,12 @@ async def cmd_instruction(message: Message):
     await _send_detailed_guide(message.chat.id)
 
 
+@dp.message(Command("newbie"))
+async def cmd_newbie(message: Message):
+    """Гид для новичков — PDF + правила первой недели: /newbie"""
+    await _send_newbie_guide(message.chat.id)
+
+
 def _main_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📘 Инструкция", callback_data="cmd:guide")],
@@ -2131,6 +2137,125 @@ async def _send_detailed_guide(chat_id: int) -> None:
     await bot.send_message(chat_id, part2, parse_mode="Markdown")
 
 
+async def _send_newbie_guide(chat_id: int) -> None:
+    """Гид для трейдеров-новичков. PDF + 3 inline-сообщения с выжимкой.
+
+    Дополняет существующие _send_bot_guide / _send_detailed_guide:
+      * _send_bot_guide       — справочник команд бота
+      * _send_detailed_guide  — "как пятилетнему" объяснение функций
+      * _send_newbie_guide    — РУКОВОДСТВО ПО ТОРГОВЛЕ для новичков:
+                                когда запускать /daily, что НЕ делать
+                                (Futures!), какой горизонт, правила
+                                выживания первой недели, walkthrough сделки
+
+    Полная версия лежит в docs/BEGINNER_GUIDE.pdf — отправляется как файл.
+    """
+    pdf_path = Path(__file__).parent / "docs" / "BEGINNER_GUIDE.pdf"
+
+    # 1. PDF (полный гид на 10 страниц).
+    try:
+        if pdf_path.exists():
+            pdf_bytes = pdf_path.read_bytes()
+            await bot.send_document(
+                chat_id,
+                document=BufferedInputFile(pdf_bytes, filename="Dialectic_Edge_Beginner_Guide.pdf"),
+                caption=(
+                    "📘 *Гид для новичков — полная версия PDF*\n\n"
+                    "15-20 минут чтения. Скачай, прочти, перешли другу.\n"
+                    "Краткая выжимка идёт следующими сообщениями ↓"
+                ),
+                parse_mode="Markdown",
+            )
+        else:
+            logger.warning("BEGINNER_GUIDE.pdf not found at %s", pdf_path)
+    except Exception as e:
+        logger.error("send beginner guide PDF failed: %s", e)
+
+    # 2. Краткая выжимка, разбитая на 3 inline-сообщения.
+    part1 = (
+        "🆕 *ГИД ДЛЯ НОВИЧКОВ — ЧАСТЬ 1/3*\n"
+        + "═" * 28 + "\n\n"
+        "📌 *Этот гид — для тебя, если:*\n"
+        "• Никогда не торговал на бирже\n"
+        "• Хочешь использовать `/daily` для собственных сделок (без autotrade)\n"
+        "• Боишься слить депозит в первую неделю\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "⏰ *КОГДА ЗАПУСКАТЬ /daily*\n\n"
+        "👉 *09:00-10:00 МСК* — золотое время:\n"
+        "• Все ночные источники свежие (COT, CME, FinBERT, MVRV)\n"
+        "• London ещё не открылся (11:00) — есть 2 часа подумать\n"
+        "• Цены статичны, уровни не уехали\n"
+        "• Психологически удобно: кофе → дайджест → день начался\n\n"
+        "❌ *НЕ запускай в эти окна:*\n"
+        "• 11:00-13:00 МСК (London opening burst)\n"
+        "• 15:30 МСК в день US data (CPI/NFP)\n"
+        "• 16:30-17:30 МСК (US equity open, хаос)\n"
+        "• 21:00 МСК по средам FOMC weeks\n\n"
+        "📅 *Big news days — запускай ДВАЖДЫ:*\n"
+        "• CPI: середина месяца, 15:30 МСК\n"
+        "• NFP: первая пятница месяца, 15:30 МСК\n"
+        "• FOMC: раз в 6 недель, среда 21:00 МСК\n\n"
+        "Календарь: investing.com/economic-calendar\n"
+        "Фильтр: USA + High Importance."
+    )
+    await bot.send_message(chat_id, part1, parse_mode="Markdown")
+
+    part2 = (
+        "🆕 *ГИД ДЛЯ НОВИЧКОВ — ЧАСТЬ 2/3*\n"
+        + "═" * 28 + "\n\n"
+        "⚠️ *ТОЛЬКО SPOT — НИКАКИХ FUTURES*\n\n"
+        "У Бинанса 3 режима:\n"
+        "• ✅ *Spot* — покупаешь реальный BTC. Макс. потеря = 100%, медленно\n"
+        "• ❌ *Futures* — плечо. 10x → ликвидация за минуту. ВСЁ потеряешь.\n"
+        "• ❌ *Margin* — мягче чем фьючи, но всё равно опасно\n\n"
+        "*95% новичков сливают депо в первую неделю именно из-за Futures.*\n"
+        "Прячь от себя самого вкладки Margin/Futures.\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "📈 *КАКОЙ ГОРИЗОНТ ВЫБРАТЬ В БОТЕ*\n\n"
+        "При `/daily` бот предложит 3 варианта:\n\n"
+        "⚡ *Intraday (1-3 дня)*\n"
+        "Свечи 4h, стопы 2%, R/R 1:1.5\n"
+        "❌ НЕ для новичков — мониторинг каждые 4h, стопы вылетают на шуме\n\n"
+        "📈 *Swing (7-14 дней)* ← *БЕРИ ЭТО*\n"
+        "Свечи 1d, стопы 5%, R/R 1:2\n"
+        "✅ Дефолт бота, под него настроены все агенты\n"
+        "✅ Проверяешь раз в день, времени на размышление весь день\n\n"
+        "🏔 *Position (30+ дней)*\n"
+        "Свечи 1w, стопы 10%, R/R 1:3\n"
+        "❌ Для $50k+. Капитал заморожен, мало точек данных.\n\n"
+        "*Когда можно intraday?* После 10 закрытых swing-сделок с журналом."
+    )
+    await bot.send_message(chat_id, part2, parse_mode="Markdown")
+
+    part3 = (
+        "🆕 *ГИД ДЛЯ НОВИЧКОВ — ЧАСТЬ 3/3*\n"
+        + "═" * 28 + "\n\n"
+        "🛡 *7 ПРАВИЛ ВЫЖИВАНИЯ ПЕРВОЙ НЕДЕЛИ*\n\n"
+        "*1. Position size: МАКС 2% от депо за сделку*\n"
+        "$10K → 1 сделка = $200. Звучит мало — это правильно. Цель недели: выжить, не заработать.\n\n"
+        "*2. Stop loss В МОМЕНТ открытия*\n"
+        "Используй OCO order — одновременно ставит Stop Loss + Take Profit. Один сработал → второй отменяется.\n\n"
+        "*3. Только setup'ы где бот сказал BULLISH/BEARISH*\n"
+        "NEUTRAL = не торгуете. Точка. Это правило ломают 90% новичков.\n\n"
+        "*4. Максимум 1 открытая позиция в первую неделю*\n"
+        "Не «BTC long + SOL short + ETH long». Одна. Фокус, обдуманно.\n\n"
+        "*5. Жди ЗАКРЫТИЯ свечи за уровень*\n"
+        "Бот пишет: «не прокол хвостом — только закрытие». Алерт на TradingView → проверка дайджеста → вход.\n\n"
+        "*6. Trading journal в Google Sheet*\n"
+        "Дата, вердикт бота, причина входа, размер, стоп, результат %. Без журнала через месяц не докажешь edge.\n\n"
+        "*7. Не торгуй за час до новостей*\n"
+        "FOMC/CPI/NFP — рынок выносит произвольно.\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "🎯 *ИНВЕСТОРАМ ГОВОРИ ТАК:*\n"
+        "_«AI-аналитический ассистент. Решения принимаем мы. Цель первых 2 недель — calibration, не profit-max, понять win rate»._\n\n"
+        "*Честно, защищает от хайпа, даёт пространство учиться.*\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "⚠️ *Disclaimer:* это аналитический инструмент, не финансовый совет. Рынок непредсказуем. Дисциплина важнее анализа.\n\n"
+        "📘 Полная версия (10 страниц) в PDF ↑"
+    )
+    await bot.send_message(chat_id, part3, parse_mode="Markdown")
+
+
 class _CallbackMessageProxy:
     """Мини-адаптер, чтобы переиспользовать cmd_* хендлеры из inline-кнопок."""
 
@@ -2166,10 +2291,15 @@ async def handle_cmd_shortcuts(callback: CallbackQuery):
         "backtest": cmd_backtest,
         "guide": lambda m: _send_bot_guide(m.chat.id),
         "instruction": lambda m: _send_detailed_guide(m.chat.id),
+        "newbie": lambda m: _send_newbie_guide(m.chat.id),
     }
 
     if cmd == "guide":
         await _send_bot_guide(callback.from_user.id)
+        return
+
+    if cmd == "newbie":
+        await _send_newbie_guide(callback.from_user.id)
         return
 
     fn = mapping.get(cmd)
@@ -2193,14 +2323,19 @@ async def cmd_start(message: Message):
     # Карточка приветствия. Никаких списков команд — только 4 главных
     # action-кнопки. Юзер тыкает что хочет, инструкции для тех кто хочет
     # лежат под отдельной кнопкой.
+    # 🆕-кнопка вверху — для новичка. Открывает PDF + 3-частевую выжимку
+    # по торговой дисциплине (когда запускать /daily, только Spot, какой
+    # горизонт, правила выживания первой недели). Опытному пользователю
+    # можно сразу идти на «📊 Покажи прогноз сейчас» или ⚙️ Настройки.
     welcome_inline = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🆕 Я новичок — гид + PDF",  callback_data="cmd:newbie")],
         [InlineKeyboardButton(text="📊 Покажи прогноз сейчас", callback_data="cmd:daily")],
         [InlineKeyboardButton(text="🏛 Что на рынках сейчас", callback_data="cmd:markets")],
         [
             InlineKeyboardButton(text="💎 Что я умею",       callback_data="cmd:pitch"),
             InlineKeyboardButton(text="⚙️ Настройки",       callback_data="cmd:profile"),
         ],
-        [InlineKeyboardButton(text="📘 Полная инструкция",  callback_data="cmd:guide")],
+        [InlineKeyboardButton(text="📘 Команды бота",        callback_data="cmd:guide")],
     ])
 
     # Сначала отдельным сообщением «приклеиваем» постоянное меню снизу —
@@ -2216,6 +2351,10 @@ async def cmd_start(message: Message):
         "🧠 *Dialectic Edge* — честный AI-аналитик рынков.\n"
         "4 агента спорят на живых данных и выдают понятный план.\n\n"
         "🐂 Bull · 🐻 Bear · 🔍 Verifier · ⚖️ Synth\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "🆕 *Никогда не торговал?* Жми «Я новичок» — там PDF-гид + правила выживания первой недели.\n"
+        "📊 *Уже опытный?* Сразу «Покажи прогноз сейчас» → выбери горизонт (swing для большинства).\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
         "👇 *Тыкни что нужно:*",
         reply_markup=welcome_inline,
         parse_mode="Markdown",
@@ -4081,6 +4220,7 @@ async def set_bot_commands(bot: Bot):
         BotCommand(command="signalstatus", description="📊 Статус трейдера"),
         BotCommand(command="eval", description="📈 Валидация сигналов"),
         BotCommand(command="screener", description="📡 Сканер аномалий"),
+        BotCommand(command="newbie", description="🆕 Гид для новичков (PDF + правила)"),
         BotCommand(command="instruction", description="📖 Инструкция для чайников"),
         BotCommand(command="close", description="Закрыть позицию"),
         BotCommand(command="why", description="Почему открыта позиция"),
