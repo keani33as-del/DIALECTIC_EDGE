@@ -480,37 +480,51 @@ _COT_LEAK_INDICATORS_RU = (
 def _looks_like_cot_leak(text: str) -> bool:
     """Распознаёт chain-of-thought leak от агента.
     
-    Reasoning-модели (gpt-oss, Nemotron) иногда возвращают свои
+    Reasoning-модели (gpt-oss, Nemotron, MiniMax) иногда возвращают свои
     «мысли о том как ответить» прямо в content вместо reasoning_tokens.
     Это видно по характерным паттернам вначале и метатекстовому стилю.
     """
     if not text:
         return True
-    head = text.strip()[:600].lower()
+    stripped = text.strip()
+    head = stripped[:600].lower()
     if not head:
         return True
-    # Сильный сигнал — старт с meta-фраз и >150 символов английского
+    # Сильный сигнал — старт с meta-фраз («We need to produce...», «Let me think...»)
     starts_with_meta = any(head.startswith(p) for p in _COT_LEAK_PATTERNS)
-    # Считаем сколько meta-маркеров встречается
+    # Считаем сколько meta-маркеров встречается в первых 600 символах
     leak_count = sum(1 for p in _COT_LEAK_PATTERNS if p in head)
-    leak_count_ru = sum(1 for p in _COT_LEAK_INDICATORS_RU if p in text[:600])
-    # Признак что response — это нормальный структурированный output:
-    # есть кириллица + наш формат «• [Актив]» / «🐻 / 🐂 / FinBERT» и т.д.
-    has_structured_output = (
-        "FinBERT" in text or "Уверенность:" in text
-        or "Источник:" in text or "Мой вывод" in text
-        or "ВЕРДИКТ" in text or "СИГНАЛ" in text
-        or "Bear ✅" in text or "Bull ✅" in text
+    leak_count_ru = sum(1 for p in _COT_LEAK_INDICATORS_RU if p in stripped[:600])
+
+    # «Нормальный» выход реально начинается с одного из ожидаемых маркеров.
+    # Раньше мы доверяли простому факту «в тексте встречается FinBERT» —
+    # это ошибка: leak-текст сам пересказывает данные и тоже содержит слово
+    # FinBERT в своих рассуждениях. Поэтому смотрим именно как НАЧИНАЕТСЯ
+    # ответ. Если он не начинается со структурного маркера и стартует с
+    # meta-фразы — это leak, даже если ниже встречается «FinBERT».
+    first300 = stripped[:300]
+    starts_with_real_structure = (
+        first300.startswith("•")
+        or first300.startswith("-")
+        or first300.startswith("🐂") or first300.startswith("🐻")
+        or first300.startswith("🔍") or first300.startswith("⚖")
+        or first300.startswith("ШАГ") or first300.startswith("Шаг")
+        or first300.startswith("Bear говорит")
+        or first300.startswith("Bull говорит")
+        or first300.startswith("Мой вывод")
+        or first300.startswith("ВЕРДИКТ")
+        or "\n•" in first300[:200]   # bullet появляется в самом верху
+        or "Аргумент 1" in first300[:200]
     )
-    if has_structured_output and not starts_with_meta:
-        return False
-    # Старт с meta-фразы И отсутствие структуры → leak
-    if starts_with_meta and not has_structured_output:
+
+    # Старт с meta-фразы И отсутствие реальной структуры в самом начале → leak
+    if starts_with_meta and not starts_with_real_structure:
         return True
-    # Слишком много meta-маркеров (>=3) → leak даже без явного start
-    if leak_count >= 3 and not has_structured_output:
+    # Старт с meta-фразы по-русски + нет структуры → leak
+    if leak_count_ru >= 2 and not starts_with_real_structure:
         return True
-    if leak_count_ru >= 2 and not has_structured_output:
+    # Слишком много meta-маркеров (>=3) в первых 600 символах и нет структуры → leak
+    if leak_count >= 3 and not starts_with_real_structure:
         return True
     return False
 

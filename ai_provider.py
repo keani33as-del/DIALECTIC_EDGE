@@ -797,7 +797,14 @@ async def _call_for_agent(agent_key: str, prompt: str, system: str, temperature:
             except Exception as e2:
                 logger.warning(f"[{agent_key}] synth mistral-small ❌ {e2}")
 
-    skip_p = frozenset({config["provider"]} if config else [])
+    # Если primary был OpenRouter — НЕ блокируем весь провайдер: у юзера
+    # 12 ключей и есть альтернативные free-модели (Llama 3.3, Gemma, Gemini
+    # через OR). Сбой обычно модельный (rate-limit на конкретной модели),
+    # а не «весь OR лёг» — поэтому даём другим OR-моделям шанс.
+    if config and config.get("provider") == "openrouter":
+        skip_p = frozenset()
+    else:
+        skip_p = frozenset({config["provider"]} if config else [])
     return await _call_best_available(
         prompt, system, temperature, agent_key,
         skip_providers=skip_p,
@@ -813,12 +820,28 @@ async def _call_best_available(
     skip_providers: frozenset | None = None,
 ) -> str:
     """
-    Цепочка fallback: Cerebras → Groq → Mistral → OpenRouter → Together → Gemini
+    Цепочка fallback: OpenRouter (12 ключей!) → Cerebras → Groq → Mistral → Together → Gemini
+
+    Порядок раньше был Cerebras → Groq → ... → OpenRouter, но у юзера 12 OR-ключей
+    (= наибольшая ёмкость по запросам), а Cerebras всего один и часто упирается
+    в дневной лимит свободного тира. Поэтому OR в fallback'е сейчас первый.
+
     skip_providers — не вызывать тот же API повторно (primary уже отработал или упал).
     """
     skip = set(skip_providers or [])
 
     providers = []
+    # OpenRouter — приоритет №1: 12 ключей × несколько free-моделей даёт самую
+    # большую ёмкость. Llama 3.3 70B как самый стабильный из free-моделей.
+    if "openrouter" not in skip and _collect_openrouter_keys():
+        providers.append(("OpenRouter/Llama",
+            lambda p, s, t: _call_openrouter_llama(p, s, t, agent_key=agent_name)))
+        providers.append(("OpenRouter/Gemma",
+            lambda p, s, t: _call_openrouter_gemma(p, s, t, agent_key=agent_name)))
+        # Gemini через OpenRouter — лучше для Synth!
+        providers.append(("OpenRouter/Gemini",
+            lambda p, s, t: _call_openrouter_gemini(p, s, t, agent_key=agent_name)))
+
     if "cerebras" not in skip and CEREBRAS_API_KEY:
         providers.append(("Cerebras/Llama 3.3 70B",
             lambda p, s, t: _call_cerebras(p, s, t, agent_key=agent_name)))
@@ -830,15 +853,6 @@ async def _call_best_available(
     if "mistral" not in skip and (MISTRAL_API_KEY or MISTRAL_API_KEY_2):
         providers.append(("Mistral Small",
             lambda p, s, t: _call_mistral_throttled(p, s, t, agent_key=agent_name)))
-
-    if "openrouter" not in skip and _collect_openrouter_keys():
-        providers.append(("OpenRouter/Llama",
-            lambda p, s, t: _call_openrouter_llama(p, s, t, agent_key=agent_name)))
-        providers.append(("OpenRouter/Gemma",
-            lambda p, s, t: _call_openrouter_gemma(p, s, t, agent_key=agent_name)))
-        # Gemini через OpenRouter — лучше для Synth!
-        providers.append(("OpenRouter/Gemini",
-            lambda p, s, t: _call_openrouter_gemini(p, s, t, agent_key=agent_name)))
 
     if "together" not in skip and (TOGETHER_API_KEY or TOGETHER_API_KEY_2):
         providers.append(("Together/Llama",
