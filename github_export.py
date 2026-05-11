@@ -386,6 +386,43 @@ async def push_digest_cache(report: str, date_str: str, full_debates: str = "") 
     return success
 
 
+async def get_latest_digest_report() -> str:
+    """Возвращает ПОЛНЫЙ отчёт самого свежего дайджеста из DIGEST_CACHE.md.
+
+    Используется как «GitHub-backed» fallback для кнопки «🎯 Стратегия по
+    рынку» и навигации по раундам дебатов, когда Railway перезагрузил
+    контейнер (auto-commit market_cache.json → redeploy → in-memory
+    debate_cache + SQLite + cache.json все обнуляются). DIGEST_CACHE.md
+    на GitHub переживает любые рестарты, поэтому это последний и самый
+    надёжный источник свежего дайджеста.
+
+    Возвращает текст внутри `<details>📋 Полный отчёт</details>` для
+    самой свежей записи (entries[0] в формате push_digest_cache).
+    """
+    if not GITHUB_TOKEN:
+        return ""
+    content, _ = await _github_get(DIGEST_CACHE_FILE)
+    if not content:
+        return ""
+
+    entries = re.split(r"\n## 📊 ", content)
+    entries = [e.strip() for e in entries if e.strip() and not e.startswith("#")]
+    if not entries:
+        return ""
+
+    latest = entries[0]
+    # Внутри latest: summary + <details>📋 Полный отчёт</details> + <details>🗣 Все раунды дебатов</details>
+    # Полный отчёт уже содержит и summary, и raw-дебаты — берём его.
+    m = re.search(
+        r"<details><summary>📋 Полный отчёт[^<]*</summary>\s*\n\s*(.+?)\n\s*</details>",
+        latest, flags=re.DOTALL,
+    )
+    if m:
+        return m.group(1).strip()
+    # Fallback: если структура чуть отличается — возвращаем raw entry.
+    return latest
+
+
 async def get_previous_digest() -> str:
     """
     Возвращает предыдущий дайджест для передачи агентам.

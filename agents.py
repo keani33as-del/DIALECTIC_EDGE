@@ -590,7 +590,27 @@ class BaseAgent:
             caller   = getattr(ai, self.ai_method)
             response = await caller(prompt=prompt, system=self.system_prompt)
             # Защита от reasoning-моделей которые иногда сливают CoT
-            # в content вместо reasoning_tokens (gpt-oss, Nemotron).
+            # в content вместо reasoning_tokens (gpt-oss, Nemotron, MiniMax M2.5).
+            # Раньше при leak'е просто подменяли на placeholder («аргументов
+            # недостаточно») — Bull Round 1 у юзера улетал пустым. Теперь
+            # пробуем ОДИН retry с skip_primary=True: это пропустит OR-реасонер
+            # и пойдёт через Cerebras/Groq/Mistral (Llama 3.3 70B / qwen) —
+            # они не leak'ают CoT.
+            if _looks_like_cot_leak(response):
+                logger.warning(
+                    "[%s] primary CoT-leak, retry skip_primary=True. Head: %r",
+                    self.name, (response or "")[:200]
+                )
+                try:
+                    retry = await caller(
+                        prompt=prompt, system=self.system_prompt,
+                        skip_primary=True,
+                    )
+                    if not _looks_like_cot_leak(retry):
+                        return retry
+                    logger.warning("[%s] retry тоже leak — placeholder", self.name)
+                except Exception as retry_e:
+                    logger.warning("[%s] retry упал: %s", self.name, retry_e)
             return _sanitize_agent_response(response, self.name)
         except Exception as e:
             logger.error(f"Agent {self.name} error: {e}")
