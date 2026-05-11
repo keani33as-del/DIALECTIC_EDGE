@@ -780,8 +780,32 @@ async def _call_for_agent(
     config = AGENT_MODELS.get(agent_key)
 
     if skip_primary:
-        # Сразу в fallback на НЕ-OR провайдеры (Cerebras/Groq/Mistral) — их
-        # модели (Llama 3.3 70B на Cerebras/Groq, Mistral Small) не leak'ают CoT.
+        # Раньше тут было skip_providers={"openrouter"} — то есть при leak'е
+        # реасонера на OR (Nemotron 120B / gpt-oss / MiniMax) мы СРАЗУ
+        # уходили на Cerebras. Это слишком жёстко: на OR есть и не-leaking
+        # модели (Llama 3.3 70B, Gemma 4 31B), у юзера 12 OR-ключей,
+        # ёмкость огромная. Сейчас пробуем сначала non-reasoning OR-модели
+        # (Llama → Gemma 4 → Gemini), и только если ВСЕ они упали или
+        # тоже leakнули — идём в Cerebras/Groq/Mistral.
+        try:
+            return await _call_openrouter_llama(
+                prompt, system, temperature, agent_key=agent_key
+            )
+        except Exception as e:
+            logger.warning("[%s] retry OR/Llama ❌ %s", agent_key, str(e)[:120])
+        try:
+            return await _call_openrouter_gemma(
+                prompt, system, temperature, agent_key=agent_key
+            )
+        except Exception as e:
+            logger.warning("[%s] retry OR/Gemma 4 ❌ %s", agent_key, str(e)[:120])
+        try:
+            return await _call_openrouter_gemini(
+                prompt, system, temperature, agent_key=agent_key
+            )
+        except Exception as e:
+            logger.warning("[%s] retry OR/Gemini ❌ %s", agent_key, str(e)[:120])
+        # Все OR-альтернативы упали — идём на не-OR провайдеры.
         return await _call_best_available(
             prompt, system, temperature, agent_key,
             skip_providers=frozenset({"openrouter"}),
