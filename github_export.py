@@ -30,16 +30,32 @@ DIGEST_CACHE_FILE = "DIGEST_CACHE.md"
 BACKTEST_FILE = "BACKTEST.md"
 MARKET_CACHE_FILE = "MARKET_CACHE.md"
 
+# Все runtime-данные (трек-рекорд / дайджест / market cache / backtest) пишем в
+# ОТДЕЛЬНУЮ ветку, которую Railway НЕ слушает. Railway по умолчанию редеплоится
+# на любой push в master — а у нас market_cache пушится каждые 20 минут,
+# DIGEST_CACHE — после каждого /daily. Это убивало контейнер посередине анализа
+# (SIGTERM в логах после market_cache push). Изолировав data-пуши в отдельной
+# ветке, мы получаем: master = только код → редеплой только когда катим
+# фичу/фикс; data/market-cache = данные → накопление истории без рестартов.
+# Ветка создаётся вручную (один раз) из master, дальше — auto-managed ботом.
+DATA_BRANCH = os.getenv("GITHUB_DATA_BRANCH", "data/market-cache")
+
 TIMEOUT = aiohttp.ClientTimeout(total=15)
 
 
 # ─── Утилиты GitHub API ───────────────────────────────────────────────────────
 
-async def _github_get(path: str) -> tuple[str, str | None]:
-    """Читает файл из GitHub. Возвращает (content, sha)."""
+async def _github_get(path: str, branch: str | None = None) -> tuple[str, str | None]:
+    """Читает файл из GitHub. Возвращает (content, sha).
+
+    branch=None → читает с default-ветки (master). Передай DATA_BRANCH чтобы
+    читать из ветки с runtime-данными (она не триггерит Railway редеплой).
+    """
     if not GITHUB_TOKEN:
         return "", None
     url     = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{path}"
+    if branch:
+        url += f"?ref={branch}"
     headers = {"Authorization": f"token {GITHUB_TOKEN}",
                "Accept": "application/vnd.github.v3+json"}
     try:
@@ -57,8 +73,14 @@ async def _github_get(path: str) -> tuple[str, str | None]:
     return "", None
 
 
-async def _github_put(path: str, content: str, sha: str | None, message: str) -> bool:
-    """Записывает файл на GitHub. При 409 (SHA конфликт) — перечитывает SHA и повторяет."""
+async def _github_put(path: str, content: str, sha: str | None, message: str,
+                      branch: str | None = None) -> bool:
+    """Записывает файл на GitHub. При 409 (SHA конфликт) — перечитывает SHA и повторяет.
+
+    branch=None → пушит в default-ветку (master), что триггерит Railway редеплой.
+    Передай DATA_BRANCH ("data/market-cache") чтобы push не вызывал редеплой —
+    Railway не слушает эту ветку.
+    """
     if not GITHUB_TOKEN:
         logger.warning("GITHUB_TOKEN не задан — экспорт пропущен")
         return False
@@ -69,9 +91,9 @@ async def _github_put(path: str, content: str, sha: str | None, message: str) ->
 
     # Пробуем до 3 раз при конфликте SHA
     for attempt in range(3):
-        # При повторе — перечитываем актуальный SHA
+        # При повторе — перечитываем актуальный SHA из той же ветки
         if attempt > 0:
-            _, sha = await _github_get(path)
+            _, sha = await _github_get(path, branch=branch)
             await asyncio.sleep(1 * attempt)
 
         payload = {
@@ -80,6 +102,8 @@ async def _github_put(path: str, content: str, sha: str | None, message: str) ->
         }
         if sha:
             payload["sha"] = sha
+        if branch:
+            payload["branch"] = branch
 
         try:
             async with aiohttp.ClientSession() as s:
@@ -209,10 +233,11 @@ async def generate_forecasts_md() -> str:
 async def export_to_github() -> bool:
     logger.info("📤 Экспорт прогнозов на GitHub...")
     content = await generate_forecasts_md()
-    _, sha  = await _github_get(FORECASTS_FILE)
+    _, sha  = await _github_get(FORECASTS_FILE, branch=DATA_BRANCH)
     success = await _github_put(
         FORECASTS_FILE, content, sha,
-        f"📊 Update track record {datetime.now().strftime('%Y-%m-%d %H:%M')} [skip ci]"
+        f"📊 Update track record {datetime.now().strftime('%Y-%m-%d %H:%M')} [skip ci]",
+        branch=DATA_BRANCH,
     )
     if success:
         logger.info("✅ FORECASTS.md обновлён на GitHub")
@@ -335,7 +360,7 @@ async def push_digest_cache(report: str, date_str: str, full_debates: str = "") 
     if not GITHUB_TOKEN:
         return False
 
-    current_content, sha = await _github_get(DIGEST_CACHE_FILE)
+    current_content, sha = await _github_get(DIGEST_CACHE_FILE, branch=DATA_BRANCH)
 
     digest_context = build_digest_context(report)
     summary_block = format_digest_cache_summary(digest_context, max_plans=5)
@@ -379,7 +404,8 @@ async def push_digest_cache(report: str, date_str: str, full_debates: str = "") 
 
     success = await _github_put(
         DIGEST_CACHE_FILE, full_content, sha,
-        f"📊 Digest {date_str} [skip ci]"
+        f"📊 Digest {date_str} [skip ci]",
+        branch=DATA_BRANCH,
     )
     if success:
         logger.info("✅ Дайджест закэширован на GitHub")
@@ -401,9 +427,13 @@ async def get_latest_digest_report() -> str:
     """
     if not GITHUB_TOKEN:
         return ""
-    content, _ = await _github_get(DIGEST_CACHE_FILE)
+    content, _ = await _github_get(DIGEST_CACHE_FILE, branch=DATA_BRANCH)
     if not content:
-        return ""
+        # Fallback: вдруг это старый деплой без data-ветки — читаем из master
+        # (там лежат исторические записи до миграции).
+        content, _ = await _github_get(DIGEST_CACHE_FILE)
+        if not content:
+            return ""
 
     entries = re.split(r"\n## 📊 ", content)
     entries = [e.strip() for e in entries if e.strip() and not e.startswith("#")]
@@ -430,9 +460,12 @@ async def get_previous_digest() -> str:
     """
     if not GITHUB_TOKEN:
         return ""
-    content, _ = await _github_get(DIGEST_CACHE_FILE)
+    content, _ = await _github_get(DIGEST_CACHE_FILE, branch=DATA_BRANCH)
     if not content:
-        return ""
+        # Fallback на master для исторических записей до миграции.
+        content, _ = await _github_get(DIGEST_CACHE_FILE)
+        if not content:
+            return ""
 
     # Берём второй по счёту дайджест (первый — текущий который только что добавили)
     entries = re.split(r"\n## 📊 ", content)
@@ -518,10 +551,11 @@ async def export_backtest_to_github(signals: list[dict], stats: dict, config: di
     
     content = "\n".join(lines)
     
-    _, sha = await _github_get(BACKTEST_FILE)
+    _, sha = await _github_get(BACKTEST_FILE, branch=DATA_BRANCH)
     success = await _github_put(
         BACKTEST_FILE, content, sha,
-        f"📊 Update backtest {datetime.now().strftime('%Y-%m-%d %H:%M')} [skip ci]"
+        f"📊 Update backtest {datetime.now().strftime('%Y-%m-%d %H:%M')} [skip ci]",
+        branch=DATA_BRANCH,
     )
     
     if success:
@@ -560,7 +594,7 @@ async def save_market_cache(
     if not GITHUB_TOKEN:
         return False
 
-    content, sha = await _github_get(MARKET_CACHE_FILE)
+    content, sha = await _github_get(MARKET_CACHE_FILE, branch=DATA_BRANCH)
 
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
     
@@ -594,7 +628,8 @@ async def save_market_cache(
 
     success = await _github_put(
         MARKET_CACHE_FILE, full_content, sha,
-        f"📦 Update market cache {now} [skip ci]"
+        f"📦 Update market cache {now} [skip ci]",
+        branch=DATA_BRANCH,
     )
     if success:
         logger.info(f"✅ MARKET_CACHE.md saved (MVRV={mvrv:.2f}, score={total_score:+d})")
@@ -611,9 +646,12 @@ async def get_market_cache() -> tuple[dict, bool]:
     if not GITHUB_TOKEN:
         return {}, False
 
-    content, _ = await _github_get(MARKET_CACHE_FILE)
+    content, _ = await _github_get(MARKET_CACHE_FILE, branch=DATA_BRANCH)
     if not content:
-        return {}, False
+        # Fallback на master для старых деплоев.
+        content, _ = await _github_get(MARKET_CACHE_FILE)
+        if not content:
+            return {}, False
 
     cache = {}
 

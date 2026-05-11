@@ -62,8 +62,10 @@ class AdminHandler:
         
         # GitHub connection check
         try:
-            from github_export import _github_get, DIGEST_CACHE_FILE
-            content, sha = await _github_get(DIGEST_CACHE_FILE)
+            from github_export import _github_get, DIGEST_CACHE_FILE, DATA_BRANCH
+            content, sha = await _github_get(DIGEST_CACHE_FILE, branch=DATA_BRANCH)
+            if not content:
+                content, sha = await _github_get(DIGEST_CACHE_FILE)
             if content:
                 checks.append("🟢 GitHub connection — OK")
             else:
@@ -77,8 +79,10 @@ class AdminHandler:
         from datetime import datetime, timedelta
         last_digest = "неизвестно"
         try:
-            from github_export import _github_get, DIGEST_CACHE_FILE
-            content, _ = await _github_get(DIGEST_CACHE_FILE)
+            from github_export import _github_get, DIGEST_CACHE_FILE, DATA_BRANCH
+            content, _ = await _github_get(DIGEST_CACHE_FILE, branch=DATA_BRANCH)
+            if not content:
+                content, _ = await _github_get(DIGEST_CACHE_FILE)
             if content:
                 time_m = re.search(r"## (\d{4}-\d{2}-\d{2} \d{2}:\d{2})", content)
                 if time_m:
