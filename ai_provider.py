@@ -443,7 +443,23 @@ async def _call_openai_style(
                 _track_usage(name, model, data.get("usage"))
             except Exception:
                 pass
-            return data["choices"][0]["message"]["content"].strip()
+            # Защитный разбор: MiniMax/некоторые OR-модели могут вернуть
+            # 200 OK с {"choices": []} или {"choices": [{"message": {"content": null}}]}.
+            # Раньше это крашилось как 'NoneType' object has no attribute 'strip' и
+            # сжигало ключ из очереди впустую. Теперь явный RuntimeError → fallback
+            # на следующий ключ/провайдер.
+            choices = data.get("choices") or []
+            if not choices:
+                raise RuntimeError(
+                    f"{name} no choices in response. Raw: {str(data)[:300]}"
+                )
+            msg = choices[0].get("message") or {}
+            content = msg.get("content")
+            if not content:
+                raise RuntimeError(
+                    f"{name} empty content. Raw: {str(data)[:300]}"
+                )
+            return content.strip()
 
 
 # ── Провайдеры ────────────────────────────────────────────────────────────────

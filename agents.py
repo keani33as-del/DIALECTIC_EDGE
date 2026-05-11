@@ -375,6 +375,19 @@ SYNTH_BASE_SYSTEM = """
 - "rr" — строка вида "1:2" / "1:1.5" / "1:3"
 - "size" — строка вида "10%" (доля депо)
 
+🚨 НАПРАВЛЕНИЕ — НИКАКОГО КОНТРАРИАНА:
+Мы НЕ играем «все полезли в лонг → шортим». Направление сделки всегда совпадает
+с движением цены, по которому открывается триггер:
+    ✅ пробой/закрытие ВВЕРХ выше уровня → LONG (или CASH с флипом в LONG)
+    ✅ пробой/закрытие ВНИЗ ниже уровня → SHORT (или CASH с флипом в SHORT)
+    ❌ "пробой $X вверх → SHORT" — ЭТО ИНВЕРСИЯ, ЗАПРЕЩЕНО
+    ❌ "пробой $Y вниз → LONG" — ЭТО ИНВЕРСИЯ, ЗАПРЕЩЕНО
+В key_trigger и invalidation НЕ указывай LONG/SHORT ярлыки вообще — пиши только
+price-event («пробой $82000 вверх», «закрытие ниже $77000»). Направление сделки
+рендерится только из plans[].direction, и валидируется отдельно. Если выдашь
+инверсию — пост-валидатор автоматически снимет ярлыки, но логирует это как
+галлюцинацию модели.
+
 WATCH (наблюдение, НЕ план):
 - watch — массив объектов {"symbol", "level", "note"} (max 4)
 - Сюда идут уровни, по которым нет однозначного направления — «$X важный, дождёмся резолюции»
@@ -850,6 +863,75 @@ def _is_bidirectional_trigger(text: str) -> bool:
     return has_up and has_down and has_or
 
 
+# Инверсия направления — Synth (особенно reasoning-модели) иногда выдаёт
+# контрарианский трейд-план: «пробой $X вверх → SHORT» или «пробой $Y вниз →
+# LONG». Это почти всегда галлюцинация: пробой ВВЕРХ = bullish breakout =
+# LONG-сторона, пробой ВНИЗ = bearish breakdown = SHORT-сторона. Контрарианская
+# логика «все полезли в лонг → шорти» в нашей системе НЕ предусмотрена —
+# направление сделки выражается через plans[].direction, не через текстовые
+# подсказки в key_trigger/invalidation. Поэтому при детекте инверсии мы
+# вычищаем direction-ярлыки целиком — Telegram-юзер видит чистый price-event,
+# а direction берёт из блока «📋 ТОРГОВЫЙ ПЛАН».
+_DIRECTION_INVERSION_PATTERNS = [
+    # up-движение → SHORT (классическая инверсия)
+    (re.compile(
+        r"(?:пробой|закрытие|breakout|break\s+up|тест|ретест|касание)?"
+        r"[^.\n]{0,40}?"
+        r"(?:вверх|выше|сверху|above|up)"
+        r"[^.\n]{0,40}?"
+        r"\b(?:short|шорт)\b",
+        re.IGNORECASE,
+    ), "up→SHORT"),
+    # down-движение → LONG (классическая инверсия)
+    (re.compile(
+        r"(?:пробой|закрытие|breakdown|break\s+down|тест|ретест|касание)?"
+        r"[^.\n]{0,40}?"
+        r"(?:вниз|ниже|снизу|below|down)"
+        r"[^.\n]{0,40}?"
+        r"\b(?:long|лонг)\b",
+        re.IGNORECASE,
+    ), "down→LONG"),
+]
+
+# Удаляет «(LONG)», «(переключение в SHORT)», «→ LONG» и т.п. — все формы
+# direction-ярлыков, прикреплённых к price-event в свободном тексте.
+_DIRECTION_TAG_RE = re.compile(
+    r"\s*(?:"
+    r"[\(\[]\s*(?:переключение\s+в\s+|switch\s+to\s+)?(?:LONG|SHORT|long|short|лонг|шорт)\s*[\)\]]"
+    r"|\s*[→\-—]+\s*(?:LONG|SHORT|long|short|лонг|шорт)\b"
+    r"|\s*\bпереключение\s+в\s+(?:LONG|SHORT|long|short|лонг|шорт)\b"
+    r"|\s*\bswitch\s+to\s+(?:LONG|SHORT|long|short|лонг|шорт)\b"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _sanitize_trigger_direction(text: str, field_name: str = "") -> str:
+    """Снимает LONG/SHORT-ярлыки из key_trigger / invalidation если детектируется
+    инверсия (см. _DIRECTION_INVERSION_PATTERNS). Логирует warning для
+    мониторинга качества Synth-модели.
+
+    Trade direction в нашей системе живёт ТОЛЬКО в plans[].direction, который
+    проходит геометрическую валидацию. Текстовые ярлыки в свободных полях
+    либо избыточны, либо опасно противоречивы — снимаем превентивно при
+    обнаружении инверсии.
+    """
+    if not text:
+        return text
+    for pat, label in _DIRECTION_INVERSION_PATTERNS:
+        if pat.search(text):
+            logger.warning(
+                f"[PLAN-GUARD] Inverted direction hint in {field_name or 'trigger'} "
+                f"({label}). Stripping LONG/SHORT tags. raw={text[:200]!r}"
+            )
+            cleaned = _DIRECTION_TAG_RE.sub("", text).strip()
+            # Прибираем лишние пробелы и хвостовые разделители после стрипа.
+            cleaned = re.sub(r"\s+", " ", cleaned)
+            cleaned = re.sub(r"\s*[,;:.—\-]\s*$", "", cleaned).strip()
+            return cleaned
+    return text
+
+
 def _is_vague_trigger(text: str) -> bool:
     """True если триггер не содержит конкретного уровня/события — типа
     «ожидание коррекции SPY/нефти». Без числа и без чёткого события
@@ -934,6 +1016,11 @@ def _render_trade_plan_from_json(
     raw_watch = data.get("watch") or []
     key_trigger = _strip_field_lead(data.get("key_trigger", ""))
     invalidation = _strip_field_lead(data.get("invalidation", ""))
+    # Анти-инверсия: если Synth написал «пробой вверх → SHORT» / «вниз → LONG»
+    # — снимаем direction-ярлыки. Юзер видит price-event без противоречивых
+    # подсказок, направление берёт из блока «ТОРГОВЫЙ ПЛАН» (plans[].direction).
+    key_trigger = _sanitize_trigger_direction(key_trigger, "key_trigger")
+    invalidation = _sanitize_trigger_direction(invalidation, "invalidation")
     # Synth-модель иногда повторяет имя ключа в значении: ":SPY перекуплен" /
     # "simple: SPY перекуплен". Снимаем оба варианта (двоеточие + повтор поля).
     simple = _strip_field_lead(data.get("simple", ""))
