@@ -554,7 +554,7 @@ def _append_signal_follow_candidates(
 
 async def _export_backtest_snapshot():
     try:
-        from github_export import _github_get, _github_put, BACKTEST_FILE
+        from github_export import _github_get, _github_put, BACKTEST_FILE, DATA_BRANCH
         from datetime import datetime
 
         signals = await get_backtest_signals()
@@ -564,10 +564,11 @@ async def _export_backtest_snapshot():
         # Use session manager to format BACKTEST.md
         content = session_manager.format_backtest_md(signals, stats, config)
 
-        _, sha = await _github_get(BACKTEST_FILE)
+        _, sha = await _github_get(BACKTEST_FILE, branch=DATA_BRANCH)
         await _github_put(
             BACKTEST_FILE, content, sha,
-            f"📊 Update backtest {datetime.now().strftime('%Y-%m-%d %H:%M')} [skip ci]"
+            f"📊 Update backtest {datetime.now().strftime('%Y-%m-%d %H:%M')} [skip ci]",
+            branch=DATA_BRANCH,
         )
         logger.info("✅ BACKTEST.md updated on GitHub")
     except Exception as e:
@@ -1246,8 +1247,11 @@ async def _check_and_trade_locked(bot, admin_ids: list[int]) -> list[dict]:
     # Load session state from BACKTEST.md on first run
     if not session_manager._loaded:
         try:
-            from github_export import _github_get, BACKTEST_FILE
-            backtest_content, _ = await _github_get(BACKTEST_FILE)
+            from github_export import _github_get, BACKTEST_FILE, DATA_BRANCH
+            backtest_content, _ = await _github_get(BACKTEST_FILE, branch=DATA_BRANCH)
+            if not backtest_content:
+                # Fallback на master для старых деплоев.
+                backtest_content, _ = await _github_get(BACKTEST_FILE)
             if backtest_content:
                 session_manager._load_from_backtest(backtest_content)
         except Exception as e:
@@ -1277,8 +1281,10 @@ async def _check_and_trade_locked(bot, admin_ids: list[int]) -> list[dict]:
     import re as _re
     gh_open_positions = []
     try:
-        from github_export import _github_get, BACKTEST_FILE
-        bt_content, _ = await _github_get(BACKTEST_FILE)
+        from github_export import _github_get, BACKTEST_FILE, DATA_BRANCH
+        bt_content, _ = await _github_get(BACKTEST_FILE, branch=DATA_BRANCH)
+        if not bt_content:
+            bt_content, _ = await _github_get(BACKTEST_FILE)
         if bt_content:
             # Капитал из GitHub
             cap_m = _re.search(r'Текущий:\s*\*\*\$([\d,\.]+)\*\*', bt_content)
@@ -1797,8 +1803,10 @@ async def get_signal_trader_status() -> dict:
 
     # Загружаем состояние из GitHub BACKTEST.md (надёжнее SQLite на Railway)
     try:
-        from github_export import _github_get, BACKTEST_FILE
-        backtest_content, _ = await _github_get(BACKTEST_FILE)
+        from github_export import _github_get, BACKTEST_FILE, DATA_BRANCH
+        backtest_content, _ = await _github_get(BACKTEST_FILE, branch=DATA_BRANCH)
+        if not backtest_content:
+            backtest_content, _ = await _github_get(BACKTEST_FILE)
         if backtest_content:
             import re
 
@@ -1854,8 +1862,10 @@ async def get_signal_trader_status() -> dict:
     contexts = await get_recent_daily_contexts(limit=RECENT_CONTEXT_LIMIT, max_age_hours=None)
     if not contexts:
         try:
-            from github_export import _github_get, DIGEST_CACHE_FILE
-            digest_content, _ = await _github_get(DIGEST_CACHE_FILE)
+            from github_export import _github_get, DIGEST_CACHE_FILE, DATA_BRANCH
+            digest_content, _ = await _github_get(DIGEST_CACHE_FILE, branch=DATA_BRANCH)
+            if not digest_content:
+                digest_content, _ = await _github_get(DIGEST_CACHE_FILE)
             if digest_content:
                 import re
                 for match in re.finditer(r'## 📊 (\d{2}\.\d{2}\.\d{4})', digest_content):

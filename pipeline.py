@@ -91,8 +91,11 @@ async def _load_signals_from_digest_cache(limit: int = 20) -> list[Signal]:
     """
     signals = []
     try:
-        from github_export import _github_get, DIGEST_CACHE_FILE
-        content, _ = await _github_get(DIGEST_CACHE_FILE)
+        from github_export import _github_get, DIGEST_CACHE_FILE, DATA_BRANCH
+        content, _ = await _github_get(DIGEST_CACHE_FILE, branch=DATA_BRANCH)
+        if not content:
+            # Fallback на master для старых деплоев.
+            content, _ = await _github_get(DIGEST_CACHE_FILE)
         if not content:
             return signals
 
