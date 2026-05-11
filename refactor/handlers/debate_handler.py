@@ -69,6 +69,23 @@ class DebateHandler:
             cached = _storage.get_cached_report()
             report = cached.get("report") if cached else None
         if not report:
+            # Последний шанс — GitHub. На Railway без volume (default) после
+            # auto-commit market_cache → редеплой → in-memory + SQLite +
+            # cache.json все вайпятся. Но DIGEST_CACHE.md на GitHub переживает
+            # любой рестарт: каждый /daily пушит туда полный отчёт. Берём
+            # самую свежую запись и реконструируем дебат из неё. Юзер
+            # получает «🎯 Стратегия» даже после рестарта.
+            try:
+                from github_export import get_latest_digest_report
+                report = await get_latest_digest_report()
+                if report:
+                    logger.info(
+                        "[debate] восстановили из GitHub (Railway redeploy?) user=%s",
+                        user_id,
+                    )
+            except Exception as exc:
+                logger.warning("github fallback failed: %s", exc)
+        if not report:
             return None
 
         hydrated = hydrate_debate_from_report(report)

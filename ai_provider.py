@@ -191,12 +191,13 @@ def _track_model(agent_key: str, provider: str, model: str):
         "llama-3.3-70b-versatile":                              "Groq/Llama 3.3 70B",
         "meta-llama/llama-3.3-70b-instruct:free":               "OpenRouter/Llama 3.3 70B",
         "google/gemma-3-27b-it:free":                           "OpenRouter/Gemma 3 27B",
+        "google/gemma-4-31b-it:free":                           "OpenRouter/Gemma 4 31B",
+        "openai/gpt-oss-20b:free":                              "OpenRouter/gpt-oss 20B",
         # Free-tier подборка для дебатов (PR /openrouter-free-models):
         "nvidia/nemotron-3-super-120b-a12b:free":               "OpenRouter/Nemotron 3 Super 120B",
         "minimax/minimax-m2.5:free":                            "OpenRouter/MiniMax M2.5",
         "openai/gpt-oss-120b:free":                             "OpenRouter/gpt-oss 120B",
         "inclusionai/ring-2.6-1t:free":                         "OpenRouter/Ring 2.6 1T 🧠",
-        "google/gemma-4-31b-it:free":                           "OpenRouter/Gemma 4 31B",
         "qwen/qwen3-next-80b-a3b-instruct:free":                "OpenRouter/Qwen3 Next 80B",
     }
     label = labels.get(model, f"{provider}/{model}")
@@ -629,9 +630,23 @@ async def _call_openrouter_llama(prompt: str, system: str, temperature: float,
 
 async def _call_openrouter_gemma(prompt: str, system: str, temperature: float,
                                   agent_key: str = None) -> str:
+    # Gemma 3 27b на OR с 11.05.2026 возвращает 404 "No endpoints found" —
+    # перешли на Gemma 4 31b:free (живая, 262k контекст).
     return await _call_openrouter_model(
         prompt, system, temperature,
-        "google/gemma-3-27b-it:free",
+        "google/gemma-4-31b-it:free",
+        agent_key,
+    )
+
+
+async def _call_openrouter_gpt_oss_20b(prompt: str, system: str, temperature: float,
+                                        agent_key: str = None) -> str:
+    # gpt-oss-20b — облегчённая версия 120B. Меньше рейт-лимитов на upstream,
+    # тот же стиль ответа. Используем как ещё один free-вариант когда Llama
+    # упёрлась в upstream rate-limit (Venice провайдер).
+    return await _call_openrouter_model(
+        prompt, system, temperature,
+        "openai/gpt-oss-20b:free",
         agent_key,
     )
 
@@ -745,8 +760,32 @@ async def _call_mistral_throttled(prompt: str, system: str, temperature: float,
 
 # ── Роутер ────────────────────────────────────────────────────────────────────
 
-async def _call_for_agent(agent_key: str, prompt: str, system: str, temperature: float) -> str:
+async def _call_for_agent(
+    agent_key: str,
+    prompt: str,
+    system: str,
+    temperature: float,
+    *,
+    skip_primary: bool = False,
+) -> str:
+    """Получить ответ от агента (bull/bear/verifier/synth).
+
+    skip_primary=True пропускает первичную модель из AGENT_MODELS и
+    сразу идёт в _call_best_available. Полезно при retry после CoT-leak'а:
+    первичная reasoning-модель (Nemotron/gpt-oss/MiniMax) вернула свои
+    «мысли» вместо ответа → нужно взять другую модель без повтора той же.
+    При skip_primary=True также скипаем openrouter в fallback'е (большинство
+    leak'ов приходит от OR reasoning-моделей).
+    """
     config = AGENT_MODELS.get(agent_key)
+
+    if skip_primary:
+        # Сразу в fallback на НЕ-OR провайдеры (Cerebras/Groq/Mistral) — их
+        # модели (Llama 3.3 70B на Cerebras/Groq, Mistral Small) не leak'ают CoT.
+        return await _call_best_available(
+            prompt, system, temperature, agent_key,
+            skip_providers=frozenset({"openrouter"}),
+        )
 
     if config:
         provider = config["provider"]
@@ -834,11 +873,21 @@ async def _call_best_available(
     # OpenRouter — приоритет №1: 12 ключей × несколько free-моделей даёт самую
     # большую ёмкость. Llama 3.3 70B как самый стабильный из free-моделей.
     if "openrouter" not in skip and _collect_openrouter_keys():
+        # Free-tier OR-модели рейт-лимитятся UPSTREAM (Venice/Llama, например).
+        # Когда Llama 3.3 в апстриме упирается в лимит — 12 наших ключей это
+        # не починят (это global cap у провайдера, не per-key). Поэтому даём
+        # сразу несколько разных upstream'ов: Llama (Venice) → Gemma 4
+        # (Google) → gpt-oss 20b (OpenAI-самобэкэнд) → Gemini-paid. При лимите
+        # на одной модели соседняя обычно ещё жива.
         providers.append(("OpenRouter/Llama",
             lambda p, s, t: _call_openrouter_llama(p, s, t, agent_key=agent_name)))
         providers.append(("OpenRouter/Gemma",
             lambda p, s, t: _call_openrouter_gemma(p, s, t, agent_key=agent_name)))
-        # Gemini через OpenRouter — лучше для Synth!
+        providers.append(("OpenRouter/gpt-oss-20b",
+            lambda p, s, t: _call_openrouter_gpt_oss_20b(p, s, t, agent_key=agent_name)))
+        # Gemini через OpenRouter — платная (но дешёвая) и почти никогда не
+        # упирается в лимит. Идёт ПОСЛЕ free-моделей, чтобы не жечь кредиты
+        # без нужды.
         providers.append(("OpenRouter/Gemini",
             lambda p, s, t: _call_openrouter_gemini(p, s, t, agent_key=agent_name)))
 
@@ -882,21 +931,25 @@ async def _call_best_available(
 
 class AgentProvider:
 
-    async def bull(self, prompt: str, system: str = "", temperature: float = None) -> str:
+    async def bull(self, prompt: str, system: str = "", temperature: float = None,
+                   skip_primary: bool = False) -> str:
         t = temperature or AGENT_TEMPERATURE
-        return await _call_for_agent("bull", prompt, system, t)
+        return await _call_for_agent("bull", prompt, system, t, skip_primary=skip_primary)
 
-    async def bear(self, prompt: str, system: str = "", temperature: float = None) -> str:
+    async def bear(self, prompt: str, system: str = "", temperature: float = None,
+                   skip_primary: bool = False) -> str:
         t = (temperature or AGENT_TEMPERATURE) * 0.4
-        return await _call_for_agent("bear", prompt, system, t)
+        return await _call_for_agent("bear", prompt, system, t, skip_primary=skip_primary)
 
-    async def verifier(self, prompt: str, system: str = "", temperature: float = None) -> str:
+    async def verifier(self, prompt: str, system: str = "", temperature: float = None,
+                       skip_primary: bool = False) -> str:
         t = 0.1
-        return await _call_for_agent("verifier", prompt, system, t)
+        return await _call_for_agent("verifier", prompt, system, t, skip_primary=skip_primary)
 
-    async def synth(self, prompt: str, system: str = "", temperature: float = None) -> str:
+    async def synth(self, prompt: str, system: str = "", temperature: float = None,
+                    skip_primary: bool = False) -> str:
         t = (temperature or AGENT_TEMPERATURE) * 0.6
-        return await _call_for_agent("synth", prompt, system, t)
+        return await _call_for_agent("synth", prompt, system, t, skip_primary=skip_primary)
 
     async def complete(self, prompt: str, system: str = "", temperature: float = None) -> str:
         t = temperature or AGENT_TEMPERATURE

@@ -1037,8 +1037,9 @@ def _eli5_for_watch_only(watch_levels: list[dict]) -> str:
         sym = (w.get("symbol") or "").strip().upper()
         if not sym:
             continue
-        note = (w.get("note") or w.get("level") or "").strip()
-        if not note:
+        note = (w.get("note") or "").strip()
+        level = (w.get("level") or "").strip()
+        if not note and not level:
             continue
         name = asset_name.get(sym, sym)
         # Простая эвристика: понимаем "пробой $X вниз → откроем SHORT"
@@ -1053,10 +1054,17 @@ def _eli5_for_watch_only(watch_levels: list[dict]) -> str:
             "выше" in note_lower or "купим" in note_lower or
             "откроем long" in note_lower
         )
-        # Пытаемся вытащить уровень $XXXX
+        # Цена ВСЕГДА берётся из поля `level` (там реальный уровень $82608),
+        # а не из `note` (там может быть «MA200 — ключевое сопротивление…»,
+        # и regex случайно вытаскивал «200» из «MA200» как цену → юзеру
+        # показывалось «закроет свечу выше $200» вместо $82608. Если в level
+        # цены нет (free-form watch) — фоллбэчим на $ из note (только со
+        # знаком $, чтобы MA200/MA50/MA50W не ловились как цены).
         import re as _re
-        price_match = _re.search(r"\$?([\d,]+(?:\.\d+)?)\s*[KkКк]?", note)
         price_str = ""
+        price_match = _re.search(r"\$\s*([\d,]+(?:\.\d+)?)\s*[KkКк]?", level)
+        if not price_match:
+            price_match = _re.search(r"\$\s*([\d,]+(?:\.\d+)?)\s*[KkКк]?", note)
         if price_match:
             try:
                 p_val = float(price_match.group(1).replace(",", ""))
