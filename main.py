@@ -155,7 +155,7 @@ russia_cache: dict = {}  # {"report": str, "timestamp": str, "sections": {...}, 
 # находила свежий дебат и писала «Сначала запусти /daily» — хотя дайджест
 # секунду назад приходил. Шарим один и тот же dict — теперь обе стороны
 # видят одинаковое состояние.
-from refactor.handlers.debate_handler import debate_cache  # noqa: E402  # {user_id: {"rounds": [...], "full": str}}
+from refactor.handlers.debate_handler import debate_cache, show_debate_round  # noqa: E402  # {user_id: {"rounds": [...], "full": str}}
 
 
 def get_bot() -> Bot:
@@ -880,10 +880,17 @@ def main_report_keyboard(user_id: int, has_debates: bool = True) -> InlineKeyboa
         )
     ])
     if has_debates:
+        # Первый клик идёт в `debate_open:` (НЕ `debate:`!): он отправляет
+        # НОВОЕ сообщение с раундом 1, а не редактирует дайджест. Раньше
+        # callback был `debate:UID:0`, который попадал в общий nav-хэндлер
+        # — тот делал `callback.message.edit_text(...)`, и дайджест
+        # затирался первой страницей дебатов. Юзер терял вердикт/сигнал/
+        # стратегию и не мог вернуться. Теперь дайджест остаётся,
+        # а навигация работает в отдельном сообщении.
         buttons.append([
             InlineKeyboardButton(
                 text="📖 Полные дебаты агентов",
-                callback_data=f"debate:{user_id}:0"
+                callback_data=f"debate_open:{user_id}"
             )
         ])
     buttons.append([
@@ -894,6 +901,32 @@ def main_report_keyboard(user_id: int, has_debates: bool = True) -> InlineKeyboa
 
 
 # ─── Обработчик листания дебатов ──────────────────────────────────────────────
+
+@dp.callback_query(F.data.startswith("debate_open:"))
+async def handle_debate_open_callback(callback: CallbackQuery):
+    """Первый клик «📖 Полные дебаты агентов» с дайджеста.
+
+    Отправляет НОВОЕ сообщение с первым раундом + nav-клавиатурой. Не
+    редактирует дайджест-сообщение, поэтому вердикт/сигнал/стратегия
+    остаются нетронутыми и доступными после возврата к чату.
+    Дальнейшая навигация по раундам (callback `debate:UID:N`) уже
+    редактирует это новое сообщение — не дайджест.
+    """
+    parts = callback.data.split(":")
+    if len(parts) != 2:
+        await callback.answer()
+        return
+    try:
+        kb_uid = int(parts[1])
+    except ValueError:
+        await callback.answer()
+        return
+    if kb_uid != callback.from_user.id:
+        await callback.answer("Кнопка не с твоего аккаунта", show_alert=True)
+        return
+    await callback.answer()
+    await show_debate_round(callback.message, callback.from_user.id, 0)
+
 
 @dp.callback_query(F.data.startswith("debate:"))
 async def handle_debate_page(callback: CallbackQuery):
