@@ -37,6 +37,7 @@ from core.horizons import (
     speechwriter_horizon_line,
     synth_overlay,
 )
+from core.sizing_state import get_multiplier, record_actionable_trade, bake_in_badge
 
 logger = logging.getLogger(__name__)
 
@@ -1067,11 +1068,24 @@ def _validate_entry_vs_market(
     return True, ""
 
 
-def _validate_sl_distance(plan: dict) -> tuple[bool, str]:
+def _scale_size_str(size: str, mult: float) -> str:
+    """Масштабирует строку размера: '10%' × 0.5 → '5%'. Нечисловые — pass-through."""
+    m = re.match(r"(\d+(?:\.\d+)?)\s*%", str(size).strip())
+    if not m:
+        return size
+    val = float(m.group(1)) * mult
+    return f"{val:.0f}%" if val >= 1 else f"{val:.1f}%"
+
+
+def _validate_sl_distance(plan: dict, market_prices: dict | None = None) -> tuple[bool, str]:
     """Стоп слишком близко к entry → выбивается шумом. Расширим до минимума.
 
     Returns (is_valid, reason). Невалидный план не coerce-ится в CASH здесь — это
-    мягкая проверка, мы лишь логируем. _coerce_to_safe_sl ниже даёт расширенный SL.
+    мягкая проверка, мы лишь логируем. _widen_sl_to_minimum ниже даёт расширенный SL.
+
+    ATR-aware (pre-live-hardening, Requirement C):
+    Если market_prices содержит ATR_{symbol} (14d, positive float) — используем
+    max(fixed_min_pct, 1.5 * ATR / entry * 100) как порог. Иначе fallback к fixed.
     """
     direction = str(plan.get("direction", "")).upper().strip()
     if direction in {"CASH", "WAIT", "FLAT", ""}:
@@ -1083,23 +1097,50 @@ def _validate_sl_distance(plan: dict) -> tuple[bool, str]:
     sl_distance_pct = abs(entry - stop) / entry * 100
     symbol = str(plan.get("symbol", "")).upper().strip()
     is_crypto = symbol in {"BTC", "ETH", "SOL", "BNB", "XRP", "DOGE", "ADA"}
-    min_pct = _MIN_SL_DISTANCE_PCT_CRYPTO if is_crypto else _MIN_SL_DISTANCE_PCT_EQUITY
+    fixed_min_pct = _MIN_SL_DISTANCE_PCT_CRYPTO if is_crypto else _MIN_SL_DISTANCE_PCT_EQUITY
+
+    # ATR-aware minimum (C1/C2/C3)
+    atr_min_pct = 0.0
+    if market_prices and symbol:
+        atr_key = f"ATR_{symbol}"
+        atr = market_prices.get(atr_key)
+        if atr is not None:
+            if isinstance(atr, (int, float)) and atr > 0:
+                atr_min_pct = (1.5 * float(atr) / entry) * 100
+            else:
+                logger.warning(f"[SL-GUARD] Invalid {atr_key}={atr!r}, fallback к fixed")
+
+    min_pct = max(fixed_min_pct, atr_min_pct)
     if sl_distance_pct < min_pct:
+        source = "[ATR×1.5]" if atr_min_pct > fixed_min_pct else "[fixed]"
         return False, (
-            f"SL слишком близко: {sl_distance_pct:.2f}% (минимум {min_pct}% для {symbol or 'актива'})"
+            f"SL слишком близко: {sl_distance_pct:.2f}% (мин {min_pct:.2f}% {source} для {symbol or 'актива'})"
         )
     return True, ""
 
 
-def _widen_sl_to_minimum(plan: dict) -> dict:
-    """Раздвигает SL до минимального безопасного расстояния от entry."""
+def _widen_sl_to_minimum(plan: dict, market_prices: dict | None = None) -> dict:
+    """Раздвигает SL до минимального безопасного расстояния от entry.
+
+    ATR-aware: если market_prices содержит ATR_{symbol} — расширяет до 1.5×ATR
+    (если это больше фиксированного минимума).
+    """
     direction = str(plan.get("direction", "")).upper().strip()
     entry = _coerce_num(plan.get("entry"))
     if not entry or direction not in {"LONG", "SHORT"}:
         return plan
     symbol = str(plan.get("symbol", "")).upper().strip()
     is_crypto = symbol in {"BTC", "ETH", "SOL", "BNB", "XRP", "DOGE", "ADA"}
-    min_pct = _MIN_SL_DISTANCE_PCT_CRYPTO if is_crypto else _MIN_SL_DISTANCE_PCT_EQUITY
+    fixed_min_pct = _MIN_SL_DISTANCE_PCT_CRYPTO if is_crypto else _MIN_SL_DISTANCE_PCT_EQUITY
+
+    # ATR-aware (C1)
+    atr_min_pct = 0.0
+    if market_prices and symbol:
+        atr = market_prices.get(f"ATR_{symbol}")
+        if isinstance(atr, (int, float)) and atr > 0:
+            atr_min_pct = (1.5 * float(atr) / entry) * 100
+
+    min_pct = max(fixed_min_pct, atr_min_pct)
     if direction == "LONG":
         new_stop = entry * (1 - min_pct / 100)
     else:
@@ -1224,10 +1265,10 @@ def _render_trade_plan_from_json(
                 )
                 p = _coerce_to_cash(raw, fresh_why)
             # ── SL-distance guard: расширяем стоп, если выставлен в шум ─────
-            sl_ok, sl_why = _validate_sl_distance(p)
+            sl_ok, sl_why = _validate_sl_distance(p, market_prices=market_prices)
             if not sl_ok and str(p.get("direction", "")).upper() in {"LONG", "SHORT"}:
                 logger.warning(f"[SL-GUARD] Widening SL: {sl_why} | raw={raw}")
-                p = _widen_sl_to_minimum(p)
+                p = _widen_sl_to_minimum(p, market_prices=market_prices)
                 # После расширения SL пересчитаем геометрию: возможно теперь R/R упал.
                 # Если упал ниже min_rr — coerce в CASH (правда такого почти не бывает,
                 # т.к. SL сужают, а не расширяют у качественных setupов).
@@ -1235,6 +1276,14 @@ def _render_trade_plan_from_json(
                 if not ok2:
                     logger.warning(f"[SL-GUARD] After widening SL R/R сломался: {why2}")
                     p = _coerce_to_cash(raw, f"SL расширен → {why2}")
+            # ── Conservative sizing (pre-live-hardening, Requirement B) ─────
+            # Первые N actionable-сделок после обновления промптов → size × 0.5
+            if str(p.get("direction", "")).upper() in {"LONG", "SHORT"}:
+                sizing_mult = get_multiplier()
+                if sizing_mult < 1.0:
+                    p = dict(p)
+                    p["size"] = _scale_size_str(str(p.get("size", "")), sizing_mult)
+                    record_actionable_trade()
             unactionable, ua_why = _is_unactionable_cash(p)
             if unactionable:
                 logger.warning(f"[PLAN-GUARD] Demoted CASH plan to watch: {ua_why} | raw={raw}")
@@ -1285,6 +1334,10 @@ def _render_trade_plan_from_json(
             "⚠️ DATA STALE: цены в первоначальном плане устарели — план переведён в CASH. "
             "Подробности в логах."
         )
+    # ── Conservative sizing badge (Requirement B) ──
+    _sizing_badge = bake_in_badge()
+    if _sizing_badge:
+        lines.append(_sizing_badge)
     if not verdict_plan_consistent:
         lines.append(
             "⚠️ ВНИМАНИЕ: вердикт не совпадает с направлением первого плана — "

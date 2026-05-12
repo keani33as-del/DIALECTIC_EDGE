@@ -316,8 +316,62 @@ class PriceFetcher:
 
 
 class DigestParser:
-    """Парсит все дайджесты из DIGEST_CACHE.md."""
-    
+    """Парсит все дайджесты из DIGEST_CACHE.md.
+
+    ⚠️ 2026-05-13 (pre-live-hardening, Requirement A):
+    Старые regex давали hit-rate 3% на аудите 56 прогнозов — артефакт парсера:
+    - S&P 500 матчился как число «500» (жадный паттерн `S[&]?P\s*500?`)
+    - VIX «18.21» обрезался до «18» (паттерн без обязательной десятичной)
+    - direction_patterns ловили «BTC LONG @ $82k» из торгового плана как прогноз
+
+    Фикс: строгие разделители [:=], sanity-bounds, pre-filter plan-строк,
+    anchor'ы для verdict-парсера.
+    """
+
+    # Sanity-bounds для price-forecasts: (regex, asset_name, min_val, max_val)
+    _PRICE_PATTERNS = [
+        (r'VIX\s*[:=]\s*(\d+\.\d+)', "VIX", 1.0, 200.0),
+        (r'VIX\s*[:=]\s*(\d{2,3})\b', "VIX", 10.0, 200.0),
+        (r'S&P\s*500?\s*[:=]\s*(\d{4,}\.?\d*)', "S&P", 1000.0, 20000.0),
+        (r'SPX\s*[:=]\s*(\d{4,}\.?\d*)', "S&P", 1000.0, 20000.0),
+        (r'(?:Нефть|WTI|CL)\s*[:=]\s*\$?(\d+\.?\d*)', "Нефть", 10.0, 500.0),
+        (r'(?:Gold|Золото|XAU)\s*[:=]\s*\$?(\d+\.?\d*)', "Gold", 500.0, 10000.0),
+        (r'Fear\s*&\s*Greed\s*[:=]\s*(\d{1,3})\b', "Fear&Greed", 0.0, 100.0),
+        (r'BTC\s*[:$=]\s*\$?([\d,]+\.?\d*)', "BTC", 1000.0, 1000000.0),
+        (r'ETH\s*[:$=]\s*\$?([\d,]+\.?\d*)', "ETH", 100.0, 100000.0),
+        (r'BNB\s*[:$=]\s*\$?([\d,]+\.?\d*)', "BNB", 10.0, 10000.0),
+        (r'SOL\s*[:$=]\s*\$?([\d,]+\.?\d*)', "SOL", 10.0, 10000.0),
+    ]
+
+    # Direction-patterns: строгие anchor'ы — тикер + эмодзи/пробелы + вердикт-слово.
+    # НЕ матчим строки с ценами/планами (pre-filter через _is_plan_line).
+    _DIRECTION_PATTERNS = [
+        (r'BTC\s*[🐻🐂🟡→\s]*\b(МЕДВЕЖ\w*|BEARISH|BULLISH|БЫЧ\w*|NEUTRAL|НЕЙТРАЛ\w*)\b', "BTC"),
+        (r'ETH\s*[🐻🐂🟡→\s]*\b(МЕДВЕЖ\w*|BEARISH|BULLISH|БЫЧ\w*|NEUTRAL|НЕЙТРАЛ\w*)\b', "ETH"),
+        (r'BNB\s*[🐻🐂🟡→\s]*\b(МЕДВЕЖ\w*|BEARISH|BULLISH|БЫЧ\w*|NEUTRAL|НЕЙТРАЛ\w*)\b', "BNB"),
+        (r'SOL\s*[🐻🐂🟡→\s]*\b(МЕДВЕЖ\w*|BEARISH|BULLISH|БЫЧ\w*|NEUTRAL|НЕЙТРАЛ\w*)\b', "SOL"),
+    ]
+
+    @staticmethod
+    def _is_plan_line(line: str) -> bool:
+        """Строка — часть торгового плана (entry/stop/target), а не прогноз.
+
+        Такие строки содержат ценовые уровни и ключевые слова плана.
+        Их НЕ нужно парсить как direction-forecast.
+        """
+        if not line:
+            return False
+        lower = line.lower()
+        # Явные маркеры торгового плана
+        if '@' in line:
+            return True
+        # $ рядом с цифрой — это цена в плане
+        if re.search(r'\$\s*\d', line):
+            return True
+        plan_keywords = ('entry', 'вход:', 'стоп:', 'stop:', 'цель:', 'target:',
+                         'тейк:', 'r/r', 'размер:', 'size:', 'горизонт:', 'horizon:')
+        return any(kw in lower for kw in plan_keywords)
+
     @staticmethod
     def extract_all_digests(text: str) -> list[dict]:
         digests = []
@@ -340,77 +394,85 @@ class DigestParser:
         
         lines = content.split('\n')
         
+        # ── Verdict-парсер: ищем anchor «ВЕРДИКТ:» и читаем ТОЛЬКО эту строку ──
         verdict_direction = None
-        for marker in ["**ВЕРДИКТ:**", "ВЕРДИКТ:"]:
+        for marker in ["**ВЕРДИКТ:**", "ВЕРДИКТ:", "VERDICT:"]:
             idx = content.find(marker)
             if idx != -1:
-                snippet = content[idx:idx+400].upper()
-                if "БЫЧ" in snippet or "BUY" in snippet or "LONG" in snippet or "🐂" in snippet or "🟢" in snippet:
+                # Берём только остаток строки после маркера (до \n)
+                after_marker = content[idx + len(marker):]
+                newline_pos = after_marker.find('\n')
+                verdict_line = after_marker[:newline_pos] if newline_pos != -1 else after_marker[:200]
+                verdict_line_upper = verdict_line.upper()
+                if "БЫЧ" in verdict_line_upper or "BUY" in verdict_line_upper or "BULL" in verdict_line_upper or "🐂" in verdict_line_upper or "🟢" in verdict_line_upper:
                     verdict_direction = "BULLISH"
-                elif "МЕДВ" in snippet or "SELL" in snippet or "SHORT" in snippet or "🐻" in snippet or "🔴" in snippet:
+                elif "МЕДВ" in verdict_line_upper or "SELL" in verdict_line_upper or "BEAR" in verdict_line_upper or "SHORT" in verdict_line_upper or "🐻" in verdict_line_upper or "🔴" in verdict_line_upper:
                     verdict_direction = "BEARISH"
+                else:
+                    verdict_direction = "NEUTRAL"
                 break
-        
-        price_patterns = [
-            (r'VIX\s*[:=]*\s*(\d+\.?\d*)', "VIX"),
-            (r'S[&]?P\s*500?\s*[:=]*\s*(\d+\.?\d*)', "S&P"),
-            (r'SPX\s*[:=]*\s*(\d+\.?\d*)', "S&P"),
-            (r'(?:Нефть|WTI)\s*[:=]*\s*\$?(\d+\.?\d*)', "Нефть"),
-            (r'(?:Gold|Золото|XAU)\s*[:=]*\s*\$?(\d+\.?\d*)', "Gold"),
-            (r'Fear\s*&\s*Greed\s*[:=]*\s*(\d+)', "Fear&Greed"),
-            (r'BTC\s*[:$=]\s*([\d,]+\.?\d*)', "BTC"),
-            (r'ETH\s*[:$=]\s*([\d,]+\.?\d*)', "ETH"),
-            (r'BNB\s*[:$=]\s*([\d,]+\.?\d*)', "BNB"),
-            (r'SOL\s*[:$=]\s*([\d,]+\.?\d*)', "SOL"),
-        ]
-        
-        direction_patterns = [
-            (r'BTC\s*[🐻🐂🟡→]*\s*(МЕДВЕЖ[ИЙ]|BEARISH|BULLISH|быч[ий]|медвеж[ий]|NEUTRAL|CASH|LONG|SHORT)', "BTC"),
-            (r'ETH\s*[🐻🐂🟡→]*\s*(МЕДВЕЖ[ИЙ]|BEARISH|BULLISH|быч[ий]|медвеж[ий]|NEUTRAL|CASH|LONG|SHORT)', "ETH"),
-            (r'BNB\s*[🐻🐂🟡→]*\s*(МЕДВЕЖ[ИЙ]|BEARISH|BULLISH|быч[ий]|медвеж[ий]|NEUTRAL|CASH|LONG|SHORT)', "BNB"),
-            (r'SOL\s*[🐻🐂🟡→]*\s*(МЕДВЕЖ[ИЙ]|BEARISH|BULLISH|быч[ий]|медвеж[ий]|NEUTRAL|CASH|LONG|SHORT)', "SOL"),
-        ]
         
         seen = set()
         
         for line in lines:
             line = line.strip()
             
-            for pattern, asset in direction_patterns:
-                match = re.search(pattern, line, re.IGNORECASE)
-                if match:
-                    direction = match.group(1).upper()
-                    if "БЫЧ" in direction or "BULL" in direction or "LONG" in direction:
-                        direction = "BULLISH"
-                    elif "МЕДВ" in direction or "BEAR" in direction or "SHORT" in direction:
-                        direction = "BEARISH"
-                    elif "НЕЙТРАЛЬ" in direction or "NEUTRAL" in direction or "CASH" in direction:
-                        direction = "NEUTRAL"
-                    
-                    key = f"{asset}:{direction}:{date}"
-                    if key not in seen:
-                        seen.add(key)
-                        forecasts.append({
-                            "date": date, "type": "Daily Digest",
-                            "asset": asset, "forecast": direction, "forecast_type": "direction"
-                        })
-                    break
+            # ── Direction-forecasts (per-asset) ──
+            # Pre-filter: пропускаем строки торгового плана (A3)
+            if not DigestParser._is_plan_line(line):
+                # Также пропускаем строки с LONG/SHORT + цифрами — это план, не прогноз
+                has_trade_direction = bool(re.search(r'\b(LONG|SHORT)\b', line, re.IGNORECASE))
+                has_numbers = bool(re.search(r'\d{4,}', line))
+                if not (has_trade_direction and has_numbers):
+                    for pattern, asset in DigestParser._DIRECTION_PATTERNS:
+                        match = re.search(pattern, line, re.IGNORECASE)
+                        if match:
+                            direction = match.group(1).upper()
+                            if "БЫЧ" in direction or "BULL" in direction:
+                                direction = "BULLISH"
+                            elif "МЕДВ" in direction or "BEAR" in direction:
+                                direction = "BEARISH"
+                            elif "НЕЙТРАЛЬ" in direction or "NEUTRAL" in direction:
+                                direction = "NEUTRAL"
+                            else:
+                                break  # неизвестное слово — пропускаем
+                            
+                            key = f"{asset}:{direction}:{date}"
+                            if key not in seen:
+                                seen.add(key)
+                                forecasts.append({
+                                    "date": date, "type": "Daily Digest",
+                                    "asset": asset, "forecast": direction, "forecast_type": "direction"
+                                })
+                            break
 
-            # FIX: price extraction must run per-line, not once after the loop.
-            for pattern, asset in price_patterns:
+            # ── Price-forecasts с sanity-bounds ──
+            for pattern, asset, min_val, max_val in DigestParser._PRICE_PATTERNS:
                 match = re.search(pattern, line, re.IGNORECASE)
                 if match:
-                    price = match.group(1)
-                    asset_norm = asset.upper()
-                    if "S&P" in asset_norm: asset_norm = "S&P"
-                    if "НЕФТ" in asset_norm: asset_norm = "Нефть"
-                    asset_norm = asset_norm.rstrip("Ь")
-                    key = f"{asset_norm}:price:{price}:{date}"
+                    price_str = match.group(1).replace(',', '')
+                    try:
+                        price_val = float(price_str)
+                    except ValueError:
+                        break
+                    # Sanity-bound (A5): отсекаем мусорные значения
+                    if price_val < min_val or price_val > max_val:
+                        logger.debug(
+                            f"[DigestParser] Sanity-skip: {asset}={price_str} "
+                            f"вне [{min_val}, {max_val}] (дата {date})"
+                        )
+                        break
+                    asset_norm = asset
+                    if "S&P" in asset_norm.upper():
+                        asset_norm = "S&P"
+                    if "НЕФТ" in asset_norm.upper():
+                        asset_norm = "Нефть"
+                    key = f"{asset_norm}:price:{price_str}:{date}"
                     if key not in seen:
                         seen.add(key)
                         forecasts.append({
                             "date": date, "type": "Daily Digest",
-                            "asset": asset_norm, "forecast": price, "forecast_type": "price"
+                            "asset": asset_norm, "forecast": price_str, "forecast_type": "price"
                         })
                     break
 
