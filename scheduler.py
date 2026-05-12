@@ -39,6 +39,12 @@ try:
 except ImportError:
     AUTO_TRACKER_ENABLED = False
 
+try:
+    from smart_money_alert import SmartMoneyAlertSystem
+    SMART_MONEY_ALERT_ENABLED = True
+except ImportError:
+    SMART_MONEY_ALERT_ENABLED = False
+
 logger = logging.getLogger(__name__)
 
 
@@ -76,6 +82,14 @@ class Scheduler:
             except Exception as e:
                 logger.warning(f"Auto tracker init error: {e}")
 
+        self._smart_money_alert = None
+        if SMART_MONEY_ALERT_ENABLED:
+            try:
+                self._smart_money_alert = SmartMoneyAlertSystem(self.bot)
+                logger.info("✅ Smart-money alert system инициализирован")
+            except Exception as e:
+                logger.warning(f"Smart-money alert init error: {e}")
+
     async def start(self):
         self._running = True
         logger.info("⏰ Scheduler запущен")
@@ -95,7 +109,10 @@ class Scheduler:
         
         if AUTO_TRACKER_ENABLED and self._auto_tracker:
             tasks.append(self._auto_tracker_loop())
-        
+
+        if SMART_MONEY_ALERT_ENABLED and self._smart_money_alert:
+            tasks.append(self._smart_money_alert_loop())
+
         await asyncio.gather(*tasks)
 
     async def _daily_digest_loop(self):
@@ -219,6 +236,30 @@ class Scheduler:
                 logger.error(f"Signals checker error: {e}")
 
             await asyncio.sleep(2 * 3600)  # каждые 2 часа
+
+    async def _smart_money_alert_loop(self):
+        """Проверяет smart-money convergence каждый час.
+
+        Шлёт алерт подписчикам сигналов только когда ≥ 2 институциональных
+        индикаторов синхронно показывают один же direction. Анти-спам внутри.
+        """
+        await asyncio.sleep(900)  # ждём 15 минут при старте — пусть система прогреется
+
+        while self._running:
+            try:
+                if self._smart_money_alert is None:
+                    await asyncio.sleep(3600)
+                    continue
+
+                subscribers = await get_signals_subscribers()
+                if subscribers:
+                    sent = await self._smart_money_alert.check_and_alert(subscribers)
+                    if sent > 0:
+                        logger.info(f"🐋 Smart-money convergence алерт отправлен: {sent}")
+            except Exception as e:
+                logger.error(f"Smart-money alert loop error: {e}")
+
+            await asyncio.sleep(3600)  # каждый час
 
     async def _auto_tracker_loop(self):
         """Проверяет прогнозы в 00:10 UTC (через 10 минут после дайджеста)."""

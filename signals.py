@@ -408,7 +408,17 @@ def build_signals_message(signals: list, binance_data: dict, verdict: Optional[d
     # Сигналы
     if signals:
         lines.append("🔔 *СИГНАЛЫ*")
-        
+
+        verdict_value = (verdict or {}).get("verdict") if verdict else None
+        if verdict_value not in ("BULLISH", "BEARISH"):
+            tag = "NEUTRAL" if verdict_value == "NEUTRAL" else "не определён"
+            lines.append("")
+            lines.append(
+                f"⚠️ _Вердикт `/daily` — {tag}. Сигналы ниже — это инфа для "
+                f"наблюдения, не приглашение войти. Решение за тобой._"
+            )
+            lines.append("")
+
         for s in signals:
             emoji = "🟢" if s["direction"] == "LONG" else "🔴"
             conf = s["confidence"]
