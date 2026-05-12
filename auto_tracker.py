@@ -29,7 +29,10 @@ FNG_URL = "https://api.alternative.me/fng/"
 GITHUB_REPO = os.getenv("GITHUB_REPO", "ANAEHY/dialectic_edge")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
 GITHUB_PRICES_URL = f"https://api.github.com/repos/{GITHUB_REPO}/contents/prices.json"
-DIGEST_CACHE_URL = f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/DIGEST_CACHE.md"
+# Default branch — explicit fallback (`main` устаревший, репо мигрировал на `master`).
+# Configurable via GITHUB_DEFAULT_BRANCH env if нужно переехать обратно.
+_DEFAULT_BRANCH = os.getenv("GITHUB_DEFAULT_BRANCH", "master")
+DIGEST_CACHE_URL = f"https://raw.githubusercontent.com/{GITHUB_REPO}/{_DEFAULT_BRANCH}/DIGEST_CACHE.md"
 AUTO_TRACK_FILE = "AUTO_TRACK.md"
 
 
@@ -99,6 +102,21 @@ class PriceFetcher:
         self.db = price_db
         self.cache = {}
     
+    @staticmethod
+    def _parse_date_only(date: str) -> Optional[datetime]:
+        """Парсит '12.05.2026' или '12.05.2026 08:13' → datetime.
+
+        Было: strptime(date, '%d.%m.%Y') падало с 'unconverted data remains: 08:13'
+        если в DIGEST_CACHE.md дата была с временем.
+        """
+        if not date:
+            return None
+        date_only = str(date).strip().split()[0]
+        try:
+            return datetime.strptime(date_only, "%d.%m.%Y")
+        except ValueError:
+            return None
+
     async def get_historical_price(self, symbol: str, date: str) -> Optional[dict]:
         """Получить цену на дату (из БД или API)."""
         symbol_upper = symbol.upper().replace(" ", "")
@@ -134,7 +152,10 @@ class PriceFetcher:
         cg_id = coingecko_map.get(symbol)
         
         try:
-            date_obj = datetime.strptime(date, "%d.%m.%Y")
+            date_obj = self._parse_date_only(date)
+            if not date_obj:
+                logger.debug(f"Historical: can't parse date '{date}'")
+                return None
             
             # CoinGecko для крипты
             if cg_id:
@@ -181,11 +202,19 @@ class PriceFetcher:
         return None
     
     async def get_current_price(self, symbol: str) -> Optional[dict]:
-        """Текущая цена (кэш)."""
+        """Текущая цена (кэш).
+
+        Binance в prod-локациях часто возвращает HTTP 451 (гео-рестрикт),
+        добавил CoinGecko fallback для крипты.
+        """
         if symbol in self.cache:
             return self.cache[symbol]
         
         binance_map = {"BTC": "BTCUSDT", "ETH": "ETHUSDT", "BNB": "BNBUSDT", "SOL": "SOLUSDT"}
+        coingecko_map = {
+            "BTC": "bitcoin", "ETH": "ethereum", "BNB": "binancecoin",
+            "SOL": "solana", "XRP": "ripple", "DOGE": "dogecoin",
+        }
         yahoo_map = {
             "VIX": "^VIX", "S&P": "^GSPC", "SPX": "^GSPC",
             "NDX": "^NDX", "GOLD": "GC=F", "XAU": "GC=F",
@@ -207,6 +236,45 @@ class PriceFetcher:
                                 return result
                             else:
                                 logger.debug(f"Binance status {resp.status} for {symbol}")
+
+                    # Kraken fallback (no auth, geo-allowed, не лимитируется как CoinGecko)
+                    kraken_map = {
+                        "BTC": "XBTUSDT", "ETH": "ETHUSDT", "BNB": "BNBUSDT",
+                        "SOL": "SOLUSDT", "XRP": "XRPUSDT", "DOGE": "XDGUSDT",
+                    }
+                    kr_pair = kraken_map.get(symbol.upper())
+                    if kr_pair:
+                        kr_url = f"https://api.kraken.com/0/public/Ticker?pair={kr_pair}"
+                        async with session.get(kr_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                            if resp.status == 200:
+                                data = await resp.json()
+                                # Kraken возвращает {"result": {"XBTUSDT": {"c": ["80828.7", "0.0002"], ...}}}
+                                ticker_data = next(iter((data.get("result") or {}).values()), None)
+                                if ticker_data and ticker_data.get("c"):
+                                    try:
+                                        last_close = float(ticker_data["c"][0])
+                                        result = {"price": last_close, "change": 0}
+                                        self.cache[symbol] = result
+                                        return result
+                                    except (ValueError, IndexError, TypeError) as e:
+                                        logger.debug(f"Kraken parse error for {symbol}: {e}")
+                            else:
+                                logger.debug(f"Kraken status {resp.status} for {symbol}")
+
+                    # CoinGecko fallback last (rate-limited).
+                    cg_id = coingecko_map.get(symbol.upper())
+                    if cg_id:
+                        cg_url = f"https://api.coingecko.com/api/v3/simple/price?ids={cg_id}&vs_currencies=usd"
+                        async with session.get(cg_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                            if resp.status == 200:
+                                data = await resp.json()
+                                price = data.get(cg_id, {}).get("usd")
+                                if price:
+                                    result = {"price": float(price), "change": 0}
+                                    self.cache[symbol] = result
+                                    return result
+                            else:
+                                logger.debug(f"CoinGecko status {resp.status} for {symbol}")
 
                     ticker = yahoo_map.get(symbol.upper())
                     if ticker:
@@ -406,12 +474,13 @@ class ResultChecker:
             #    Для direction-прогнозов это и есть "что случилось через 7 дней?".
             eval_at_horizon = None
             try:
-                d_obj = datetime.strptime(date, "%d.%m.%Y")
-                horizon_days = 7
-                eval_date = d_obj + timedelta(days=horizon_days)
-                if eval_date.date() <= datetime.utcnow().date():
-                    eval_str = eval_date.strftime("%d.%m.%Y")
-                    eval_at_horizon = await self.fetcher.get_historical_price(asset, eval_str)
+                d_obj = PriceFetcher._parse_date_only(date)
+                if d_obj:
+                    horizon_days = 7
+                    eval_date = d_obj + timedelta(days=horizon_days)
+                    if eval_date.date() <= datetime.utcnow().date():
+                        eval_str = eval_date.strftime("%d.%m.%Y")
+                        eval_at_horizon = await self.fetcher.get_historical_price(asset, eval_str)
             except Exception as e:
                 logger.debug(f"Eval-date parse error for {date}: {e}")
 
