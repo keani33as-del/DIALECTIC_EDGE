@@ -258,6 +258,20 @@ async def _fetch_trend_data(session, symbol_binance: str, key: str) -> dict:
             trend = "SIDEWAYS"
             trend_emoji = "↔️"
 
+        # ── ATR(14d) — Average True Range для SL-guard (pre-live-hardening) ──
+        # True Range = max(high-low, |high-prev_close|, |low-prev_close|)
+        if len(klines) >= 15:
+            true_ranges = []
+            for i in range(-14, 0):
+                h = float(klines[i][2])
+                l = float(klines[i][3])
+                prev_c = float(klines[i - 1][4])
+                tr = max(h - l, abs(h - prev_c), abs(l - prev_c))
+                true_ranges.append(tr)
+            atr_14 = sum(true_ranges) / len(true_ranges)
+            result["atr_14d"] = round(atr_14, 2)
+            result["atr_14d_pct"] = round(atr_14 / current * 100, 2)
+
         result["trend"] = trend
         result["trend_emoji"] = trend_emoji
         result["hh"] = hh
@@ -345,7 +359,7 @@ async def _fred(session, series_id: str) -> str:
 
 async def _fear_greed(session) -> dict:
     try:
-        async with session.get("https://api.alternative.me/fng/?limit=2",
+        async with session.get("https://api.alternative.me/fng/?limit=8",
                                timeout=TIMEOUT) as r:
             if r.status == 200:
                 d     = await r.json()
@@ -354,11 +368,24 @@ async def _fear_greed(session) -> dict:
                     cur  = items[0]
                     prev = int(items[1]["value"]) if len(items) > 1 else int(cur["value"])
                     val  = int(cur["value"])
+                    # 7-дневный тренд F&G (pre-live-hardening)
+                    history_7d = [int(it["value"]) for it in items[:7] if it.get("value")]
+                    trend_7d = ""
+                    if len(history_7d) >= 5:
+                        avg_recent = sum(history_7d[:3]) / 3
+                        avg_older = sum(history_7d[4:7]) / max(len(history_7d[4:7]), 1)
+                        if avg_recent > avg_older + 5:
+                            trend_7d = "RISING"
+                        elif avg_recent < avg_older - 5:
+                            trend_7d = "FALLING"
+                        else:
+                            trend_7d = "STABLE"
                     return {"val": val, "status": cur["value_classification"],
-                            "change": val - prev}
+                            "change": val - prev, "trend_7d": trend_7d,
+                            "history_7d": history_7d}
     except Exception as e:
         logger.debug(f"F&G: {e}")
-    return {"val": "N/A", "status": "Unknown", "change": 0}
+    return {"val": "N/A", "status": "Unknown", "change": 0, "trend_7d": "", "history_7d": []}
 
 
 # ─── Агрегатор ────────────────────────────────────────────────────────────────
@@ -405,6 +432,9 @@ async def fetch_realtime_prices() -> dict:
         for key, trend_val in [("BTC", trend_btc), ("ETH", trend_eth), ("SOL", trend_sol)]:
             if key in prices and trend_val and not isinstance(trend_val, Exception) and trend_val:
                 prices[key].update(trend_val)
+                # Прокидываем ATR в top-level для SL-guard (market_prices["ATR_BTC"])
+                if "atr_14d" in trend_val:
+                    prices[f"ATR_{key}"] = trend_val["atr_14d"]
 
         for key, val in [("SPX", spx), ("NDX", ndx), ("VIX", vix),
                          ("DXY", dxy), ("OIL_WTI", oil), ("GOLD", gold)]:
@@ -506,6 +536,12 @@ def format_prices_for_agents(prices: dict) -> str:
             f"{'🟢' if fc > 0 else '🔴' if fc < 0 else '➡️'} {fc:+d} за сутки  "
             f"[Источник: Alternative.me Crypto F&G — НЕ FRED]"
         )
+        # F&G 7-дневный тренд (pre-live-hardening)
+        fng_trend = fng.get("trend_7d", "")
+        fng_hist = fng.get("history_7d", [])
+        if fng_trend and fng_hist:
+            trend_label = {"RISING": "↗️ растёт", "FALLING": "↘️ падает", "STABLE": "→ стабилен"}.get(fng_trend, fng_trend)
+            lines.append(f"  F&G тренд 7д: {trend_label} ({' → '.join(str(x) for x in fng_hist[:5])})")
         lines.append("  [!] CPI = индекс (~323), НЕ %. Инфляция = YoY (выше).")
 
     lines.append("\n[ФОНДОВЫЕ ИНДЕКСЫ]")
