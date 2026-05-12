@@ -233,6 +233,8 @@ def enrich_prices_with_scores(
         sm = enriched.smart_money
         if sm.top_trader_ls_ratio is not None:
             enriched_prices["SM_TOP_TRADER_LS"] = sm.top_trader_ls_ratio
+        if sm.top_trader_ls_per_symbol:
+            enriched_prices["SM_TOP_TRADER_LS_PER_SYMBOL"] = dict(sm.top_trader_ls_per_symbol)
         if sm.coinbase_premium_pct is not None:
             enriched_prices["SM_COINBASE_PREMIUM"] = sm.coinbase_premium_pct
         if sm.cme_basis_pct is not None:

@@ -463,6 +463,28 @@ def extract_symbols_from_report(report: str, prices: dict) -> tuple[dict, dict, 
     return entries, stop_losses, targets, timeframes
 
 
+_SM_CARD_SYMBOL_ICONS = {
+    "BTCUSDT": "₿",
+    "ETHUSDT": "Ξ",
+    "SOLUSDT": "◎",
+    "BNBUSDT": "🅱",
+    "XRPUSDT": "✕",
+}
+_SM_CARD_LS_SYMBOLS = ("BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT")
+
+
+def _sm_ls_tag(ls: float) -> tuple[str, str]:
+    if ls >= 1.5:
+        return "🟢", "лонгят сильно"
+    if ls >= 1.2:
+        return "🟢", "лонгят"
+    if ls <= 0.7:
+        return "🔴", "шортят сильно"
+    if ls <= 0.85:
+        return "🔴", "шортят"
+    return "⚪️", "нейтрал"
+
+
 def _format_smart_money_card(prices: dict | None) -> str | None:
     """Делает короткую карточку институциональных сигналов для пользователя.
     Использует SM_* ключи которые уже есть в prices_dict (заполняются
@@ -474,30 +496,30 @@ def _format_smart_money_card(prices: dict | None) -> str | None:
         return None
     
     ls = prices.get("SM_TOP_TRADER_LS")
+    ls_per_symbol = prices.get("SM_TOP_TRADER_LS_PER_SYMBOL") or {}
     cb_prem = prices.get("SM_COINBASE_PREMIUM")
     cme_basis = prices.get("SM_CME_BASIS")
     funding_avg = prices.get("SM_FUNDING_AVG")
     funding_align = prices.get("SM_FUNDING_ALIGN")
     
     bullets: list[str] = []
-    
-    if isinstance(ls, (int, float)):
-        if ls >= 1.5:
-            tag = "лонгят сильно"
-            emoji = "🟢"
-        elif ls >= 1.2:
-            tag = "лонгят"
-            emoji = "🟢"
-        elif ls <= 0.7:
-            tag = "шортят сильно"
-            emoji = "🔴"
-        elif ls <= 0.85:
-            tag = "шортят"
-            emoji = "🔴"
-        else:
-            tag = "нейтрал"
-            emoji = "⚪️"
-        bullets.append(f"{emoji} *Top-trader L/S:* {ls:.2f} → {tag}")
+
+    # Top-trader L/S — компактный per-symbol блок по 5 основным парам.
+    # Если per-symbol нет, fallback на старую одно-строчную BTC-форму.
+    if isinstance(ls_per_symbol, dict) and ls_per_symbol:
+        bullets.append("📊 *Top-trader L/S по парам:*")
+        for sym in _SM_CARD_LS_SYMBOLS:
+            ratio = ls_per_symbol.get(sym)
+            name = sym.replace("USDT", "")
+            icon = _SM_CARD_SYMBOL_ICONS.get(sym, "•")
+            if not isinstance(ratio, (int, float)):
+                bullets.append(f"  {icon} {name}: N/A")
+                continue
+            emoji, tag = _sm_ls_tag(float(ratio))
+            bullets.append(f"  {icon} {name}: `{ratio:.2f}` {emoji} {tag}")
+    elif isinstance(ls, (int, float)):
+        emoji, tag = _sm_ls_tag(float(ls))
+        bullets.append(f"{emoji} *Top-trader L/S (BTC):* {ls:.2f} → {tag}")
     
     if isinstance(cb_prem, (int, float)):
         if cb_prem >= 0.20:

@@ -58,6 +58,8 @@ USER_AGENT = "Mozilla/5.0 (compatible; dialectic-edge/1.0)"
 TIMEOUT = aiohttp.ClientTimeout(total=8)
 
 DEFAULT_FUNDING_SYMBOLS = ("BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT")
+# Топ-трейдер L/S тянем по тем же 5 основным парам.
+DEFAULT_LS_SYMBOLS = DEFAULT_FUNDING_SYMBOLS
 
 
 @dataclass
@@ -66,8 +68,11 @@ class SmartMoneySignals:
 
     # 1. Top-trader L/S position ratio (Binance)
     # >1 = топ-трейдеры в лонге, <1 = в шорте.
+    # `top_trader_ls_ratio` — BTC (бек-совместимость).
+    # `top_trader_ls_per_symbol` — dict по 5 основным парам.
     top_trader_ls_ratio: Optional[float] = None
     top_trader_ls_signal: str = "N/A"
+    top_trader_ls_per_symbol: dict = field(default_factory=dict)  # {symbol: ratio}
 
     # 2. Coinbase Premium (% spread Coinbase USD vs Binance USDT)
     # Положительный = US institutional bid pressure.
@@ -272,14 +277,16 @@ async def fetch_smart_money_signals(symbol_btc: str = "BTCUSDT") -> SmartMoneySi
     signals = SmartMoneySignals()
 
     async with aiohttp.ClientSession() as session:
-        # Параллельно запускаем 4 группы запросов
-        tasks = {
-            "top_trader_ls": fetch_top_trader_ls(session, symbol_btc),
+        # Параллельно запускаем все запросы
+        tasks: dict = {
             "coinbase_btc": fetch_coinbase_spot(session, "BTC-USD"),
             "binance_btc": fetch_binance_spot(session, "BTCUSDT"),
             "cme_btc": fetch_yahoo_quote(session, "BTC=F"),
             "spot_btc_yahoo": fetch_yahoo_quote(session, "BTC-USD"),
         }
+        # Top-trader L/S по 5 основным парам (было только BTC).
+        for sym in DEFAULT_LS_SYMBOLS:
+            tasks[f"ls_{sym}"] = fetch_top_trader_ls(session, sym)
         # Funding rates по 5 парам
         for sym in DEFAULT_FUNDING_SYMBOLS:
             tasks[f"funding_{sym}"] = fetch_funding_rate(session, sym)
@@ -294,12 +301,21 @@ async def fetch_smart_money_signals(symbol_btc: str = "BTCUSDT") -> SmartMoneySi
             return None
         return v
 
-    # 1. Top-trader L/S
-    ls = _v("top_trader_ls")
+    # 1. Top-trader L/S — берём по всем 5 парам, BTC дублируем в legacy-поле.
+    per_symbol_ls: dict[str, float] = {}
+    for sym in DEFAULT_LS_SYMBOLS:
+        v = _v(f"ls_{sym}")
+        if v is not None:
+            per_symbol_ls[sym] = round(float(v), 2)
+    signals.top_trader_ls_per_symbol = per_symbol_ls
+    ls = per_symbol_ls.get(symbol_btc)
     if ls is not None:
-        signals.top_trader_ls_ratio = round(ls, 2)
+        signals.top_trader_ls_ratio = ls
         signals.top_trader_ls_signal = _classify_top_trader(ls)
-        logger.info(f"[SMART-MONEY] Top-trader L/S: {ls:.2f}")
+        logger.info(
+            f"[SMART-MONEY] Top-trader L/S BTC={ls:.2f}, "
+            f"all={ {k: v for k, v in per_symbol_ls.items()} }"
+        )
 
     # 2. Coinbase Premium
     cb = _v("coinbase_btc")
@@ -460,6 +476,108 @@ def format_smart_money_for_agents(s: SmartMoneySignals) -> str:
         "чем глобальный long/short ratio. Подтверждение нескольких сигналов одновременно "
         "= высокая уверенность."
     )
+
+    return "\n".join(lines)
+
+
+# ── Compact formatter (для Telegram /markets и /daily) ───────────────────────
+
+
+_SYMBOL_ICON = {
+    "BTCUSDT": "₿",
+    "ETHUSDT": "Ξ",
+    "SOLUSDT": "◎",
+    "BNBUSDT": "🅱",
+    "XRPUSDT": "✕",
+}
+
+
+def _ls_tag(ratio: float) -> tuple[str, str]:
+    """Возвращает (emoji, короткий ярлык) для L/S ratio."""
+    if ratio >= 1.5:
+        return "🟢", "лонгят сильно"
+    if ratio >= 1.2:
+        return "🟢", "лонгят"
+    if ratio <= 0.7:
+        return "🔴", "шортят сильно"
+    if ratio <= 0.85:
+        return "🔴", "шортят"
+    return "⚪", "нейтрал"
+
+
+def format_smart_money_compact(s: SmartMoneySignals) -> Optional[str]:
+    """Короткий Telegram-friendly блок smart-money для /markets и /daily.
+
+    Возвращает None если совсем нет данных (модуль молчит).
+    """
+    has_any = bool(
+        s.top_trader_ls_per_symbol
+        or s.coinbase_premium_pct is not None
+        or s.cme_basis_pct is not None
+        or s.funding_rates
+    )
+    if not has_any:
+        return None
+
+    lines = ["🏛 *SMART-MONEY (топ-трейдеры / институционалы)*"]
+
+    if s.top_trader_ls_per_symbol:
+        lines.append("")
+        lines.append("📊 *Top-trader L/S по парам (Binance Futures):*")
+        for sym in DEFAULT_LS_SYMBOLS:
+            ratio = s.top_trader_ls_per_symbol.get(sym)
+            name = sym.replace("USDT", "")
+            icon = _SYMBOL_ICON.get(sym, "•")
+            if ratio is None:
+                lines.append(f"{icon} {name}: N/A")
+                continue
+            emoji, tag = _ls_tag(ratio)
+            lines.append(f"{icon} {name}: `{ratio:.2f}` {emoji} {tag}")
+
+    macro_lines: list[str] = []
+
+    if s.coinbase_premium_pct is not None:
+        prem = s.coinbase_premium_pct
+        if prem >= 0.20:
+            tag = "🟢 US-биды сильные"
+        elif prem >= 0.05:
+            tag = "🟢 US bid pressure"
+        elif prem <= -0.20:
+            tag = "🔴 US-продажи"
+        elif prem <= -0.05:
+            tag = "🔴 US sell pressure"
+        else:
+            tag = "⚪ нейтрал"
+        macro_lines.append(f"🇺🇸 *Coinbase Premium:* `{prem:+.2f}%` {tag}")
+
+    if s.cme_basis_pct is not None:
+        basis = s.cme_basis_pct
+        if basis >= 0.30:
+            tag = "🟢 contango (бычий)"
+        elif basis <= -0.30:
+            tag = "🔴 backwardation (стресс)"
+        else:
+            tag = "⚪ нейтрал"
+        macro_lines.append(f"📜 *CME Basis:* `{basis:+.2f}%` {tag}")
+
+    if s.funding_avg_pct is not None and s.funding_alignment:
+        avg = s.funding_avg_pct
+        align = s.funding_alignment
+        if align == "ALL_LONG" and avg > 0.05:
+            tag = "⚠️ перегретый лонг — squeeze risk"
+        elif align == "ALL_SHORT" and avg < -0.005:
+            tag = "⚡ массовый шорт — contrarian-бычий"
+        elif align == "ALL_LONG":
+            tag = "🟢 лонг-настроение"
+        elif align == "ALL_SHORT":
+            tag = "🔴 шорт-настроение"
+        else:
+            tag = "⚪ смешанный"
+        macro_lines.append(f"💸 *Funding avg:* `{avg:+.4f}%` [{align}] {tag}")
+
+    if macro_lines:
+        lines.append("")
+        lines.extend(macro_lines)
 
     return "\n".join(lines)
 
