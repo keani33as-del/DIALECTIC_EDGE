@@ -460,20 +460,63 @@ async def fetch_markets_bundle(github_repo: str | None = None) -> dict:
 
 
 async def build_markets_panel_message(github_repo: str | None = None) -> tuple[str, dict]:
-    """Полный текст для команды /markets: живой контекст + сигналы."""
+    """Полный текст для команды /markets: живой контекст + smart-money + сигналы."""
     from web_search import get_full_realtime_context
+    try:
+        from market_indicators.smart_money import (
+            fetch_smart_money_signals,
+            format_smart_money_compact,
+        )
+        _smart_money_available = True
+    except Exception:
+        _smart_money_available = False
 
-    bundle = await fetch_markets_bundle(github_repo)
-    _, live_formatted = await get_full_realtime_context()
+    # Тянем bundle, live-контекст и smart-money параллельно — суммарно ~1-2с.
+    if _smart_money_available:
+        bundle, live_result, smart_money = await asyncio.gather(
+            fetch_markets_bundle(github_repo),
+            get_full_realtime_context(),
+            fetch_smart_money_signals(),
+            return_exceptions=False,
+        )
+        sm_block: Optional[str] = None
+        try:
+            sm_block = format_smart_money_compact(smart_money)
+        except Exception as e:
+            logger.warning(f"format_smart_money_compact error: {e}")
+    else:
+        bundle, live_result = await asyncio.gather(
+            fetch_markets_bundle(github_repo),
+            get_full_realtime_context(),
+            return_exceptions=False,
+        )
+        sm_block = None
+
+    _, live_formatted = live_result
     now = datetime.now().strftime("%d.%m.%Y %H:%M")
-    header = f"📊 *РЫНКИ И СИГНАЛЫ* — {now}\n\n"
-    body = (
-        "*Живой контекст*\n"
-        f"{live_formatted}\n\n"
-        "──────────────\n\n"
-        f"{bundle['signals_message']}"
-    )
-    full = header + body
+    separator = "━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+    parts = [
+        f"📊 *РЫНКИ И СИГНАЛЫ* — _{now}_",
+        "",
+        separator,
+        "🌍 *Живой контекст*",
+        separator,
+        live_formatted,
+    ]
+    if sm_block:
+        parts.extend([
+            "",
+            separator,
+            sm_block,
+        ])
+    parts.extend([
+        "",
+        separator,
+        bundle["signals_message"],
+    ])
+
+    full = "\n".join(parts)
     max_len = 3900
     if len(full) > max_len:
         full = full[: max_len - 24] + "\n\n_…часть текста скрыта_"
