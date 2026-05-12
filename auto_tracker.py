@@ -29,7 +29,10 @@ FNG_URL = "https://api.alternative.me/fng/"
 GITHUB_REPO = os.getenv("GITHUB_REPO", "ANAEHY/dialectic_edge")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
 GITHUB_PRICES_URL = f"https://api.github.com/repos/{GITHUB_REPO}/contents/prices.json"
-DIGEST_CACHE_URL = f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/DIGEST_CACHE.md"
+# Default branch — explicit fallback (`main` устаревший, репо мигрировал на `master`).
+# Configurable via GITHUB_DEFAULT_BRANCH env if нужно переехать обратно.
+_DEFAULT_BRANCH = os.getenv("GITHUB_DEFAULT_BRANCH", "master")
+DIGEST_CACHE_URL = f"https://raw.githubusercontent.com/{GITHUB_REPO}/{_DEFAULT_BRANCH}/DIGEST_CACHE.md"
 AUTO_TRACK_FILE = "AUTO_TRACK.md"
 
 
@@ -99,6 +102,21 @@ class PriceFetcher:
         self.db = price_db
         self.cache = {}
     
+    @staticmethod
+    def _parse_date_only(date: str) -> Optional[datetime]:
+        """Парсит '12.05.2026' или '12.05.2026 08:13' → datetime.
+
+        Было: strptime(date, '%d.%m.%Y') падало с 'unconverted data remains: 08:13'
+        если в DIGEST_CACHE.md дата была с временем.
+        """
+        if not date:
+            return None
+        date_only = str(date).strip().split()[0]
+        try:
+            return datetime.strptime(date_only, "%d.%m.%Y")
+        except ValueError:
+            return None
+
     async def get_historical_price(self, symbol: str, date: str) -> Optional[dict]:
         """Получить цену на дату (из БД или API)."""
         symbol_upper = symbol.upper().replace(" ", "")
@@ -134,7 +152,10 @@ class PriceFetcher:
         cg_id = coingecko_map.get(symbol)
         
         try:
-            date_obj = datetime.strptime(date, "%d.%m.%Y")
+            date_obj = self._parse_date_only(date)
+            if not date_obj:
+                logger.debug(f"Historical: can't parse date '{date}'")
+                return None
             
             # CoinGecko для крипты
             if cg_id:
@@ -181,11 +202,19 @@ class PriceFetcher:
         return None
     
     async def get_current_price(self, symbol: str) -> Optional[dict]:
-        """Текущая цена (кэш)."""
+        """Текущая цена (кэш).
+
+        Binance в prod-локациях часто возвращает HTTP 451 (гео-рестрикт),
+        добавил CoinGecko fallback для крипты.
+        """
         if symbol in self.cache:
             return self.cache[symbol]
         
         binance_map = {"BTC": "BTCUSDT", "ETH": "ETHUSDT", "BNB": "BNBUSDT", "SOL": "SOLUSDT"}
+        coingecko_map = {
+            "BTC": "bitcoin", "ETH": "ethereum", "BNB": "binancecoin",
+            "SOL": "solana", "XRP": "ripple", "DOGE": "dogecoin",
+        }
         yahoo_map = {
             "VIX": "^VIX", "S&P": "^GSPC", "SPX": "^GSPC",
             "NDX": "^NDX", "GOLD": "GC=F", "XAU": "GC=F",
@@ -207,6 +236,45 @@ class PriceFetcher:
                                 return result
                             else:
                                 logger.debug(f"Binance status {resp.status} for {symbol}")
+
+                    # Kraken fallback (no auth, geo-allowed, не лимитируется как CoinGecko)
+                    kraken_map = {
+                        "BTC": "XBTUSDT", "ETH": "ETHUSDT", "BNB": "BNBUSDT",
+                        "SOL": "SOLUSDT", "XRP": "XRPUSDT", "DOGE": "XDGUSDT",
+                    }
+                    kr_pair = kraken_map.get(symbol.upper())
+                    if kr_pair:
+                        kr_url = f"https://api.kraken.com/0/public/Ticker?pair={kr_pair}"
+                        async with session.get(kr_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                            if resp.status == 200:
+                                data = await resp.json()
+                                # Kraken возвращает {"result": {"XBTUSDT": {"c": ["80828.7", "0.0002"], ...}}}
+                                ticker_data = next(iter((data.get("result") or {}).values()), None)
+                                if ticker_data and ticker_data.get("c"):
+                                    try:
+                                        last_close = float(ticker_data["c"][0])
+                                        result = {"price": last_close, "change": 0}
+                                        self.cache[symbol] = result
+                                        return result
+                                    except (ValueError, IndexError, TypeError) as e:
+                                        logger.debug(f"Kraken parse error for {symbol}: {e}")
+                            else:
+                                logger.debug(f"Kraken status {resp.status} for {symbol}")
+
+                    # CoinGecko fallback last (rate-limited).
+                    cg_id = coingecko_map.get(symbol.upper())
+                    if cg_id:
+                        cg_url = f"https://api.coingecko.com/api/v3/simple/price?ids={cg_id}&vs_currencies=usd"
+                        async with session.get(cg_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                            if resp.status == 200:
+                                data = await resp.json()
+                                price = data.get(cg_id, {}).get("usd")
+                                if price:
+                                    result = {"price": float(price), "change": 0}
+                                    self.cache[symbol] = result
+                                    return result
+                            else:
+                                logger.debug(f"CoinGecko status {resp.status} for {symbol}")
 
                     ticker = yahoo_map.get(symbol.upper())
                     if ticker:
@@ -363,30 +431,75 @@ class ResultChecker:
         self.fetcher = price_fetcher
     
     async def check_forecast(self, forecast: dict) -> dict:
+        """Сверяет прогноз с реальностью.
+
+        ⚠️ 2026-05-12: было — `change` бралось из `priceChangePercent` Binance
+        `/ticker/24hr`, то есть 24-часовая rolling-дельта в момент запуска
+        трекера. На bullish апреле 2026 это давало одинаковый -1.09% для всех
+        дат, потому что трекер последний раз бежал когда BTC корректировался.
+        Реальная directional-accuracy там 36%, а не 25%.
+
+        Теперь: для direction-прогнозов (verdict/per-asset) считаем
+        **forward-delta** от даты прогноза D до min(D+7d, сегодня).
+        Это даёт релевантное движение по горизонту swing-стратегии.
+
+        Для price-прогнозов (конкретный уровень) сверяем с current_price
+        (старое поведение — не меняем).
+        """
         asset = forecast["asset"]
         forecast_val = forecast["forecast"]
         ftype = forecast["forecast_type"]
         date = forecast["date"]
         
         price_data = None
-        current_price = None
+        entry_price = None   # цена на дату прогноза D
+        eval_price = None    # цена на дату оценки (D+7d или сегодня)
         change = None
         
         asset_upper = asset.upper()
         
         if "FEAR" in asset_upper or "GREED" in asset_upper:
+            # F&G — у нас нет истории, можем сравнить только текущий с прогнозом.
             price_data = await self.fetcher.get_fear_greed(date)
             if price_data:
-                current_price = price_data.get("value", 0)
+                eval_price = price_data.get("value", 0)
+                entry_price = eval_price  # для F&G change не считаем
         else:
-            price_data = await self.fetcher.get_historical_price(asset, date)
-            if not price_data:
-                price_data = await self.fetcher.get_current_price(asset)
-            
-            if price_data:
-                current_price = price_data.get("price", 0)
-                change = price_data.get("change", 0)
+            # 1. Historical price at forecast date D (entry_price).
+            hist_at_d = await self.fetcher.get_historical_price(asset, date)
+            if hist_at_d and hist_at_d.get("price"):
+                entry_price = hist_at_d.get("price")
+
+            # 2. Evaluation price: price at D+7 if D+7 ≤ today, else today.
+            #    Для direction-прогнозов это и есть "что случилось через 7 дней?".
+            eval_at_horizon = None
+            try:
+                d_obj = PriceFetcher._parse_date_only(date)
+                if d_obj:
+                    horizon_days = 7
+                    eval_date = d_obj + timedelta(days=horizon_days)
+                    if eval_date.date() <= datetime.utcnow().date():
+                        eval_str = eval_date.strftime("%d.%m.%Y")
+                        eval_at_horizon = await self.fetcher.get_historical_price(asset, eval_str)
+            except Exception as e:
+                logger.debug(f"Eval-date parse error for {date}: {e}")
+
+            if eval_at_horizon and eval_at_horizon.get("price"):
+                eval_price = eval_at_horizon.get("price")
+            else:
+                # D+7 ещё не наступил, или Yahoo не дал — берём текущую.
+                current = await self.fetcher.get_current_price(asset)
+                if current:
+                    eval_price = current.get("price")
+
+            # 3. Compute true forward delta entry → eval. Это та цифра, которая
+            #    реально измеряет «попал ли прогноз?».
+            if entry_price and entry_price > 0 and eval_price:
+                change = (eval_price - entry_price) / entry_price * 100
         
+        # current_price — оставляем для обратной совместимости со старым кодом
+        # ниже (forecast_type == "price").
+        current_price = eval_price
         if current_price is None or current_price == 0:
             return {"result": "⚠️ Нет цены", "accuracy": "—", "fact": "—"}
         
@@ -408,7 +521,9 @@ class ResultChecker:
                 return {"result": "❌ Неверно", "accuracy": "0%", "fact": f"{current_price:.2f}"}
         
         else:
-            if not change:
+            # `if not change` ловил легитимный 0.0 как "нет данных". Используем
+            # явный None-check.
+            if change is None:
                 return {"result": "⚠️ Нет данных", "accuracy": "—", "fact": "—"}
             
             forecast_dir = forecast_val.upper()
