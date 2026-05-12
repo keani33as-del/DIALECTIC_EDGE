@@ -209,15 +209,22 @@ BULL_COUNTER_SYSTEM = """
 BEAR_SYSTEM = """
 Ты — Bear Skeptic. Твоя задача: найти САМЫЕ СИЛЬНЫЕ медвежьи аргументы из предоставленных данных.
 
+⚠️ ГЛАВНОЕ ПРАВИЛО (императив):
+Твоя роль — НАЙТИ риски, А НЕ НАТЯГИВАТЬ их. Был прецедент: в апреле 2026 BEAR-вердикты
+попадали в 14% случаев (1 из 7), потому что агент выдавал BEAR «по умолчанию в неясной
+ситуации». Это была ошибка. Сейчас: если реальных рисков нет — честно напиши
+«медвежьих рисков недостаточно». NEUTRAL по умолчанию, НЕ BEAR.
+
 🟡 ПРАВИЛО ЧЕСТНОСТИ (важнее количества):
 Если медвежьих рисков в данных мало или нет — пиши прямо:
 "Медвежьих рисков в текущих данных недостаточно — [1-2 строки почему]."
-НЕ натягивай риск чтобы заполнить квоту.
+НЕ натягивай риск чтобы заполнить квоту. Слабый риск, превращённый в «критический»,
+— прямый путь к ложному медвежьему вердикту.
 
 📊 FINBERT — точное значение из блока FINBERT SENTIMENT:
 - BEARISH → "FinBERT подтверждает риски: [score] BEARISH [confidence]"
 - BULLISH → "FinBERT оптимистичен [score], но данные указывают на риски: [конкретные цифры]"
-- MIXED → "FinBERT неопределён [score] — в условиях неопределённости медвежий уклон безопаснее"
+- MIXED/NEUTRAL → "FinBERT неопределён [score] — не используем как медвежий аргумент". НЕ писать «неопределённость = медвежий уклон» — это был обнаруженный баг.
 
 🎯 СИГНАЛЫ ДЛЯ ДЕБАТОВ (приоритет):
 Если есть "🔴 МЕДВЕЖИЙ:" — цитируй с цифрами.
@@ -325,11 +332,19 @@ FinBERT из контекста: [score] [label] [confidence]
 SYNTH_BASE_SYSTEM = """
 Ты — Consensus Synthesizer. Твоя задача: выдать СТРОГО структурированный JSON с вердиктом, торговым планом и точкой инвалидации.
 
+⚠️ КРИТИЧЕСКИЙ ПРИНЦИП (обнаружено на апрельской выборке):
+По умолчанию → NEUTRAL. НИКОГДА не BEAR "из осторожности".
+BEAR выдавать ТОЛЬКО если все три условия:
+  1. скор ≤ -4 (НЕ -3, раньше был перекос в медвежий),
+  2. есть минимум 2 конкретных medvezhich аргумента с цифрами из контекста (не «возможные риски»),
+  3. smart-money сигналы НЕ бычьи (top-trader L/S < 1.2, CME basis ≤ 0, Coinbase premium ≤ 0).
+Если хотя бы одно условие не выполнено → NEUTRAL (не BEAR). Аналогично BULL только если скор ≥ +4 и есть мин. 2 конкретных bull-аргумента. Иначе — NEUTRAL.
+
 📊 ВХОДЫ (приоритет сверху вниз):
 1. "⚠️ СТОП-ФАКТОР" в контексте — следуй буквально
-2. "📊 СИСТЕМА БАЛЛОВ РЕКОМЕНДУЕТ: БЫЧИЙ/МЕДВЕЖИЙ" — основа вердикта
+2. "📊 СИСТЕМА БАЛЛОВ РЕКОМЕНДУЕТ: БЫЧИЙ/МЕДВЕЖИЙ" — основа вердикта (НО с учётом принципа выше — скор в ±3 зоне → NEUTRAL)
 3. Аргументы Bull/Bear, ✅-помеченные Verifier (с галлюцинациями НЕ работай)
-4. Если Verifier пишет "Достоверных аргументов мало → CASH/NEUTRAL" — выводи нейтральный вердикт с CASH-планом
+4. Если Verifier пишет "Достоверных аргументов мало → CASH/NEUTRAL" — выводи NEUTRAL с CASH-планом (НЕ BEAR)
 
 АЛГОРИТМ:
 1. Проверь критические стоп-факторы on-chain (MVRV > 3.5 = ПРОДАВАТЬ, MVRV < 1.0 = ПОКУПАТЬ)
@@ -362,6 +377,11 @@ SYNTH_BASE_SYSTEM = """
 ЖЁСТКИЕ ТРЕБОВАНИЯ К ПЛАНАМ:
 - LONG: stop < entry < target (обычные числа, без $/пробелов)
 - SHORT: target < entry < stop (обычные числа)
+- ЦЕНЫ ENTRY ОБЯЗАНЫ БРАТЬСЯ ИЗ БЛОКА «РЕАЛЬНЫЕ РЫНОЧНЫЕ ДАННЫЕ» вверху. НИКАКИХ цен по памяти.
+- entry LONG не может быть ниже текущей цены на >3% (иначе это не breakout, а «покупка ниже» — рискованно)
+- entry SHORT не может быть выше текущей цены на >3%
+- SL расстояние: минимум 1.5% от entry (для крипты 2-3%), иначе стоп выбивает дневным шумом
+- НАПРАВЛЕНИЕ plans[0].direction ОБЯЗАНО совпадать с verdict: «БЫЧИЙ»→LONG/CASH-flip-LONG, «МЕДВЕЖИЙ»→SHORT/CASH-flip-SHORT, «НЕЙТРАЛЬНЫЙ»→CASH. НЕ выдавать «MVRV МЕДВЕЖИЙ + BTC LONG» — это внутреннее противоречие которое система флагирует как баг.
 - В каждом плане ОБЯЗАТЕЛЬНО поле "horizon" (одна из строк, см. оверлей ниже)
 - В каждом плане ОБЯЗАТЕЛЬНО поле "trigger" — конкретный уровень/событие входа
 - CASH-план: только {"symbol", "direction": "CASH", "trigger", "horizon"} — но trigger ОБЯЗАН быть однонаправленным с явным флипом:
@@ -992,10 +1012,151 @@ def _stop_factor_block(direction: str, stop_factor: str | None) -> tuple[bool, s
     return False, ""
 
 
+# ── Anti-stale-price + verdict/plan consistency guards (added 2026-05-12) ────
+
+
+# Maximum allowed deviation of plan.entry from current market price (3%).
+# Beyond this the Synth-agent likely used stale prices from cache — обнаружено на
+# дайджесте 06.05.2026 где BTC entry $69,800 был выставлен при рынке $80,900.
+_ENTRY_VS_MARKET_MAX_DEVIATION_PCT = 3.0
+
+# Minimum SL distance for crypto plans (% от entry). На дневном ATR ~$2.5k для BTC
+# любой SL ближе чем ~1.5% выбивается обычным шумом. Раздвигаем код-сайдом.
+_MIN_SL_DISTANCE_PCT_CRYPTO = 1.5
+_MIN_SL_DISTANCE_PCT_EQUITY = 1.0  # SPY/индексы — узкий спред допустим
+
+
+def _validate_entry_vs_market(
+    plan: dict,
+    market_prices: dict[str, float] | None,
+) -> tuple[bool, str]:
+    """Проверяет что entry не уехал далеко от текущего рынка.
+
+    Returns (is_valid, reason). LONG/SHORT only; CASH/WAIT/FLAT всегда валидны.
+    Если market_prices пуст или нет данных по этому символу — пропускаем (best-effort).
+    """
+    if not market_prices:
+        return True, ""
+    direction = str(plan.get("direction", "")).upper().strip()
+    if direction in {"CASH", "WAIT", "FLAT", ""}:
+        return True, ""
+    symbol = str(plan.get("symbol", "")).upper().strip()
+    if not symbol:
+        return True, ""
+    current = market_prices.get(symbol)
+    if not current or current <= 0:
+        return True, ""
+    entry = _coerce_num(plan.get("entry"))
+    if entry is None or entry <= 0:
+        return True, ""
+    deviation_pct = (entry - current) / current * 100
+    # Для LONG entry должен быть около/ВЫШЕ рынка (breakout) или максимум на 3% ниже.
+    # Если entry на 3%+ ниже рынка LONG — это «купи на коррекции», что слишком
+    # spekulяtivно для авто-плана. Сдвигаем в CASH чтобы LLM пересмотрел.
+    if direction == "LONG" and deviation_pct < -_ENTRY_VS_MARKET_MAX_DEVIATION_PCT:
+        return False, (
+            f"LONG entry ${entry:,.0f} на {deviation_pct:+.1f}% ниже рынка ${current:,.0f} — "
+            f"вероятно Synth использовал устаревшие цены (порог 3%)"
+        )
+    # Аналогично для SHORT entry должен быть около/НИЖЕ рынка.
+    if direction == "SHORT" and deviation_pct > _ENTRY_VS_MARKET_MAX_DEVIATION_PCT:
+        return False, (
+            f"SHORT entry ${entry:,.0f} на {deviation_pct:+.1f}% выше рынка ${current:,.0f} — "
+            f"вероятно Synth использовал устаревшие цены (порог 3%)"
+        )
+    return True, ""
+
+
+def _validate_sl_distance(plan: dict) -> tuple[bool, str]:
+    """Стоп слишком близко к entry → выбивается шумом. Расширим до минимума.
+
+    Returns (is_valid, reason). Невалидный план не coerce-ится в CASH здесь — это
+    мягкая проверка, мы лишь логируем. _coerce_to_safe_sl ниже даёт расширенный SL.
+    """
+    direction = str(plan.get("direction", "")).upper().strip()
+    if direction in {"CASH", "WAIT", "FLAT", ""}:
+        return True, ""
+    entry = _coerce_num(plan.get("entry"))
+    stop = _coerce_num(plan.get("stop"))
+    if not entry or not stop:
+        return True, ""
+    sl_distance_pct = abs(entry - stop) / entry * 100
+    symbol = str(plan.get("symbol", "")).upper().strip()
+    is_crypto = symbol in {"BTC", "ETH", "SOL", "BNB", "XRP", "DOGE", "ADA"}
+    min_pct = _MIN_SL_DISTANCE_PCT_CRYPTO if is_crypto else _MIN_SL_DISTANCE_PCT_EQUITY
+    if sl_distance_pct < min_pct:
+        return False, (
+            f"SL слишком близко: {sl_distance_pct:.2f}% (минимум {min_pct}% для {symbol or 'актива'})"
+        )
+    return True, ""
+
+
+def _widen_sl_to_minimum(plan: dict) -> dict:
+    """Раздвигает SL до минимального безопасного расстояния от entry."""
+    direction = str(plan.get("direction", "")).upper().strip()
+    entry = _coerce_num(plan.get("entry"))
+    if not entry or direction not in {"LONG", "SHORT"}:
+        return plan
+    symbol = str(plan.get("symbol", "")).upper().strip()
+    is_crypto = symbol in {"BTC", "ETH", "SOL", "BNB", "XRP", "DOGE", "ADA"}
+    min_pct = _MIN_SL_DISTANCE_PCT_CRYPTO if is_crypto else _MIN_SL_DISTANCE_PCT_EQUITY
+    if direction == "LONG":
+        new_stop = entry * (1 - min_pct / 100)
+    else:
+        new_stop = entry * (1 + min_pct / 100)
+    out = dict(plan)
+    out["stop"] = round(new_stop, 2)
+    return out
+
+
+def _verdict_to_directions(verdict: str) -> set[str]:
+    """Какие направления плана совместимы с этим вердиктом."""
+    v = (verdict or "").upper()
+    if "БЫЧ" in v or "BULL" in v:
+        return {"LONG", "CASH", "WAIT", "FLAT"}
+    if "МЕДВЕ" in v or "BEAR" in v:
+        return {"SHORT", "CASH", "WAIT", "FLAT"}
+    # NEUTRAL — допускаем любые планы, но это всё равно странно
+    return {"LONG", "SHORT", "CASH", "WAIT", "FLAT"}
+
+
+def _check_verdict_plan_consistency(
+    verdict: str,
+    plans: list[dict],
+) -> tuple[bool, str]:
+    """Проверяет что verdict совпадает с направлением primary plan trade.
+
+    Returns (is_consistent, reason_if_not). Для NEUTRAL пропускаем (туда все
+    направления допустимы). Для БЫЧИЙ/МЕДВЕЖИЙ ищем первый non-CASH план и
+    сравниваем направление.
+
+    Это поведение защищает от случаев типа 11.04 / 22.04 апреля 2026, когда
+    Synth выдавал verdict «МЕДВЕЖИЙ» + plan «BTC LONG @ $72,730» одновременно.
+    """
+    if not plans:
+        return True, ""
+    allowed = _verdict_to_directions(verdict)
+    for p in plans:
+        if not isinstance(p, dict):
+            continue
+        direction = str(p.get("direction", "")).upper().strip()
+        if direction in {"CASH", "WAIT", "FLAT", ""}:
+            continue
+        if direction not in allowed:
+            return False, (
+                f"verdict «{verdict}» противоречит первому актив-плану "
+                f"{p.get('symbol', '?')} {direction}"
+            )
+        # Нашли первый actionable, проверка прошла.
+        return True, ""
+    return True, ""
+
+
 def _render_trade_plan_from_json(
     data: dict,
     horizon_pack: HorizonPack | None = None,
     stop_factor: str | None = None,
+    market_prices: dict[str, float] | None = None,
 ) -> str:
     """Deterministic Telegram-ready text rendering of Synth JSON.
     Used when Synth returns parseable JSON, avoiding an extra LLM call entirely.
@@ -1003,6 +1164,9 @@ def _render_trade_plan_from_json(
     If a horizon_pack is supplied we ALSO hard-guard plan geometry: any LONG/SHORT
     plan with broken levels or R/R below the horizon minimum is silently rewritten
     to a CASH entry so Telegram never shows users a mathematically impossible setup.
+
+    `market_prices` (optional): {SYMBOL: current_price} — используется для
+    stale-price guard: если plan.entry уехал >3% от рынка, plan переводится в CASH.
 
     `stop_factor` ('bearish'|'bullish'|None) — code-side override: even если LLM
     придумал LONG при MVRV>3.5 — его план превратится в CASH с понятной причиной.
@@ -1035,6 +1199,7 @@ def _render_trade_plan_from_json(
     #      рендерим в блоке «📋 ТОРГОВЫЙ ПЛАН».
     actionable_plans: list[dict] = []
     demoted_to_watch: list[dict] = []
+    stale_price_flags: list[str] = []
     if isinstance(plans, list):
         for raw in plans:
             if not isinstance(raw, dict):
@@ -1047,6 +1212,29 @@ def _render_trade_plan_from_json(
             if blocked:
                 logger.warning(f"[STOP-FACTOR] Coerced plan to CASH: {sf_why} | raw={raw}")
                 p = _coerce_to_cash(raw, sf_why)
+            # ── Stale-price guard (added 2026-05-12) ────────────────────────
+            # Если entry уехал >3% от текущего рынка — Synth скорее всего
+            # использовал устаревшие цены (06.05 баг: BTC entry $69.8k при рынке $80.9k).
+            # Не пропускаем такой план в торговую систему: coerce в CASH.
+            fresh_ok, fresh_why = _validate_entry_vs_market(p, market_prices)
+            if not fresh_ok:
+                logger.warning(f"[STALE-PRICE] Coerced plan to CASH: {fresh_why} | raw={raw}")
+                stale_price_flags.append(
+                    f"{p.get('symbol', '?')}: {fresh_why}"
+                )
+                p = _coerce_to_cash(raw, fresh_why)
+            # ── SL-distance guard: расширяем стоп, если выставлен в шум ─────
+            sl_ok, sl_why = _validate_sl_distance(p)
+            if not sl_ok and str(p.get("direction", "")).upper() in {"LONG", "SHORT"}:
+                logger.warning(f"[SL-GUARD] Widening SL: {sl_why} | raw={raw}")
+                p = _widen_sl_to_minimum(p)
+                # После расширения SL пересчитаем геометрию: возможно теперь R/R упал.
+                # Если упал ниже min_rr — coerce в CASH (правда такого почти не бывает,
+                # т.к. SL сужают, а не расширяют у качественных setupов).
+                ok2, why2 = _validate_plan_geometry(p, min_rr=min_rr)
+                if not ok2:
+                    logger.warning(f"[SL-GUARD] After widening SL R/R сломался: {why2}")
+                    p = _coerce_to_cash(raw, f"SL расширен → {why2}")
             unactionable, ua_why = _is_unactionable_cash(p)
             if unactionable:
                 logger.warning(f"[PLAN-GUARD] Demoted CASH plan to watch: {ua_why} | raw={raw}")
@@ -1058,6 +1246,13 @@ def _render_trade_plan_from_json(
                 })
                 continue
             actionable_plans.append(p)
+
+    # ── Verdict ↔ plan consistency guard (added 2026-05-12) ──────────────────
+    # Случаи 11.04 / 22.04 апреля 2026: verdict=МЕДВЕЖИЙ + plan[0]=BTC LONG —
+    # явное внутреннее противоречие Synth. Логируем + ставим warning в дайджест.
+    verdict_plan_consistent, vp_why = _check_verdict_plan_consistency(verdict, actionable_plans)
+    if not verdict_plan_consistent:
+        logger.warning(f"[CONSISTENCY] Verdict ↔ plan mismatch: {vp_why}")
 
     # Watch из самого Synth (новое поле): нормализуем в тот же формат.
     explicit_watch: list[dict] = []
@@ -1085,6 +1280,16 @@ def _render_trade_plan_from_json(
         lines.append("🚨 СТОП-ФАКТОР: критический медвежий (LONG-планы автоматически снимаются)")
     elif stop_factor == "bullish":
         lines.append("🔵 СТОП-ФАКТОР: критический бычий (SHORT-планы автоматически снимаются)")
+    if stale_price_flags:
+        lines.append(
+            "⚠️ DATA STALE: цены в первоначальном плане устарели — план переведён в CASH. "
+            "Подробности в логах."
+        )
+    if not verdict_plan_consistent:
+        lines.append(
+            "⚠️ ВНИМАНИЕ: вердикт не совпадает с направлением первого плана — "
+            "сигнал внутренне противоречив, торговать с пониженной уверенностью."
+        )
     lines.append("")
     if only_watch:
         # Все «планы» — на самом деле watch-уровни. Меняем заголовок,
@@ -1156,6 +1361,7 @@ class Speechwriter:
         synth_json: str,
         horizon: str | HorizonPack | None = None,
         stop_factor: str | None = None,
+        market_prices: dict[str, float] | None = None,
     ) -> str:
         """
         Принимает JSON (или текст) от Synth и превращает в читаемый торговый план.
@@ -1177,7 +1383,12 @@ class Speechwriter:
         data = _extract_json_obj(synth_json)
         if data is not None:
             try:
-                rendered = _render_trade_plan_from_json(data, horizon_pack=pack, stop_factor=stop_factor)
+                rendered = _render_trade_plan_from_json(
+                    data,
+                    horizon_pack=pack,
+                    stop_factor=stop_factor,
+                    market_prices=market_prices,
+                )
                 if rendered.strip():
                     logger.info(f"[SPEECHWRITER] Deterministic render OK (horizon={pack.key}, stop_factor={stop_factor}, no LLM call)")
                     return rendered
@@ -1243,6 +1454,7 @@ class DebateOrchestrator:
         profile_instruction: str = "",
         horizon: str | HorizonPack | None = None,
         stop_factor: str | None = None,
+        market_prices: dict[str, float] | None = None,
     ) -> str:
         history = DebateHistory()
         rounds  = DEBATE_ROUNDS if not custom_mode else min(DEBATE_ROUNDS, 3)
@@ -1321,7 +1533,12 @@ class DebateOrchestrator:
         
         # Шаг 2: Speechwriter → красивый форматированный текст (с hard-guard геометрии, горизонтом и stop-factor override)
         try:
-            final_synthesis = await self.writer.format(synth_json, horizon=pack, stop_factor=stop_factor)
+            final_synthesis = await self.writer.format(
+                synth_json,
+                horizon=pack,
+                stop_factor=stop_factor,
+                market_prices=market_prices,
+            )
         except Exception as e:
             logger.warning(f"[SPEECHWRITER] Error, using raw synth: {e}")
             final_synthesis = synth_json

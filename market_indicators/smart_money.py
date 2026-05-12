@@ -363,48 +363,53 @@ def smart_money_score_contribution(s: SmartMoneySignals) -> tuple[int, list[str]
     """Считает вклад smart-money блока в общий score.
 
     Returns: (score_delta, bullish_reasons, bearish_reasons)
+
+    ⚠️ 2026-05-12: бустим веса smart-money. Старый max ±7 (≈18% общего скора)
+    выходил мал на фоне sentiment/news которые легко давали ±5. После апрельского
+    аудита смарт-мани оказались самым опережающим сигналом (особенно CME basis +
+    Coinbase premium), поэтому поднимаем максимум до ±11 (≈30% общего скора).
     """
     score = 0
     bullish: list[str] = []
     bearish: list[str] = []
 
-    # 1. Top-trader L/S
+    # 1. Top-trader L/S (max ±3, было ±2)
     if s.top_trader_ls_ratio is not None:
         if s.top_trader_ls_ratio >= 1.5:
-            score += 2
+            score += 3
             bullish.append(f"Top-trader L/S {s.top_trader_ls_ratio:.2f} — крупные в лонге")
         elif s.top_trader_ls_ratio >= 1.2:
             score += 1
             bullish.append(f"Top-trader L/S {s.top_trader_ls_ratio:.2f} — лёгкий лонг-перевес")
         elif s.top_trader_ls_ratio <= 0.7:
-            score -= 2
+            score -= 3
             bearish.append(f"Top-trader L/S {s.top_trader_ls_ratio:.2f} — крупные в шорте")
         elif s.top_trader_ls_ratio <= 0.85:
             score -= 1
             bearish.append(f"Top-trader L/S {s.top_trader_ls_ratio:.2f} — лёгкий шорт-перевес")
 
-    # 2. Coinbase Premium
+    # 2. Coinbase Premium (max ±3, было ±2 — US-институционалы — главный leading-сигнал)
     if s.coinbase_premium_pct is not None:
         if s.coinbase_premium_pct >= 0.20:
-            score += 2
+            score += 3
             bullish.append(f"Coinbase Premium +{s.coinbase_premium_pct:.2f}% — US-институционалы покупают")
         elif s.coinbase_premium_pct >= 0.05:
             score += 1
             bullish.append(f"Coinbase Premium +{s.coinbase_premium_pct:.2f}% — US bid pressure")
         elif s.coinbase_premium_pct <= -0.20:
-            score -= 2
+            score -= 3
             bearish.append(f"Coinbase Premium {s.coinbase_premium_pct:.2f}% — US-институционалы продают")
         elif s.coinbase_premium_pct <= -0.05:
             score -= 1
             bearish.append(f"Coinbase Premium {s.coinbase_premium_pct:.2f}% — US sell pressure")
 
-    # 3. CME Basis
+    # 3. CME Basis (max ±2, было ±1 — backwardation/контанго даёт направление за дни)
     if s.cme_basis_pct is not None:
         if s.cme_basis_pct >= 0.30:
-            score += 1
+            score += 2
             bullish.append(f"CME Basis +{s.cme_basis_pct:.2f}% — институционалы платят за фьючерс")
         elif s.cme_basis_pct <= -0.30:
-            score -= 1
+            score -= 2
             bearish.append(f"CME Basis {s.cme_basis_pct:.2f}% — backwardation")
 
     # 4. Funding dispersion

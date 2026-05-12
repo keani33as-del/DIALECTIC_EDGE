@@ -283,6 +283,22 @@ async def run_full_analysis(
         except Exception as e:
             logger.warning(f"On-chain/macro/scoring failed: {e}")
 
+    # Numeric prices for anti-stale-price guard in Speechwriter.
+    numeric_market_prices: dict[str, float] = {}
+    for _sym in ("BTC", "ETH", "SOL", "BNB", "XRP", "SPX", "NDX", "VIX", "GOLD", "OIL_WTI", "DXY"):
+        _entry = prices_dict.get(_sym) if isinstance(prices_dict, dict) else None
+        if isinstance(_entry, dict):
+            _p = _entry.get("price")
+            if isinstance(_p, (int, float)) and _p > 0:
+                numeric_market_prices[_sym] = float(_p)
+    if "SPX" in numeric_market_prices:
+        numeric_market_prices.setdefault("SPY", numeric_market_prices["SPX"])
+    if "GOLD" in numeric_market_prices:
+        numeric_market_prices.setdefault("GLD", numeric_market_prices["GOLD"])
+    if "OIL_WTI" in numeric_market_prices:
+        numeric_market_prices.setdefault("WTI", numeric_market_prices["OIL_WTI"])
+        numeric_market_prices.setdefault("USO", numeric_market_prices["OIL_WTI"])
+
     report = await _get_orchestrator().run_debate(
         news_context=news_context,
         live_prices=live_prices,
@@ -290,6 +306,7 @@ async def run_full_analysis(
         custom_mode=custom_mode,
         horizon=pack,
         stop_factor=stop_factor,
+        market_prices=numeric_market_prices,
     )
     report, removed_lines = sanitize_full_report(report)
     if removed_lines:

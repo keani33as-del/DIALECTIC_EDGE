@@ -2555,12 +2555,31 @@ async def legacy_run_full_analysis(
         "confidence": sentiment_result.confidence,
     }
 
+    # Numeric prices for anti-stale-price guard in Speechwriter. Извлекаем
+    # цены ровно для тех символов, которые могут попасть в торговый план.
+    numeric_market_prices: dict[str, float] = {}
+    for _sym in ("BTC", "ETH", "SOL", "BNB", "XRP", "SPX", "NDX", "VIX", "GOLD", "OIL_WTI", "DXY"):
+        _entry = prices_dict.get(_sym)
+        if isinstance(_entry, dict):
+            _p = _entry.get("price")
+            if isinstance(_p, (int, float)) and _p > 0:
+                numeric_market_prices[_sym] = float(_p)
+    # Алиасы которые иногда возвращает Synth: SPY=SPX, GLD=GOLD, USO/WTI=OIL_WTI
+    if "SPX" in numeric_market_prices:
+        numeric_market_prices.setdefault("SPY", numeric_market_prices["SPX"])
+    if "GOLD" in numeric_market_prices:
+        numeric_market_prices.setdefault("GLD", numeric_market_prices["GOLD"])
+    if "OIL_WTI" in numeric_market_prices:
+        numeric_market_prices.setdefault("WTI", numeric_market_prices["OIL_WTI"])
+        numeric_market_prices.setdefault("USO", numeric_market_prices["OIL_WTI"])
+
     orchestrator = DebateOrchestrator()
     report = await orchestrator.run_debate(
         news_context=news_context,
         live_prices=live_prices,
         profile_instruction=profile_instruction + sentiment_block,
-        custom_mode=custom_mode
+        custom_mode=custom_mode,
+        market_prices=numeric_market_prices,
     )
     report, _san_lines = sanitize_full_report(report)
     if _san_lines:
