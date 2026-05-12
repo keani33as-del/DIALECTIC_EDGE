@@ -351,17 +351,21 @@ class DigestParser:
                     verdict_direction = "BEARISH"
                 break
         
+        # Регэксы поддерживают числа с запятыми/пробелами (например "S&P 500: 7,300.42").
+        # Без этого парсер раньше извлекал "7" из "7,300.42" → ложные forecast="0/7" в /audit.
+        # \b и явный лидирующий separator (=, :, $) защищают от случайных совпадений в тексте.
+        _NUM = r"\$?(\d[\d,\u00A0\s]{0,8}\.?\d*)"  # 7,300.42 / 81 046 / 80,792
         price_patterns = [
-            (r'VIX\s*[:=]*\s*(\d+\.?\d*)', "VIX"),
-            (r'S[&]?P\s*500?\s*[:=]*\s*(\d+\.?\d*)', "S&P"),
-            (r'SPX\s*[:=]*\s*(\d+\.?\d*)', "S&P"),
-            (r'(?:Нефть|WTI)\s*[:=]*\s*\$?(\d+\.?\d*)', "Нефть"),
-            (r'(?:Gold|Золото|XAU)\s*[:=]*\s*\$?(\d+\.?\d*)', "Gold"),
-            (r'Fear\s*&\s*Greed\s*[:=]*\s*(\d+)', "Fear&Greed"),
-            (r'BTC\s*[:$=]\s*([\d,]+\.?\d*)', "BTC"),
-            (r'ETH\s*[:$=]\s*([\d,]+\.?\d*)', "ETH"),
-            (r'BNB\s*[:$=]\s*([\d,]+\.?\d*)', "BNB"),
-            (r'SOL\s*[:$=]\s*([\d,]+\.?\d*)', "SOL"),
+            (rf'\bVIX\b\s*[:=]+\s*{_NUM}', "VIX"),
+            (rf'\bS[&]?P\s*500?\b\s*[:=]+\s*{_NUM}', "S&P"),
+            (rf'\bSPX\b\s*[:=]+\s*{_NUM}', "S&P"),
+            (rf'(?:\bНефть\b|\bWTI\b)\s*[:=]+\s*{_NUM}', "Нефть"),
+            (rf'(?:\bGold\b|\bЗолото\b|\bXAU\b)\s*[:=]+\s*{_NUM}', "Gold"),
+            (rf'\bFear\s*&\s*Greed\b\s*[:=]+\s*(\d{{1,3}})\b', "Fear&Greed"),
+            (rf'\bBTC\b\s*[:$=]+\s*{_NUM}', "BTC"),
+            (rf'\bETH\b\s*[:$=]+\s*{_NUM}', "ETH"),
+            (rf'\bBNB\b\s*[:$=]+\s*{_NUM}', "BNB"),
+            (rf'\bSOL\b\s*[:$=]+\s*{_NUM}', "SOL"),
         ]
         
         direction_patterns = [
@@ -505,9 +509,33 @@ class ResultChecker:
         
         if ftype == "price":
             try:
-                forecast_num = float(forecast_val)
-            except:
+                # Извлечённые цены могут содержать запятые/non-breaking spaces:
+                # "7,300.42", "81 046", "80\u00A0792" — нормализуем перед float().
+                norm = (
+                    str(forecast_val)
+                    .replace(",", "")
+                    .replace("\u00A0", "")
+                    .replace(" ", "")
+                    .strip()
+                )
+                if not norm:
+                    return {"result": "⚠️ Ошибка парсинга", "accuracy": "—"}
+                forecast_num = float(norm)
+            except (ValueError, TypeError):
                 return {"result": "⚠️ Ошибка парсинга", "accuracy": "—"}
+            
+            # Игнорируем явно сломанные парс-результаты (0, 1, 7 и т.п. — это
+            # точно не VIX/S&P/Нефть, а артефакт регэкспа). Реальный VIX > 10,
+            # S&P > 1000, нефть > 20, золото > 100, BTC > 1000.
+            min_thresholds = {
+                "VIX": 8.0, "S&P": 1000.0, "SPX": 1000.0, "NDX": 1000.0,
+                "Нефть": 20.0, "Gold": 100.0, "XAU": 100.0,
+                "BTC": 1000.0, "ETH": 100.0, "BNB": 20.0, "SOL": 5.0,
+                "Fear&Greed": 0.0,  # F&G 0-100, не фильтруем
+            }
+            min_val = min_thresholds.get(asset, 0.0)
+            if forecast_num < min_val:
+                return {"result": "⚠️ Парс-ошибка", "accuracy": "—", "fact": "—"}
             
             diff_pct = abs((current_price - forecast_num) / forecast_num * 100) if forecast_num > 0 else 100
             
