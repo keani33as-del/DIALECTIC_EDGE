@@ -652,7 +652,9 @@ def build_short_report(parts: dict, stars: str, pct: int, horizon: HorizonPack |
     else:
         lines.extend(["", "📋 *Торговый план:*"])
         if plans:
-            for plan in plans[:5]:
+            # Per-asset coverage: 5-6 крипто (BTC/ETH/SOL/BNB/XRP) + 6 макро
+            # (SPX/NDX/GOLD/OIL/DXY/VIX) → до 11 планов в одном дайджесте.
+            for plan in plans[:12]:
                 lines.append(f"• {_digest_plan_line(plan)}")
         elif key_trigger:
             lines.append(f"• {key_trigger}")
@@ -661,7 +663,7 @@ def build_short_report(parts: dict, stars: str, pct: int, horizon: HorizonPack |
 
         if watch_levels:
             lines.extend(["", "👁 *Наблюдение (без сделки):*"])
-            for w in watch_levels[:4]:
+            for w in watch_levels[:8]:
                 chunks = []
                 sym = (w.get("symbol") or "").strip()
                 level = (w.get("level") or "").strip()

@@ -36,6 +36,8 @@ PRICE_SANITY = {
     "BTC":     (20_000,  250_000),
     "ETH":     (500,     30_000),
     "SOL":     (10,      3_000),
+    "BNB":     (100,     5_000),
+    "XRP":     (0.2,     50),
     "SPX":     (4_000,   12_000),
     "NDX":     (10_000,  35_000),
     "VIX":     (5,       90),
@@ -159,12 +161,14 @@ async def _coingecko_crypto(session) -> dict:
     out = {}
     try:
         url    = "https://api.coingecko.com/api/v3/simple/price"
-        params = {"ids": "bitcoin,ethereum,solana", "vs_currencies": "usd",
+        params = {"ids": "bitcoin,ethereum,solana,binancecoin,ripple",
+                  "vs_currencies": "usd",
                   "include_24hr_change": "true"}
         async with session.get(url, params=params, timeout=TIMEOUT) as r:
             if r.status == 200:
                 data = await r.json()
-                for cg_id, key in [("bitcoin","BTC"),("ethereum","ETH"),("solana","SOL")]:
+                for cg_id, key in [("bitcoin","BTC"),("ethereum","ETH"),("solana","SOL"),
+                                    ("binancecoin","BNB"),("ripple","XRP")]:
                     if cg_id in data:
                         p = float(data[cg_id].get("usd", 0))
                         c = float(data[cg_id].get("usd_24h_change", 0))
@@ -286,6 +290,96 @@ async def _fetch_trend_data(session, symbol_binance: str, key: str) -> dict:
 
 # ─── Yahoo Finance ────────────────────────────────────────────────────────────
 
+async def _fetch_yahoo_trend(session, ticker: str, key: str) -> dict:
+    """MA50/MA200/ATR(14d) для макро-активов через Yahoo Finance.
+
+    Используется для SPX/NDX/VIX/DXY/OIL/GOLD — у крипты MA-метрики уже
+    приходят из Binance через `_fetch_trend_data`. Аналогичная структура
+    результата: `ma50`, `ma200`, `above_ma50`, `above_ma200`, `atr_14d`,
+    `change_7d`, `change_30d`, `trend`/`trend_emoji`.
+
+    Yahoo `range=1y` → ~250 дневных свечей → MA200 считается корректно.
+    """
+    result = {}
+    try:
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
+        async with session.get(url, params={"interval": "1d", "range": "1y"},
+                               timeout=TIMEOUT) as r:
+            if r.status != 200:
+                return result
+            data = await r.json()
+            chart = data.get("chart") or {}
+            results = chart.get("result") or []
+            if not results:
+                return result
+            r0 = results[0]
+            ind = r0.get("indicators") or {}
+            quotes = (ind.get("quote") or [{}])[0]
+            closes_raw = quotes.get("close") or []
+            highs_raw = quotes.get("high") or []
+            lows_raw = quotes.get("low") or []
+            # Yahoo может вернуть None для нерабочих дней
+            closes = [c for c in closes_raw if c is not None]
+            highs = [h for h in highs_raw if h is not None]
+            lows = [l for l in lows_raw if l is not None]
+            if len(closes) < 50:
+                return result
+            current = closes[-1]
+
+            if len(closes) >= 8:
+                result["change_7d"] = round((current - closes[-8]) / closes[-8] * 100, 2)
+            if len(closes) >= 31:
+                result["change_30d"] = round((current - closes[-31]) / closes[-31] * 100, 2)
+
+            if len(closes) >= 50:
+                ma50 = sum(closes[-50:]) / 50
+                result["ma50"] = round(ma50, 2)
+                result["above_ma50"] = current > ma50
+            if len(closes) >= 200:
+                ma200 = sum(closes[-200:]) / 200
+                result["ma200"] = round(ma200, 2)
+                result["above_ma200"] = current > ma200
+
+            # ATR(14d) — нужно совпадение длин закрытий с high/low
+            if len(closes) >= 15 and len(highs) >= 15 and len(lows) >= 15:
+                # Сводим списки к одинаковой длине (берём последние 15)
+                n = min(len(closes), len(highs), len(lows))
+                if n >= 15:
+                    cs = closes_raw[-n:]
+                    hs = highs_raw[-n:]
+                    ls = lows_raw[-n:]
+                    trs = []
+                    for i in range(-14, 0):
+                        try:
+                            h = float(hs[i]); l = float(ls[i]); prev_c = float(cs[i - 1])
+                            trs.append(max(h - l, abs(h - prev_c), abs(l - prev_c)))
+                        except (TypeError, ValueError):
+                            continue
+                    if trs:
+                        atr_14 = sum(trs) / len(trs)
+                        result["atr_14d"] = round(atr_14, 4)
+                        result["atr_14d_pct"] = round(atr_14 / current * 100, 2)
+
+            # Простой trend label (как в _fetch_trend_data, но без HH/HL)
+            ch_7d = result.get("change_7d", 0) or 0
+            ch_30d = result.get("change_30d", 0) or 0
+            above_ma50 = result.get("above_ma50", True)
+            if ch_7d > 2 and above_ma50:
+                result["trend"], result["trend_emoji"] = "UPTREND", "📈"
+            elif ch_7d < -2 and not above_ma50:
+                result["trend"], result["trend_emoji"] = "DOWNTREND", "📉"
+            elif abs(ch_7d) < 3 and abs(ch_30d) < 8:
+                result["trend"], result["trend_emoji"] = "SIDEWAYS", "↔️"
+            elif ch_7d >= 0:
+                result["trend"], result["trend_emoji"] = "UPTREND", "📈"
+            else:
+                result["trend"], result["trend_emoji"] = "DOWNTREND", "📉"
+
+    except Exception as e:
+        logger.debug(f"Yahoo trend {ticker}: {e}")
+    return result
+
+
 async def _yahoo(session, ticker: str, key: str) -> dict | None:
     try:
         url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
@@ -393,13 +487,16 @@ async def _fear_greed(session) -> dict:
 async def fetch_realtime_prices() -> dict:
     prices = {}
     async with aiohttp.ClientSession(headers=HEADERS) as session:
-        (btc, eth, sol,
+        (btc, eth, sol, bnb, xrp,
          spx, ndx, vix, dxy, oil, gold,
          fed_rate, cpi_raw, fng,
-         trend_btc, trend_eth, trend_sol) = await asyncio.gather(
+         trend_btc, trend_eth, trend_sol, trend_bnb, trend_xrp,
+         trend_spx, trend_ndx, trend_vix, trend_dxy, trend_oil, trend_gold) = await asyncio.gather(
             _binance(session, "BTCUSDT", "BTC"),
             _binance(session, "ETHUSDT", "ETH"),
             _binance(session, "SOLUSDT", "SOL"),
+            _binance(session, "BNBUSDT", "BNB"),
+            _binance(session, "XRPUSDT", "XRP"),
             _yahoo(session, "^GSPC",    "SPX"),
             _yahoo(session, "^NDX",     "NDX"),
             _yahoo(session, "^VIX",     "VIX"),
@@ -412,12 +509,21 @@ async def fetch_realtime_prices() -> dict:
             _fetch_trend_data(session, "BTCUSDT", "BTC"),
             _fetch_trend_data(session, "ETHUSDT", "ETH"),
             _fetch_trend_data(session, "SOLUSDT", "SOL"),
+            _fetch_trend_data(session, "BNBUSDT", "BNB"),
+            _fetch_trend_data(session, "XRPUSDT", "XRP"),
+            _fetch_yahoo_trend(session, "^GSPC",    "SPX"),
+            _fetch_yahoo_trend(session, "^NDX",     "NDX"),
+            _fetch_yahoo_trend(session, "^VIX",     "VIX"),
+            _fetch_yahoo_trend(session, "DX-Y.NYB", "DXY"),
+            _fetch_yahoo_trend(session, "CL=F",     "OIL_WTI"),
+            _fetch_yahoo_trend(session, "GC=F",     "GOLD"),
             return_exceptions=True,
         )
 
         # Крипта с fallback
         missing = []
-        for key, val in [("BTC", btc), ("ETH", eth), ("SOL", sol)]:
+        for key, val in [("BTC", btc), ("ETH", eth), ("SOL", sol),
+                         ("BNB", bnb), ("XRP", xrp)]:
             if val and not isinstance(val, Exception):
                 prices[key] = val
             else:
@@ -428,18 +534,35 @@ async def fetch_realtime_prices() -> dict:
                 if k in cg:
                     prices[k] = cg[k]
 
-        # Добавляем тренд к крипто данным
-        for key, trend_val in [("BTC", trend_btc), ("ETH", trend_eth), ("SOL", trend_sol)]:
+        # Добавляем тренд+MA к крипто данным
+        for key, trend_val in [("BTC", trend_btc), ("ETH", trend_eth), ("SOL", trend_sol),
+                                ("BNB", trend_bnb), ("XRP", trend_xrp)]:
             if key in prices and trend_val and not isinstance(trend_val, Exception) and trend_val:
                 prices[key].update(trend_val)
                 # Прокидываем ATR в top-level для SL-guard (market_prices["ATR_BTC"])
                 if "atr_14d" in trend_val:
                     prices[f"ATR_{key}"] = trend_val["atr_14d"]
+                # Прокидываем MA200/MA50 в top-level — Synth use'ит их в plans
+                if "ma200" in trend_val:
+                    prices[f"MA200_{key}"] = trend_val["ma200"]
+                if "ma50" in trend_val:
+                    prices[f"MA50_{key}"] = trend_val["ma50"]
 
+        # Макро: prices + MA-тренд
         for key, val in [("SPX", spx), ("NDX", ndx), ("VIX", vix),
                          ("DXY", dxy), ("OIL_WTI", oil), ("GOLD", gold)]:
             if val and not isinstance(val, Exception):
                 prices[key] = val
+        for key, trend_val in [("SPX", trend_spx), ("NDX", trend_ndx), ("VIX", trend_vix),
+                                ("DXY", trend_dxy), ("OIL_WTI", trend_oil), ("GOLD", trend_gold)]:
+            if key in prices and trend_val and not isinstance(trend_val, Exception) and trend_val:
+                prices[key].update(trend_val)
+                if "ma200" in trend_val:
+                    prices[f"MA200_{key}"] = trend_val["ma200"]
+                if "ma50" in trend_val:
+                    prices[f"MA50_{key}"] = trend_val["ma50"]
+                if "atr_14d" in trend_val:
+                    prices[f"ATR_{key}"] = trend_val["atr_14d"]
 
         prices["MACRO"] = {
             "fed_rate": fed_rate if not isinstance(fed_rate, Exception) else "N/A",
@@ -482,7 +605,8 @@ def format_prices_for_agents(prices: dict) -> str:
     lines = [f"=== ВЕРИФИЦИРОВАННЫЕ РЫНОЧНЫЕ ДАННЫЕ ({now}) ==="]
 
     lines.append("\n[КРИПТОРЫНОК]")
-    for k, label in [("BTC","Bitcoin"),("ETH","Ethereum"),("SOL","Solana")]:
+    for k, label in [("BTC","Bitcoin"),("ETH","Ethereum"),("SOL","Solana"),
+                     ("BNB","BNB"),("XRP","XRP")]:
         if k in prices:
             p  = prices[k]
             ch = p["change_24h"]
@@ -544,6 +668,25 @@ def format_prices_for_agents(prices: dict) -> str:
             lines.append(f"  F&G тренд 7д: {trend_label} ({' → '.join(str(x) for x in fng_hist[:5])})")
         lines.append("  [!] CPI = индекс (~323), НЕ %. Инфляция = YoY (выше).")
 
+    # MA200/MA50 для макро — нужны Synth-агенту, чтобы строить per-asset планы
+    # с двумя триггерами (закрытие выше MA200 → LONG; ниже MA50 → SHORT).
+    def _macro_trend_line(p: dict, unit: str = "") -> str:
+        ma50 = p.get("ma50"); ma200 = p.get("ma200")
+        above50 = p.get("above_ma50"); above200 = p.get("above_ma200")
+        trend = p.get("trend", ""); trend_e = p.get("trend_emoji", "")
+        chunks = []
+        if trend:
+            chunks.append(f"{trend_e} ТРЕНД: {trend}")
+        if ma50 is not None:
+            pos50 = "выше" if above50 else "ниже"
+            pct50 = ((p['price'] - ma50) / ma50 * 100) if ma50 else 0
+            chunks.append(f"MA50: {ma50:,.2f}{unit} ({pos50}, {pct50:+.1f}%)")
+        if ma200 is not None:
+            pos200 = "выше" if above200 else "ниже"
+            pct200 = ((p['price'] - ma200) / ma200 * 100) if ma200 else 0
+            chunks.append(f"MA200: {ma200:,.2f}{unit} ({pos200}, {pct200:+.1f}%)")
+        return " | ".join(chunks)
+
     lines.append("\n[ФОНДОВЫЕ ИНДЕКСЫ]")
     for k, label in [("SPX","S&P 500"),("NDX","Nasdaq 100"),("VIX","VIX")]:
         if k in prices:
@@ -551,6 +694,9 @@ def format_prices_for_agents(prices: dict) -> str:
             ch = p["change_24h"]
             lines.append(f"  {label}: {p['price']:,.2f}  "
                          f"{'🟢' if ch>=0 else '🔴'} {ch:+.2f}%  [{p['source']}]")
+            tl = _macro_trend_line(p)
+            if tl:
+                lines.append(f"    {tl}")
 
     lines.append("\n[СЫРЬЁ И ВАЛЮТЫ]")
     for k, label, unit in [("OIL_WTI","Нефть WTI","$/барр"),
@@ -562,6 +708,9 @@ def format_prices_for_agents(prices: dict) -> str:
             u  = f" {unit}" if unit else ""
             lines.append(f"  {label}: {p['price']:,.2f}{u}  "
                          f"{'🟢' if ch>=0 else '🔴'} {ch:+.2f}%  [{p['source']}]")
+            tl = _macro_trend_line(p, unit=u if k == "OIL_WTI" or k == "GOLD" else "")
+            if tl:
+                lines.append(f"    {tl}")
 
     lines.append("\n⚠️ ИНСТРУКЦИЯ: используй ТОЛЬКО эти цифры. "
                  "Если актива нет — пиши 'нет данных'.")
