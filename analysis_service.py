@@ -299,6 +299,15 @@ async def run_full_analysis(
         numeric_market_prices.setdefault("WTI", numeric_market_prices["OIL_WTI"])
         numeric_market_prices.setdefault("USO", numeric_market_prices["OIL_WTI"])
 
+    # ATR keys прокидываются отдельно (pre-live-hardening): web_search кладёт
+    # их как top-level prices["ATR_BTC"] и т.д. — иначе ATR-aware SL guard
+    # падает к fixed-fallback.
+    for _sym in ("BTC", "ETH", "SOL", "BNB", "XRP"):
+        _atr_key = f"ATR_{_sym}"
+        _atr_val = prices_dict.get(_atr_key) if isinstance(prices_dict, dict) else None
+        if isinstance(_atr_val, (int, float)) and _atr_val > 0:
+            numeric_market_prices[_atr_key] = float(_atr_val)
+
     report = await _get_orchestrator().run_debate(
         news_context=news_context,
         live_prices=live_prices,
