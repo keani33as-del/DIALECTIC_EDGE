@@ -90,19 +90,32 @@ def _parse_auto_track() -> Optional[Calibration]:
 
     cutoff = datetime.utcnow() - timedelta(days=_WINDOW_DAYS)
 
-    # Ищем строки таблицы с VERDICT (closed: ✅ или ❌)
-    # Формат AUTO_TRACK.md (из AutoTracker.generate_markdown):
-    # | 11.05.2026 | Daily Digest | VERDICT | BULLISH | ✅ Верно | 100% | +2.1% |
+    # Ищем строки closed-таблицы с direction-прогнозами (VERDICT/BTC/ETH/SOL/BNB).
+    # Формат AUTO_TRACK.md (closed table):
+    # | 11.05.2026 14:39 | BTC | Daily Digest | BULLISH | +2.1% | ✅ Верно | 100% |
+    # Старый regex требовал ровно `\d{2}.\d{2}.\d{4}` в первой колонке — но
+    # реальные ячейки имеют формат "11.05.2026 14:39" (date + time), плюс мы
+    # учитывали ТОЛЬКО VERDICT (не per-asset). Без этого calibration никогда
+    # не имела данных и всегда падала на snapshot.
     row_re = re.compile(
-        r"\|\s*(\d{2}\.\d{2}\.\d{4})\s*\|[^|]*\|\s*VERDICT\s*\|\s*"
-        r"(BULLISH|BEARISH|NEUTRAL)\s*\|\s*([^|]+)\|",
-        re.IGNORECASE
+        r"\|\s*(\d{2}\.\d{2}\.\d{4})(?:\s+\d{1,2}:\d{2})?\s*\|"
+        r"\s*(VERDICT|BTC|ETH|SOL|BNB|XRP)\s*\|"
+        r"[^|]*\|"
+        r"\s*(BULLISH|BEARISH|NEUTRAL)\s*\|"
+        r"[^|]*\|"
+        r"\s*([^|]+)\|",
+        re.IGNORECASE,
     )
 
     buckets = {"BULLISH": [0, 0], "BEARISH": [0, 0], "NEUTRAL": [0, 0]}  # [wins, total]
 
     for m in row_re.finditer(text):
-        date_str, verdict, result = m.group(1), m.group(2).upper(), m.group(3)
+        date_str, _asset, verdict, result = (
+            m.group(1),
+            m.group(2).upper(),
+            m.group(3).upper(),
+            m.group(4),
+        )
         try:
             d = datetime.strptime(date_str, "%d.%m.%Y")
         except ValueError:
