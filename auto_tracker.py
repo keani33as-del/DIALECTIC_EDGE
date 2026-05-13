@@ -518,7 +518,12 @@ class ResultChecker:
         eval_price = None    # цена на дату оценки (D+7d или сегодня)
         change = None
         
-        asset_upper = asset.upper()
+        # VERDICT — общий вердикт по сессии. У него нет своего тикера: он применяется
+        # к рисковым активам (по умолчанию BTC, как primary risk asset). Без этого
+        # маппинга все VERDICT-прогнозы возвращают "Нет цены" и calibration_cache
+        # не получает live-данные (всегда падает на snapshot апрель 2026).
+        price_asset = "BTC" if asset.upper() == "VERDICT" else asset
+        asset_upper = price_asset.upper()
         
         if "FEAR" in asset_upper or "GREED" in asset_upper:
             # F&G — у нас нет истории, можем сравнить только текущий с прогнозом.
@@ -528,7 +533,7 @@ class ResultChecker:
                 entry_price = eval_price  # для F&G change не считаем
         else:
             # 1. Historical price at forecast date D (entry_price).
-            hist_at_d = await self.fetcher.get_historical_price(asset, date)
+            hist_at_d = await self.fetcher.get_historical_price(price_asset, date)
             if hist_at_d and hist_at_d.get("price"):
                 entry_price = hist_at_d.get("price")
 
@@ -542,7 +547,7 @@ class ResultChecker:
                     eval_date = d_obj + timedelta(days=horizon_days)
                     if eval_date.date() <= datetime.utcnow().date():
                         eval_str = eval_date.strftime("%d.%m.%Y")
-                        eval_at_horizon = await self.fetcher.get_historical_price(asset, eval_str)
+                        eval_at_horizon = await self.fetcher.get_historical_price(price_asset, eval_str)
             except Exception as e:
                 logger.debug(f"Eval-date parse error for {date}: {e}")
 
@@ -550,7 +555,7 @@ class ResultChecker:
                 eval_price = eval_at_horizon.get("price")
             else:
                 # D+7 ещё не наступил, или Yahoo не дал — берём текущую.
-                current = await self.fetcher.get_current_price(asset)
+                current = await self.fetcher.get_current_price(price_asset)
                 if current:
                     eval_price = current.get("price")
 
