@@ -459,8 +459,16 @@ async def fetch_markets_bundle(github_repo: str | None = None) -> dict:
     }
 
 
-async def build_markets_panel_message(github_repo: str | None = None) -> tuple[str, dict]:
-    """Полный текст для команды /markets: живой контекст + smart-money + сигналы."""
+async def build_markets_panel_message(github_repo: str | None = None) -> tuple[list[str], dict]:
+    """Текст для команды /markets: живой контекст + smart-money + сигналы.
+
+    Раньше возвращал одну строку и резал хвост по `max_len=3900` — из-за чего
+    блок «🏛 SMART-MONEY» обрезался посередине, когда live-контекст распухал
+    (5 крипто + макро + индексы + сырьё + COT + ETF flows = ~3.5k символов).
+    Теперь возвращаем **список сообщений**: первое — живой контекст, второе —
+    smart-money + сигналы. Caller отправляет их последовательно, клавиатура
+    цепляется к последнему.
+    """
     from web_search import get_full_realtime_context
     try:
         from market_indicators.smart_money import (
@@ -496,31 +504,30 @@ async def build_markets_panel_message(github_repo: str | None = None) -> tuple[s
     now = datetime.now().strftime("%d.%m.%Y %H:%M")
     separator = "━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-    parts = [
+    # ── Сообщение 1: заголовок + живой контекст ───────────────────────────
+    msg_live = "\n".join([
         f"📊 *РЫНКИ И СИГНАЛЫ* — _{now}_",
         "",
         separator,
         "🌍 *Живой контекст*",
         separator,
         live_formatted,
-    ]
-    if sm_block:
-        parts.extend([
-            "",
-            separator,
-            sm_block,
-        ])
-    parts.extend([
-        "",
-        separator,
-        bundle["signals_message"],
     ])
 
-    full = "\n".join(parts)
-    max_len = 3900
-    if len(full) > max_len:
-        full = full[: max_len - 24] + "\n\n_…часть текста скрыта_"
-    return full, bundle
+    # ── Сообщение 2: smart-money + сигналы ────────────────────────────────
+    extra_parts: list[str] = []
+    if sm_block:
+        extra_parts.extend([separator, sm_block, ""])
+    extra_parts.extend([separator, bundle["signals_message"]])
+    msg_extra = "\n".join(extra_parts)
+
+    # Telegram cap = 4096; защита на случай если live_formatted распухнет ещё.
+    messages: list[str] = []
+    for chunk in (msg_live, msg_extra):
+        if len(chunk) > 4000:
+            chunk = chunk[: 4000 - 24] + "\n\n_…часть текста скрыта_"
+        messages.append(chunk)
+    return messages, bundle
 
 
 class SignalsSystem:
