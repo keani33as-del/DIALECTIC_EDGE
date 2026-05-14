@@ -144,6 +144,111 @@ def _direction_to_int(direction: str) -> int:
     return 0
 
 
+def _fmt_price(value) -> str:
+    """Адаптивная точность для цены в нотификации (зеркало main._fmt_money_compact).
+
+    XRP ($1.46) и DOGE ($0.08) с ${:,.2f} были бы $1.46 и $0.08, но
+    для совсем малых (<1) хочется 4 знака, для >=100 — 0. Не используем
+    main.* чтобы signal_trader оставался самодостаточным.
+    """
+    if value is None:
+        return "—"
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    abs_v = abs(v)
+    if abs_v < 1:
+        body = f"{v:,.4f}"
+    elif abs_v < 100:
+        body = f"{v:,.2f}"
+    else:
+        body = f"{v:,.0f}"
+    return body
+
+
+def _fmt_pct(delta_pct: float) -> str:
+    """`+3.0%` / `−2.0%` (минус юникодный, чтобы Telegram рендерил красиво)."""
+    sign = "+" if delta_pct >= 0 else "−"
+    return f"{sign}{abs(delta_pct):.1f}%"
+
+
+def _render_opened_positions_message(opened_events: list[dict]) -> str:
+    """Красивый текст для уведомления «🎯 НОВЫЕ ПОЗИЦИИ».
+
+    Раньше формат был:
+        🟢 SOL BUY
+          Вход: $91.32
+          Тейк: $94.06 | Стоп: $89.49
+          Score: 13.0 | Сигнал: SHORT
+
+    Юзера сбивало «зелёный BUY» одновременно с «Сигнал: SHORT» — выглядело
+    как нарушение логики. На самом деле это контр-трендовый «buy-the-dip»
+    из нейтрального режима (см. _inject_signal_only_candidates). Новый
+    формат отделяет две стратегии и добавляет процент к TP/SL.
+    """
+    lines = ["🎯 *НОВЫЕ ПОЗИЦИИ*", ""]
+    for ev in opened_events:
+        sym = ev.get("symbol", "?")
+        direction = (ev.get("direction") or "").upper()
+        is_long = direction == "BUY"
+        side_emoji = "🟢" if is_long else "🔴"
+        sig_dir = (ev.get("signal_direction") or "NEUTRAL").upper()
+        contrarian = bool(ev.get("signal_follow_only"))
+
+        # Заголовок: для контр-тренда отдельный лейбл, чтобы не вводить
+        # в заблуждение «BUY ↔ Сигнал SHORT».
+        if contrarian:
+            label = "Buy the dip" if is_long else "Sell the rip"
+            head = f"{side_emoji} *{sym}* — {label} (контр-тренд)"
+        else:
+            label = "LONG" if is_long else "SHORT"
+            head = f"{side_emoji} *{sym}* — {label}"
+        lines.append(head)
+
+        try:
+            entry = float(ev.get("entry_price") or 0.0)
+            tp = float(ev.get("target") or 0.0)
+            sl = float(ev.get("stop") or 0.0)
+        except (TypeError, ValueError):
+            entry = tp = sl = 0.0
+        tp_pct = ((tp / entry) - 1) * 100 if entry else 0.0
+        sl_pct = ((sl / entry) - 1) * 100 if entry else 0.0
+
+        lines.append(f"   ├ Вход: `${_fmt_price(entry)}`")
+        lines.append(f"   ├ Тейк: `${_fmt_price(tp)}`  ({_fmt_pct(tp_pct)})")
+        lines.append(f"   ├ Стоп: `${_fmt_price(sl)}`  ({_fmt_pct(sl_pct)})")
+
+        rr = ev.get("rr_ratio")
+        score = float(ev.get("score") or 0.0)
+        rr_part = f"R/R: {float(rr):.2f}" if rr is not None else None
+        score_part = f"Score: {score:.1f}"
+        meta = "  ·  ".join(p for p in (rr_part, score_part) if p)
+        lines.append(f"   ├ {meta}")
+
+        # Пояснение «почему мы здесь»: trend-follow vs контр-тренд.
+        # Без этой строки юзер не понимает, как сочетать `BUY` с
+        # `Сигнал: SHORT` — мы же не отказываемся от сигнала, мы
+        # сознательно идём против него в нейтральном режиме.
+        if contrarian:
+            arrow = "↩️"
+            if is_long:
+                reason = f"внешний сигнал {sig_dir} → ждём отскок (mean reversion)"
+            else:
+                reason = f"внешний сигнал {sig_dir} → фиксируем на росте"
+        else:
+            arrow = "📈" if is_long else "📉"
+            if sig_dir in ("LONG", "SHORT"):
+                reason = f"сигнал {sig_dir} · подтверждён скорингом"
+            else:
+                reason = "сделка из дайджест-кандидатов"
+        lines.append(f"   └ {arrow} {reason}")
+        lines.append("")
+
+    lines.append(f"💵 Баланс: `${_fmt_price(opened_events[-1].get('capital', 0.0))}`")
+    return "\n".join(lines)
+
+
 def _int_to_trade_direction(score: int) -> str:
     if score > 0:
         return "BUY"
@@ -1732,6 +1837,11 @@ async def _check_and_trade_locked(bot, admin_ids: list[int]) -> list[dict]:
                     "support": support,
                     "score": float(candidate.get("total_score") or 0.0),
                     "signal_direction": candidate.get("signal_direction", "NEUTRAL"),
+                    # signal_follow_only=True означает контр-трендовый
+                    # «buy-the-dip / sell-the-rip» вход из нейтрального
+                    # режима. Нужно в нотификации, чтобы зелёный «BUY»
+                    # рядом с «Сигнал SHORT» не выглядел как баг.
+                    "signal_follow_only": bool(candidate.get("signal_follow_only")),
                     "trend": candidate.get("trend", ""),
                     "trend_label": candidate.get("trend_label", ""),
                     "regime": regime,
@@ -1758,15 +1868,7 @@ async def _check_and_trade_locked(bot, admin_ids: list[int]) -> list[dict]:
     # Send one summary notification if any positions were opened
     opened_events = [e for e in events if e.get("event") == "opened"]
     if opened_events and bot and admin_ids:
-        lines = ["🎯 *НОВЫЕ ПОЗИЦИИ*\n"]
-        for ev in opened_events:
-            lines.append(f"{'🟢' if ev['direction'] == 'BUY' else '🔴'} *{ev['symbol']}* {ev['direction']}")
-            lines.append(f"  Вход: ${ev['entry_price']:,.2f}")
-            lines.append(f"  Тейк: ${ev['target']:,.2f} | Стоп: ${ev['stop']:,.2f}")
-            lines.append(f"  Score: {ev['score']:.1f} | Сигнал: {ev.get('signal_direction', 'NEUTRAL')}")
-            lines.append("")
-        lines.append(f"💵 Баланс: ${opened_events[-1]['capital']:,.2f}")
-        msg = "\n".join(lines)
+        msg = _render_opened_positions_message(opened_events)
         for admin_id in admin_ids:
             try:
                 await bot.send_message(admin_id, msg, parse_mode="Markdown")
