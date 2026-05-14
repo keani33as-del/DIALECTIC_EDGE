@@ -429,10 +429,14 @@ def generate_main_chart(report: str, prices: dict, stars: str, pct: int):
                          COLORS["neutral"])
                 rows.append((name, p_str, f"{arrow}{abs(ch):.2f}%", color))
 
+        # Временная метка в заголовке СТолбца 24ч: раньше юзер видел 24ч без
+        # таймстампа и думал что это дельта за календарный день — но это
+        # скользящее 24ч-окно от момента запроса. Подпись снимает путаницу.
+        _now_hm = datetime.now().strftime("%H:%M")
         y = 0.95
         ax3.text(0.0,  y, "Актив",  transform=ax3.transAxes, fontsize=8, color=COLORS["subtext"], fontweight="bold")
         ax3.text(0.45, y, "Цена",   transform=ax3.transAxes, fontsize=8, color=COLORS["subtext"], fontweight="bold")
-        ax3.text(0.78, y, "24ч",    transform=ax3.transAxes, fontsize=8, color=COLORS["subtext"], fontweight="bold")
+        ax3.text(0.78, y, f"24ч на {_now_hm}", transform=ax3.transAxes, fontsize=8, color=COLORS["subtext"], fontweight="bold")
         ax3.plot([0, 1], [y - 0.04, y - 0.04], color=COLORS["border"],
                  linewidth=0.5, transform=ax3.transAxes, clip_on=False)
 
@@ -503,16 +507,34 @@ def generate_main_chart(report: str, prices: dict, stars: str, pct: int):
                      fontsize=8.5, color=vix_color, fontweight="bold")
 
         if "BTC" in prices:
-            rsi_m = re.search(r"RSI[^\d]*BTC[^\d]*(\d+\.?\d*)", report, re.IGNORECASE)
-            if rsi_m:
-                rsi_val   = float(rsi_m.group(1))
+            # Реальный RSI из prices_dict (web_search.py:_compute_rsi). Раньше
+            # регекс тащил желаемую цифру из любого места в тексте LLM, отсюда
+            # прыжки RSI 14→60 за 1.5ч при движении цены на +0.12%.
+            rsi_val = prices.get("BTC", {}).get("rsi_14d") if isinstance(prices.get("BTC"), dict) else None
+            if rsi_val is None:
+                # Fallback на старый regex — на случай если web_search почему-то
+                # не прокинул rsi_14d. Строже регекс (RSI(14): X или RSI BTC: X),
+                # чтобы не хватать цены/MA из соседних слов.
+                rsi_m = re.search(
+                    r"RSI\s*\(?\s*1[45]\s*\)?\s*[:\-]?\s*(\d{1,3}(?:\.\d+)?)",
+                    report,
+                    re.IGNORECASE,
+                )
+                if rsi_m:
+                    try:
+                        candidate = float(rsi_m.group(1))
+                        if 0 <= candidate <= 100:
+                            rsi_val = candidate
+                    except ValueError:
+                        pass
+            if rsi_val is not None:
                 rsi_color = (COLORS["bear"] if rsi_val > 70 else
                              COLORS["bull"] if rsi_val < 30 else
                              COLORS["text"])
                 rsi_label = ("Перекуплен" if rsi_val > 70 else
                              "Перепродан" if rsi_val < 30 else
                              "Нейтрально")
-                ax4.text(0, 0.35, f"RSI BTC: {rsi_val:.1f} — {rsi_label}",
+                ax4.text(0, 0.35, f"RSI BTC(14d): {rsi_val:.1f} — {rsi_label}",
                          fontsize=8.5, color=rsi_color)
 
         fig.text(0.5, 0.01, "⚠️ Не является финансовым советом. AI-анализ. DYOR.",
@@ -620,6 +642,165 @@ def generate_russia_chart(russia_report: str):
     except Exception as e:
         logger.error(f"Russia chart error: {e}", exc_info=True)
         return None
+
+
+# ── Торговый план — PNG-таблица (PR #34) ────────────────────────────────────
+# Чтобы юзеру не приходилось читать 11 строк подряд в Telegram, рендерим
+# план таблицей. Layout: 2 секции (Крипта / Макро), 4 столбца на актив:
+# название, текущая цена, LONG-trigger (выше), SHORT-trigger (ниже).
+# Цветовая дифференциация: цена выше обеих MA — зелёный фон, ниже обеих —
+# красный, sandwich — нейтральный. Так глаз сразу видит, где сейчас актив.
+
+_TRADING_PLAN_PNG_GROUPS = [
+    ("КРИПТО", [
+        ("BTC",     "BTC"),
+        ("ETH",     "ETH"),
+        ("SOL",     "SOL"),
+        ("BNB",     "BNB"),
+        ("XRP",     "XRP"),
+    ]),
+    ("МАКРО", [
+        ("SPX",     "S&P 500"),
+        ("NDX",     "Nasdaq 100"),
+        ("GOLD",    "Gold"),
+        ("OIL_WTI", "WTI Oil"),
+        ("DXY",     "DXY"),
+        ("VIX",     "VIX"),
+    ]),
+]
+
+
+def _fmt_plan_money(value) -> str:
+    """Зеркало main._fmt_money_compact — адаптивная точность.
+
+    Дублируем минимально, чтобы chart_generator не зависел от main.
+    """
+    if value is None:
+        return "—"
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    abs_v = abs(v)
+    if abs_v < 1:
+        return f"{v:,.4f}"
+    elif abs_v < 100:
+        return f"{v:,.2f}"
+    else:
+        return f"{v:,.0f}"
+
+
+def generate_trading_plan_png(prices: dict | None, plans: list[dict] | None = None):
+    """Рендер торгового плана как PNG-таблицы для кнопки «Показать таблицу».
+
+    Источник истины — `prices_dict` (MA50/MA200 из web_search.py). `plans`
+    используется только чтобы понять, какие активы Synth включил в план.
+    """
+    if not MATPLOTLIB_OK:
+        return None
+    if not prices:
+        return None
+
+    _setup_dark_style()
+
+    # Нормализация символов из plans — тот же набор алиасов, что в main.py.
+    aliases = {
+        "BITCOIN": "BTC", "BTCUSD": "BTC", "BTCUSDT": "BTC",
+        "ETHEREUM": "ETH", "ETHUSD": "ETH", "ETHUSDT": "ETH",
+        "SOLANA": "SOL", "SOLUSDT": "SOL",
+        "BNBUSDT": "BNB", "XRPUSDT": "XRP",
+        "S&P": "SPX", "S&P500": "SPX", "SP500": "SPX", "SPY": "SPX", "^GSPC": "SPX",
+        "NASDAQ": "NDX", "QQQ": "NDX", "^NDX": "NDX",
+        "XAU": "GOLD", "GLD": "GOLD", "XAUUSD": "GOLD",
+        "OILWTI": "OIL_WTI", "WTI": "OIL_WTI", "USO": "OIL_WTI",
+        "CL=F": "OIL_WTI", "OIL": "OIL_WTI",
+        "DX-Y.NYB": "DXY", "^VIX": "VIX",
+    }
+    plan_symbols: set[str] = set()
+    for plan in plans or []:
+        raw = (plan.get("symbol") or plan.get("label") or "")
+        sym = aliases.get(str(raw).upper().strip(), str(raw).upper().strip())
+        if sym:
+            plan_symbols.add(sym)
+
+    rows: list[tuple[str, str, dict]] = []
+    for group_title, assets in _TRADING_PLAN_PNG_GROUPS:
+        any_in_group = False
+        for key, label in assets:
+            if plan_symbols and key not in plan_symbols:
+                continue
+            entry = prices.get(key)
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("price") is None or entry.get("ma50") is None or entry.get("ma200") is None:
+                continue
+            if not any_in_group:
+                rows.append((group_title, "__header__", {}))
+                any_in_group = True
+            rows.append((group_title, label, entry))
+
+    if not rows:
+        return None
+
+    # Высота: 0.55" на строку (заголовок группы + N активов), +1.2" на title.
+    height = 1.4 + 0.55 * len(rows)
+    fig, ax = plt.subplots(figsize=(10.5, height), facecolor=COLORS["bg"])
+    ax.set_facecolor(COLORS["surface"])
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.axis("off")
+
+    now_hm = datetime.now().strftime("%d.%m %H:%M UTC")
+    ax.text(0.5, 0.98, "ТОРГОВЫЙ ПЛАН",
+            transform=ax.transAxes, ha="center", va="top",
+            fontsize=15, fontweight="bold", color=COLORS["gold"])
+    ax.text(0.5, 0.945, f"{now_hm} · ждём пробоя MA50 / MA200",
+            transform=ax.transAxes, ha="center", va="top",
+            fontsize=8, color=COLORS["subtext"])
+
+    # Шапка таблицы.
+    header_y = 0.895
+    ax.text(0.04, header_y, "Актив",       transform=ax.transAxes, fontsize=9, color=COLORS["subtext"], fontweight="bold")
+    ax.text(0.30, header_y, "Цена",        transform=ax.transAxes, fontsize=9, color=COLORS["subtext"], fontweight="bold")
+    ax.text(0.48, header_y, "▲ выше → LONG",  transform=ax.transAxes, fontsize=9, color=COLORS["bull"], fontweight="bold")
+    ax.text(0.74, header_y, "▼ ниже → SHORT", transform=ax.transAxes, fontsize=9, color=COLORS["bear"], fontweight="bold")
+    ax.plot([0.02, 0.98], [header_y - 0.02, header_y - 0.02], color=COLORS["border"], linewidth=0.8, transform=ax.transAxes)
+
+    # Каждая строка занимает row_h в относительных координатах.
+    row_h = (header_y - 0.04) / len(rows)
+    for idx, (group, label, entry) in enumerate(rows):
+        y = header_y - 0.04 - row_h * (idx + 0.5)
+        if label == "__header__":
+            ax.text(0.04, y, f"═══ {group} ═══",
+                    transform=ax.transAxes, fontsize=10,
+                    color=COLORS["blue"], fontweight="bold", va="center")
+            continue
+        price = float(entry["price"])
+        ma50 = float(entry["ma50"]); ma200 = float(entry["ma200"])
+        up_level, up_tag = (ma200, "MA200") if ma200 >= ma50 else (ma50, "MA50")
+        dn_level, dn_tag = (ma50, "MA50") if ma200 >= ma50 else (ma200, "MA200")
+
+        # Цветовая подсветка статуса: выше обоих — зелёный, ниже — красный.
+        if price >= max(ma50, ma200):
+            status_color = COLORS["bull"]
+        elif price <= min(ma50, ma200):
+            status_color = COLORS["bear"]
+        else:
+            status_color = COLORS["text"]
+
+        ax.text(0.04, y, label, transform=ax.transAxes, fontsize=10,
+                color=COLORS["text"], fontweight="bold", va="center")
+        ax.text(0.30, y, f"${_fmt_plan_money(price)}",
+                transform=ax.transAxes, fontsize=10,
+                color=status_color, va="center")
+        ax.text(0.48, y, f"${_fmt_plan_money(up_level)} ({up_tag})",
+                transform=ax.transAxes, fontsize=10,
+                color=COLORS["bull"], va="center")
+        ax.text(0.74, y, f"${_fmt_plan_money(dn_level)} ({dn_tag})",
+                transform=ax.transAxes, fontsize=10,
+                color=COLORS["bear"], va="center")
+
+    return _to_bytes(fig)
 
 
 def is_available() -> bool:

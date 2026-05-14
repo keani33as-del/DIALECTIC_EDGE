@@ -39,7 +39,7 @@ from config import (
 )
 from web_search import get_full_realtime_context
 from report_sanitizer import sanitize_full_report
-from chart_generator import generate_main_chart, generate_russia_chart
+from chart_generator import generate_main_chart, generate_russia_chart, generate_trading_plan_png
 from core import digest_context
 from core.digest_context import (
     _plan_line as _digest_plan_line,
@@ -156,6 +156,13 @@ russia_cache: dict = {}  # {"report": str, "timestamp": str, "sections": {...}, 
 # секунду назад приходил. Шарим один и тот же dict — теперь обе стороны
 # видят одинаковое состояние.
 from refactor.handlers.debate_handler import debate_cache, show_debate_round  # noqa: E402  # {user_id: {"rounds": [...], "full": str}}
+
+# PR #34: кэш для кнопки «📊 Показать таблицу плана». Храним (plans, prices)
+# в момент рендера дайджеста, потом callback `plantable:UID` берёт это и
+# отдаёт PNG через generate_trading_plan_png. Не сохраняем в Redis/SQLite —
+# таблица всегда актуальна на момент /daily, после рестарта Railway просто
+# перепрогоняется /daily. Поэтому in-memory dict — нормально.
+_plan_table_cache: dict[int, tuple[list, dict]] = {}
 
 
 def get_bot() -> Bot:
@@ -565,6 +572,136 @@ def _format_smart_money_card(prices: dict | None) -> str | None:
     return "\n".join(["🏛 *Институциональные сигналы (Smart-money):*", *bullets])
 
 
+# ── Группированный торговый план (PR #34) ──────────────────────────────────
+# Asset → (emoji-маркер, человеческое название). emoji-маркеры повторяют
+# смысл в `_SM_CARD_SYMBOL_ICONS` (Top-trader L/S), плюс макро-набор. Не
+# подмешиваем в один блок — у юзера должно быть чёткое разделение крипта
+# vs макро, иначе 11 одинаковых строк подряд читать невозможно.
+_TRADING_PLAN_GROUPS: list[tuple[str, list[tuple[str, str, str]]]] = [
+    ("🪙 *КРИПТО*", [
+        ("BTC",     "₿", "BTC"),
+        ("ETH",     "Ξ", "ETH"),
+        ("SOL",     "◎", "SOL"),
+        ("BNB",     "🅱", "BNB"),
+        ("XRP",     "✕", "XRP"),
+    ]),
+    ("📈 *МАКРО*", [
+        ("SPX",     "📊", "S&P 500"),
+        ("NDX",     "💻", "Nasdaq 100"),
+        ("GOLD",    "🥇", "Gold"),
+        ("OIL_WTI", "🛢", "WTI Oil"),
+        ("DXY",     "💵", "DXY"),
+        ("VIX",     "😱", "VIX"),
+    ]),
+]
+
+# Synth иногда называет активы по-другому (SPY=SPX, WTI=OIL_WTI и т.д.) —
+# мапим к каноничным ключам prices_dict, чтобы группировка работала.
+_PLAN_SYMBOL_ALIASES: dict[str, str] = {
+    "BITCOIN": "BTC", "BTCUSD": "BTC", "BTCUSDT": "BTC",
+    "ETHEREUM": "ETH", "ETHUSD": "ETH", "ETHUSDT": "ETH",
+    "SOLANA": "SOL", "SOLUSDT": "SOL",
+    "BNBUSDT": "BNB",
+    "XRPUSDT": "XRP",
+    "S&P": "SPX", "S&P500": "SPX", "SP500": "SPX", "SPY": "SPX", "^GSPC": "SPX",
+    "NASDAQ": "NDX", "QQQ": "NDX", "^NDX": "NDX",
+    "XAU": "GOLD", "GLD": "GOLD", "XAUUSD": "GOLD",
+    "OILWTI": "OIL_WTI", "WTI": "OIL_WTI", "USO": "OIL_WTI", "CL=F": "OIL_WTI", "OIL": "OIL_WTI",
+    "DX-Y.NYB": "DXY",
+    "^VIX": "VIX",
+}
+
+
+def _fmt_money_compact(value) -> str:
+    """Markdown-safe адаптивная цена. Зеркало web_search._fmt_money."""
+    if value is None:
+        return "—"
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    abs_v = abs(v)
+    if abs_v < 1:
+        body = f"{v:,.4f}"
+    elif abs_v < 100:
+        body = f"{v:,.2f}"
+    else:
+        body = f"{v:,.0f}"
+    return body
+
+
+def _normalize_plan_symbol(raw: str | None) -> str | None:
+    if not raw:
+        return None
+    up = str(raw).upper().strip()
+    if up in _PLAN_SYMBOL_ALIASES:
+        return _PLAN_SYMBOL_ALIASES[up]
+    return up
+
+
+def _trading_plan_grouped_lines(plans: list[dict] | None, prices: dict | None) -> list[str]:
+    """Группированный торговый план: крипта / макро, по 2-3 строки на актив.
+
+    Источник истины — `prices_dict` (MA50/MA200 из web_search.py:_fetch_*).
+    `plans[]` (Synth output) используется только чтобы определить, какие
+    активы Synth решил включить в план. Раньше рендер был «11 одинаковых
+    bullet-строк подряд», читать тяжело; плюс из-за `${ma:.0f}` в
+    `format_prices_for_agents` XRP-триггеры приходили как `$1/$2` —
+    теперь берём MA-уровни напрямую из структурированных данных.
+    """
+    prices = prices or {}
+    plans = plans or []
+
+    # Множество символов, которые Synth включил в план (после нормализации).
+    plan_symbols: set[str] = set()
+    for plan in plans:
+        sym = _normalize_plan_symbol(plan.get("symbol") or plan.get("label"))
+        if sym:
+            plan_symbols.add(sym)
+
+    out: list[str] = []
+    for group_title, assets in _TRADING_PLAN_GROUPS:
+        group_lines: list[str] = []
+        for key, emoji, label in assets:
+            if plan_symbols and key not in plan_symbols:
+                continue
+            entry = prices.get(key)
+            if not isinstance(entry, dict):
+                continue
+            price = entry.get("price")
+            ma50 = entry.get("ma50")
+            ma200 = entry.get("ma200")
+            if price is None or ma50 is None or ma200 is None:
+                continue
+
+            try:
+                price_f = float(price); ma50_f = float(ma50); ma200_f = float(ma200)
+            except (TypeError, ValueError):
+                continue
+
+            # Решаем какой MA-уровень является LONG-триггером (выше цены),
+            # а какой SHORT-триггером (ниже цены). Если оба с одной стороны
+            # (uptrend/downtrend), ближайший = текущий стоп-трейл, дальний =
+            # подтверждающий уровень. Для unification рендерим всегда два
+            # уровня — юзер видит структуру MA50/MA200 относительно цены.
+            ma_a, tag_a = (ma200_f, "MA200")
+            ma_b, tag_b = (ma50_f, "MA50")
+            up_level, up_tag = (ma_a, tag_a) if ma_a >= ma_b else (ma_b, tag_b)
+            dn_level, dn_tag = (ma_b, tag_b) if ma_a >= ma_b else (ma_a, tag_a)
+
+            head = f"{emoji} *{label}* — `${_fmt_money_compact(price_f)}`"
+            up = f"   ▲ выше `${_fmt_money_compact(up_level)}` ({up_tag}) → LONG"
+            dn = f"   ▼ ниже `${_fmt_money_compact(dn_level)}` ({dn_tag}) → SHORT"
+            group_lines.extend([head, up, dn])
+
+        if group_lines:
+            if out:
+                out.append("")
+            out.append(group_title)
+            out.extend(group_lines)
+    return out
+
+
 def build_short_report(parts: dict, stars: str, pct: int, horizon: HorizonPack | None = None, prices: dict | None = None) -> list:
     """
     Собирает ОДНО сообщение для пользователя в фиксированном layout'е:
@@ -654,8 +791,17 @@ def build_short_report(parts: dict, stars: str, pct: int, horizon: HorizonPack |
         if plans:
             # Per-asset coverage: 5-6 крипто (BTC/ETH/SOL/BNB/XRP) + 6 макро
             # (SPX/NDX/GOLD/OIL/DXY/VIX) → до 11 планов в одном дайджесте.
-            for plan in plans[:12]:
-                lines.append(f"• {_digest_plan_line(plan)}")
+            # PR #34: рендерим группами (Крипто / Макро) с MA-уровнями
+            # из prices_dict напрямую — было 11 одинаковых bullet-строк,
+            # стало читаемо. Fallback на старый рендер если prices пустой
+            # или ни у одного актива нет MA (что не должно случаться, но
+            # на всякий случай).
+            grouped = _trading_plan_grouped_lines(plans, prices or {})
+            if grouped:
+                lines.extend(grouped)
+            else:
+                for plan in plans[:12]:
+                    lines.append(f"• {_digest_plan_line(plan)}")
         elif key_trigger:
             lines.append(f"• {key_trigger}")
         else:
@@ -853,7 +999,22 @@ async def send_daily_digest_bundle(
     logger.info(f"Отправляю {len(messages)} сообщений. Размеры: {[len(m) for m in messages]}")
 
     rounds_out = debate_cache.get(user_id, {}).get("rounds") or []
-    keyboard = main_report_keyboard(user_id, has_debates=bool(rounds_out))
+
+    # PR #34: кэшируем plans+prices для кнопки «📊 Показать таблицу плана».
+    # plans берём из digest_context (он же используется в build_short_report
+    # для рендера grouped-layout). Если plans пуст — кнопку не покажем,
+    # чтобы не клацать впустую и не путать юзера.
+    digest_ctx = build_digest_context(report or "")
+    plans_for_table = digest_ctx.get("plans") or []
+    has_plan_table = bool(plans_for_table) and bool(prices_dict)
+    if has_plan_table:
+        _plan_table_cache[user_id] = (list(plans_for_table), dict(prices_dict))
+
+    keyboard = main_report_keyboard(
+        user_id,
+        has_debates=bool(rounds_out),
+        has_plan_table=has_plan_table,
+    )
 
     # Один основной digest-блок: к нему прицепляем клавиатуру с двумя кнопками
     # ("📜 Показать всё" + "📖 Полные дебаты агентов") — чтобы строка
@@ -882,7 +1043,7 @@ async def send_daily_digest_bundle(
         await send_debates_attachment(chat_id, rounds_out)
 
 
-def main_report_keyboard(user_id: int, has_debates: bool = True) -> InlineKeyboardMarkup:
+def main_report_keyboard(user_id: int, has_debates: bool = True, has_plan_table: bool = False) -> InlineKeyboardMarkup:
     """Клавиатура под основным отчётом."""
     buttons = []
     # «🎯 Стратегия по рынку» наверху — главная action-кнопка: бот считает
@@ -897,6 +1058,18 @@ def main_report_keyboard(user_id: int, has_debates: bool = True) -> InlineKeyboa
             callback_data=f"money:{user_id}"
         )
     ])
+    # PR #34: кнопка «📊 Показать таблицу плана» — рисует план в виде PNG.
+    # Раньше план был 11 одинаковых bullet-строк, читать тяжело; новая
+    # таблица сгруппирована (Крипта / Макро), color-coded по статусу.
+    # Текстовый grouped-формат и так в дайджесте, но картинку удобнее
+    # скриншотить / показывать другим.
+    if has_plan_table:
+        buttons.append([
+            InlineKeyboardButton(
+                text="📊 Показать таблицу плана",
+                callback_data=f"plantable:{user_id}",
+            )
+        ])
     buttons.append([
         InlineKeyboardButton(
             text="📜 Показать всё",
@@ -996,6 +1169,53 @@ async def handle_full_report_callback(callback: CallbackQuery):
 
     await callback.answer("Отправляю полный raw-отчёт")
     await send_full_report_attachment(callback.message.chat.id, full_report)
+
+
+# PR #34: callback для кнопки «📊 Показать таблицу плана».
+# Берёт (plans, prices) из in-memory `_plan_table_cache`, заполняемого в
+# send_daily_digest_bundle, и рисует PNG через chart_generator. На рестарт
+# Railway не рассчитываем — кэш умирает с процессом, юзер просто
+# перезапустит /daily, что и так делает каждый день.
+@dp.callback_query(F.data.startswith("plantable:"))
+async def handle_plan_table_callback(callback: CallbackQuery):
+    parts_ = callback.data.split(":")
+    if len(parts_) != 2:
+        await callback.answer()
+        return
+    try:
+        kb_uid = int(parts_[1])
+    except ValueError:
+        await callback.answer()
+        return
+    if kb_uid != callback.from_user.id:
+        await callback.answer("Кнопка не с твоего аккаунта", show_alert=True)
+        return
+
+    cached = _plan_table_cache.get(callback.from_user.id)
+    if not cached:
+        await callback.answer(
+            "Таблица недоступна — запусти /daily заново",
+            show_alert=True,
+        )
+        return
+
+    plans, prices = cached
+    try:
+        buf = generate_trading_plan_png(prices, plans)
+    except Exception as e:
+        logger.warning("plan table png failed: %s", e)
+        buf = None
+    if not buf:
+        await callback.answer("Не удалось собрать таблицу", show_alert=True)
+        return
+
+    raw = buf.getvalue() if hasattr(buf, "getvalue") else buf.read()
+    await callback.answer("Отправляю таблицу плана")
+    await bot.send_photo(
+        callback.message.chat.id,
+        photo=BufferedInputFile(raw, filename="trading_plan.png"),
+        caption="📊 Торговый план — MA50 / MA200 триггеры",
+    )
 
 
 def _money_format_price(value) -> str:

@@ -56,6 +56,69 @@ def _sane(key: str, price: float) -> bool:
     return ok
 
 
+def _fmt_money(value: float | int | None, *, prefix: str = "") -> str:
+    """Адаптивная точность для денежных значений.
+
+    Большой бан XRP-precision: при ${value:,.0f} XRP MA200 = $1.65 рендерится
+    как `$2`, MA50 = $1.30 → `$1`. Все per-asset планы агенту/юзеру приходят
+    с обрезанными до целого триггерами, и Synth дословно пишет «$2 (MA200)».
+
+    Точность подбираем по абсолютной величине:
+      |v| >= 1000   → 0 знаков ($82,308)
+      |v| >= 100    → 0 знаков ($769)
+      |v| >= 10     → 2 знака  ($94.87, $18.35)
+      |v| >= 1      → 2 знака  ($1.65, $1.30)
+      |v| <  1      → 4 знака  ($0.0123)
+    Хвостовые нули у <10 не режем — `$1.30` информативнее, чем `$1.3`.
+    """
+    if value is None:
+        return "N/A"
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    abs_v = abs(v)
+    if abs_v < 1:
+        body = f"{v:,.4f}"
+    elif abs_v < 100:
+        body = f"{v:,.2f}"
+    else:
+        body = f"{v:,.0f}"
+    return f"{prefix}{body}"
+
+
+def _compute_rsi(closes: list[float], period: int = 14) -> float | None:
+    r"""RSI(14) по Wilder-smoothing. Возвращает None при недостатке данных.
+
+    Используется для дайджеста (PNG-карточки): раньше chart_generator
+    регекспом тащил RSI прямо из текста LLM (`r"RSI[^\d]*BTC[^\d]*(\d+\.?\d*)"`),
+    и брал любое число после слов RSI/BTC. Так RSI прыгал с 14 на 60 за
+    1.5ч — это была не реальная метрика, а первая попавшаяся цифра из
+    свободного текста модели. Считаем сами по дневным закрытиям.
+    """
+    if not closes or len(closes) < period + 1:
+        return None
+    gains: list[float] = []
+    losses: list[float] = []
+    for i in range(1, len(closes)):
+        delta = closes[i] - closes[i - 1]
+        if delta >= 0:
+            gains.append(delta)
+            losses.append(0.0)
+        else:
+            gains.append(0.0)
+            losses.append(-delta)
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+    for i in range(period, len(gains)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return round(100 - (100 / (1 + rs)), 1)
+
+
 # ─── Tavily — реальный веб-поиск ──────────────────────────────────────────────
 
 async def search_tavily(query: str, max_results: int = 3) -> str:
@@ -276,6 +339,12 @@ async def _fetch_trend_data(session, symbol_binance: str, key: str) -> dict:
             result["atr_14d"] = round(atr_14, 2)
             result["atr_14d_pct"] = round(atr_14 / current * 100, 2)
 
+        # RSI(14d) — считаем сами по дневным закрытиям. Раньше chart_generator
+        # регекспом тащил RSI из текста LLM, отсюда прыжки 14→60 за 1.5ч.
+        rsi = _compute_rsi(closes, 14)
+        if rsi is not None:
+            result["rsi_14d"] = rsi
+
         result["trend"] = trend
         result["trend_emoji"] = trend_emoji
         result["hh"] = hh
@@ -359,6 +428,11 @@ async def _fetch_yahoo_trend(session, ticker: str, key: str) -> dict:
                         atr_14 = sum(trs) / len(trs)
                         result["atr_14d"] = round(atr_14, 4)
                         result["atr_14d_pct"] = round(atr_14 / current * 100, 2)
+
+            # RSI(14d) для макро-активов — те же причины, что и для крипты.
+            rsi = _compute_rsi(closes, 14)
+            if rsi is not None:
+                result["rsi_14d"] = rsi
 
             # Простой trend label (как в _fetch_trend_data, но без HH/HL)
             ch_7d = result.get("change_7d", 0) or 0
@@ -602,6 +676,11 @@ def format_prices_for_agents(prices: dict) -> str:
         return "Рыночные данные временно недоступны."
 
     now   = datetime.now().strftime("%d.%m.%Y %H:%M UTC")
+    # Скользящее 24ч-окно считается от момента запроса, а не от полуночи.
+    # Юзер видел "+0.24% (24ч)" в 08:38 и "-0.05% (24ч)" в 07:04 для BTC и
+    # удивлялся "почему 24ч разные". В подпись добавляем HH:MM, чтобы
+    # очевидно было, что окно скользит.
+    now_hm = datetime.now().strftime("%H:%M")
     lines = [f"=== ВЕРИФИЦИРОВАННЫЕ РЫНОЧНЫЕ ДАННЫЕ ({now}) ==="]
 
     lines.append("\n[КРИПТОРЫНОК]")
@@ -620,9 +699,10 @@ def format_prices_for_agents(prices: dict) -> str:
             trend_e  = p.get("trend_emoji", "")
             vol      = p.get("volume_24h_usd")
 
-            # Базовая строка
-            line = (f"  {label} ({k}): ${p['price']:,.2f}  "
-                    f"{'🟢' if ch>=0 else '🔴'} {ch:+.2f}% (24ч)")
+            # Базовая строка. _fmt_money — адаптивная точность, иначе XRP
+            # ($1.46) с ${...:,.2f} нормально, но MA ниже проблема.
+            line = (f"  {label} ({k}): {_fmt_money(p['price'], prefix='$')}  "
+                    f"{'🟢' if ch>=0 else '🔴'} {ch:+.2f}% (24ч на {now_hm})")
             if ch7 is not None:
                 line += f"  {'🟢' if ch7>=0 else '🔴'} {ch7:+.1f}% (7д)"
             if ch30 is not None:
@@ -630,17 +710,18 @@ def format_prices_for_agents(prices: dict) -> str:
             line += f"  [{p['source']}]"
             lines.append(line)
 
-            # Тренд и MA
+            # Тренд и MA — адаптивная точность через _fmt_money:
+            # XRP MA50=$1.30 раньше рендерился как `$1`, Synth писал «$1 (MA50)».
             if trend:
                 trend_line = f"    {trend_e} ТРЕНД: {trend}"
                 if ma50 is not None:
                     pos50 = "выше" if above50 else "ниже"
                     pct50 = ((p['price'] - ma50) / ma50 * 100)
-                    trend_line += f" | MA50: ${ma50:,.0f} ({pos50}, {pct50:+.1f}%)"
+                    trend_line += f" | MA50: {_fmt_money(ma50, prefix='$')} ({pos50}, {pct50:+.1f}%)"
                 if ma200 is not None:
                     pos200 = "выше" if above200 else "ниже"
                     pct200 = ((p['price'] - ma200) / ma200 * 100)
-                    trend_line += f" | MA200: ${ma200:,.0f} ({pos200}, {pct200:+.1f}%)"
+                    trend_line += f" | MA200: {_fmt_money(ma200, prefix='$')} ({pos200}, {pct200:+.1f}%)"
                 lines.append(trend_line)
 
             # Объём
@@ -680,11 +761,11 @@ def format_prices_for_agents(prices: dict) -> str:
         if ma50 is not None:
             pos50 = "выше" if above50 else "ниже"
             pct50 = ((p['price'] - ma50) / ma50 * 100) if ma50 else 0
-            chunks.append(f"MA50: {ma50:,.2f}{unit} ({pos50}, {pct50:+.1f}%)")
+            chunks.append(f"MA50: {_fmt_money(ma50)}{unit} ({pos50}, {pct50:+.1f}%)")
         if ma200 is not None:
             pos200 = "выше" if above200 else "ниже"
             pct200 = ((p['price'] - ma200) / ma200 * 100) if ma200 else 0
-            chunks.append(f"MA200: {ma200:,.2f}{unit} ({pos200}, {pct200:+.1f}%)")
+            chunks.append(f"MA200: {_fmt_money(ma200)}{unit} ({pos200}, {pct200:+.1f}%)")
         return " | ".join(chunks)
 
     lines.append("\n[ФОНДОВЫЕ ИНДЕКСЫ]")
