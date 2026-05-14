@@ -3537,8 +3537,7 @@ async def cmd_markets(message: Message):
     try:
         from signals import build_markets_panel_message
 
-        full_text, _bundle = await build_markets_panel_message(github_repo)
-        safe = clean_markdown(full_text)
+        messages, _bundle = await build_markets_panel_message(github_repo)
         is_enabled = await get_user_signals_status(user_id)
         status_text = (
             "\n\n✅ *Сигналы включены* — при сильном сигнале пришлю отдельным сообщением"
@@ -3549,13 +3548,38 @@ async def cmd_markets(message: Message):
                 "или совпадении с вердиктом из DIGEST_CACHE"
             )
         )
+        # build_markets_panel_message теперь возвращает список сообщений:
+        # 1) живой контекст; 2) smart-money + сигналы. Раньше всё было в одном
+        # сообщении и блок smart-money обрезался по max_len=3900.
+        # Стратегия:
+        #   - первое сообщение — edit поверх «⏳ Загружаю…» (без клавиатуры);
+        #   - последнее — send_message с клавиатурой + status_text.
+        if not messages:
+            await bot.edit_message_text(
+                "❌ Нет данных.",
+                chat_id=message.chat.id,
+                message_id=wait_msg.message_id,
+            )
+            return
+
+        # Первое сообщение — заменяем «⏳ Загружаю…».
         await bot.edit_message_text(
-            safe + status_text,
+            clean_markdown(messages[0]),
             chat_id=message.chat.id,
             message_id=wait_msg.message_id,
             parse_mode="Markdown",
-            reply_markup=_markets_signal_keyboard(is_enabled),
         )
+        # Остальные — отдельными сообщениями. Клавиатура и status_text — к
+        # последнему.
+        for i, chunk in enumerate(messages[1:], start=1):
+            is_last = (i == len(messages) - 1)
+            body = clean_markdown(chunk) + (status_text if is_last else "")
+            await bot.send_message(
+                message.chat.id,
+                body,
+                parse_mode="Markdown",
+                reply_markup=_markets_signal_keyboard(is_enabled) if is_last else None,
+            )
     except Exception as e:
         await bot.edit_message_text(
             f"❌ Ошибка: {e}",
@@ -3674,8 +3698,7 @@ async def cb_markets_signals(callback: CallbackQuery):
         try:
             from signals import build_markets_panel_message
 
-            full_text, _bundle = await build_markets_panel_message(github_repo)
-            safe = clean_markdown(full_text)
+            messages, _bundle = await build_markets_panel_message(github_repo)
             is_enabled = await get_user_signals_status(user_id)
             status_text = (
                 "\n\n✅ *Сигналы включены* — при сильном сигнале пришлю отдельным сообщением"
@@ -3686,11 +3709,24 @@ async def cb_markets_signals(callback: CallbackQuery):
                     "или совпадении с вердиктом из DIGEST_CACHE"
                 )
             )
+            if not messages:
+                await callback.answer("Нет данных.", show_alert=True)
+                return
+            # Тот же раскат что и в cmd_markets — edit первое, остальные
+            # отдельными send_message. Кнопка цепляется к последнему.
             await callback.message.edit_text(
-                safe + status_text,
+                clean_markdown(messages[0]),
                 parse_mode="Markdown",
-                reply_markup=_markets_signal_keyboard(is_enabled),
             )
+            for i, chunk in enumerate(messages[1:], start=1):
+                is_last = (i == len(messages) - 1)
+                body = clean_markdown(chunk) + (status_text if is_last else "")
+                await bot.send_message(
+                    callback.message.chat.id,
+                    body,
+                    parse_mode="Markdown",
+                    reply_markup=_markets_signal_keyboard(is_enabled) if is_last else None,
+                )
         except Exception as e:
             await callback.answer(f"Ошибка: {e}", show_alert=True)
 

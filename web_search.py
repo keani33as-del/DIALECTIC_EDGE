@@ -56,6 +56,23 @@ def _sane(key: str, price: float) -> bool:
     return ok
 
 
+def _fmt_change(ch: float | int | None, *, decimals: int = 2) -> str:
+    """Эмодзи + знак для процентного изменения. `0.00%` → ⚪ (нет данных/флэт),
+    а не зелёный `🟢 +0.00%` — тот выглядит как маленький рост, но почти
+    всегда означает что Yahoo вернул `previousClose=None` или `change_24h`
+    не посчитался. Порог 0.005% — ниже округление до двух знаков покажет
+    `0.00%` в любом случае.
+    """
+    try:
+        v = float(ch) if ch is not None else 0.0
+    except (TypeError, ValueError):
+        v = 0.0
+    if abs(v) < 0.005:
+        return f"⚪ {v:+.{decimals}f}%"
+    emoji = "🟢" if v > 0 else "🔴"
+    return f"{emoji} {v:+.{decimals}f}%"
+
+
 def _fmt_money(value: float | int | None, *, prefix: str = "") -> str:
     """Адаптивная точность для денежных значений.
 
@@ -455,6 +472,24 @@ async def _fetch_yahoo_trend(session, ticker: str, key: str) -> dict:
 
 
 async def _yahoo(session, ticker: str, key: str) -> dict | None:
+    """Цена + 24ч-изменение через Yahoo Finance v8 chart API.
+
+    Раньше change оставался `0.0` для **фьючерсов и DX-Y.NYB** потому что
+    Yahoo для них возвращает `meta.previousClose == None` (фьючерсы CL=F/GC=F
+    закрываются на выходных, индекс DX-Y.NYB вообще не имеет «previous close»
+    в том же смысле что у акций). Старый код брал `closes[-2]` только если
+    оно not None, а иначе падал в ветку с `previousClose` — и если тот None,
+    то prev=price, change=0.
+
+    Новая логика устойчивее:
+      1. Фильтруем None из массива closes. Если осталось ≥2 валидных свечи —
+         используем `valid[-2]` (или `valid[-1]` если `valid[-1] != price`).
+      2. Если валидная свеча одна — пробуем `chartPreviousClose` и
+         `previousClose` (в таком порядке: `chartPreviousClose` это
+         фиксированный «close перед началом диапазона», работает у всех
+         тикеров, включая фьючерсы и индексы валют).
+      3. Если closes вообще пустой — те же fallback'и.
+    """
     try:
         url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
         async with session.get(url, params={"interval": "1d", "range": "5d"},
@@ -464,19 +499,43 @@ async def _yahoo(session, ticker: str, key: str) -> dict | None:
                 result = data["chart"]["result"][0]
                 meta   = result["meta"]
                 price  = float(meta.get("regularMarketPrice", 0))
-                
+
                 change = 0.0
-                if result.get("indicators", {}).get("quote"):
-                    quotes = result["indicators"]["quote"][0]
-                    closes = quotes.get("close", [])
-                    if len(closes) >= 2 and closes[-1] is not None and closes[-2] is not None:
-                        prev_price = closes[-2]
-                        change = ((price - prev_price) / prev_price * 100) if prev_price else 0.0
-                    elif len(closes) >= 1 and closes[-1] is not None:
-                        prev = float(meta.get("previousClose", price) or price)
-                        if prev != price:
-                            change = ((price - prev) / prev * 100) if prev else 0.0
-                
+                quotes = (result.get("indicators") or {}).get("quote") or [{}]
+                closes_raw = quotes[0].get("close") or []
+                valid = [float(c) for c in closes_raw if c is not None]
+
+                # `interval=1d, range=5d` → 4-5 дневных свечей. Последняя
+                # свеча — сегодняшний бар (intraday для открытых рынков,
+                # или close если рынок закрыт). Предпоследняя — вчерашний
+                # close, нужный нам как референс для 24h change.
+                #
+                # Раньше код пытался выяснить «last == price» с порогом
+                # `1e-6`, но Yahoo отдаёт `closes` с full-precision float
+                # (101.47000122) при том что `regularMarketPrice` округлён
+                # (101.47). Разница ~1e-6 пограничная, и код падал в ветку
+                # `prev_price = valid[-1]` (т.е. = price) → change = 0.
+                # Это давало `+0.00%` для CL=F, GC=F, DX-Y.NYB.
+                prev_price: float | None = None
+                if len(valid) >= 2:
+                    prev_price = valid[-2]
+                elif valid:
+                    # Только один валидный close — пробуем meta-поля.
+                    for cand in (meta.get("previousClose"),
+                                  meta.get("chartPreviousClose")):
+                        if cand is not None:
+                            prev_price = float(cand)
+                            break
+                else:
+                    for cand in (meta.get("previousClose"),
+                                  meta.get("chartPreviousClose")):
+                        if cand is not None:
+                            prev_price = float(cand)
+                            break
+
+                if prev_price and abs(prev_price - price) > 1e-9:
+                    change = (price - prev_price) / prev_price * 100
+
                 if _sane(key, price):
                     return {"price": round(price, 2),
                             "change_24h": round(change, 3),
@@ -702,11 +761,11 @@ def format_prices_for_agents(prices: dict) -> str:
             # Базовая строка. _fmt_money — адаптивная точность, иначе XRP
             # ($1.46) с ${...:,.2f} нормально, но MA ниже проблема.
             line = (f"  {label} ({k}): {_fmt_money(p['price'], prefix='$')}  "
-                    f"{'🟢' if ch>=0 else '🔴'} {ch:+.2f}% (24ч на {now_hm})")
+                    f"{_fmt_change(ch)} (24ч на {now_hm})")
             if ch7 is not None:
-                line += f"  {'🟢' if ch7>=0 else '🔴'} {ch7:+.1f}% (7д)"
+                line += f"  {_fmt_change(ch7, decimals=1)} (7д)"
             if ch30 is not None:
-                line += f"  {'🟢' if ch30>=0 else '🔴'} {ch30:+.1f}% (30д)"
+                line += f"  {_fmt_change(ch30, decimals=1)} (30д)"
             line += f"  [{p['source']}]"
             lines.append(line)
 
@@ -774,7 +833,7 @@ def format_prices_for_agents(prices: dict) -> str:
             p  = prices[k]
             ch = p["change_24h"]
             lines.append(f"  {label}: {p['price']:,.2f}  "
-                         f"{'🟢' if ch>=0 else '🔴'} {ch:+.2f}%  [{p['source']}]")
+                         f"{_fmt_change(ch)}  [{p['source']}]")
             tl = _macro_trend_line(p)
             if tl:
                 lines.append(f"    {tl}")
@@ -788,7 +847,7 @@ def format_prices_for_agents(prices: dict) -> str:
             ch = p["change_24h"]
             u  = f" {unit}" if unit else ""
             lines.append(f"  {label}: {p['price']:,.2f}{u}  "
-                         f"{'🟢' if ch>=0 else '🔴'} {ch:+.2f}%  [{p['source']}]")
+                         f"{_fmt_change(ch)}  [{p['source']}]")
             tl = _macro_trend_line(p, unit=u if k == "OIL_WTI" or k == "GOLD" else "")
             if tl:
                 lines.append(f"    {tl}")
