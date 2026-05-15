@@ -441,6 +441,180 @@ def _interpret(hurst: Optional[float], entropy: Optional[float]) -> tuple[str, s
     return regime_hint, recommendation, max(0.0, min(1.0, tradeable_score))
 
 
+# ── Variance Ratio Test (Lo–MacKinlay 1988) ─────────────────────────────────
+
+
+@dataclass
+class VarianceRatioResult:
+    """Результат Variance Ratio Test.
+
+    Attributes:
+        k: интервал агрегации (например 2, 4, 8 баров).
+        vr: VR(k) — отношение дисперсий. Под H0 случайного блуждания → 1.
+            >1.1 → персистентность (тренд), <0.9 → mean-reversion.
+        z_stat: z-статистика гомоскедастичной версии теста Lo–MacKinlay.
+            |z| > 1.96 → отвергаем H0 случайного блуждания на 5%.
+        p_value: двусторонний p-value (нормальное приближение). Чем меньше,
+            тем сильнее уверенность что ряд НЕ random walk.
+        random_walk: True если |z| < 1.96 (нельзя отвергнуть H0).
+    """
+
+    k: int
+    vr: float
+    z_stat: float
+    p_value: float
+    random_walk: bool
+
+
+def _normal_cdf(x: float) -> float:
+    """Phi(x) — функция распределения N(0,1) через erf, без scipy."""
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def variance_ratio_test(
+    returns: Sequence[float], k: int = 2
+) -> Optional[VarianceRatioResult]:
+    """Тест Lo–MacKinlay на случайное блуждание (homoscedastic version).
+
+    Идея: если r_t — случайное блуждание, то дисперсия k-периодного returns
+    линейна по k. Считаем:
+        VR(k) = Var(y_k(t)) / (k * Var(r_t)),  где y_k(t) = sum_{i=0}^{k-1} r_{t-i}
+
+    Под H0: VR(k) → 1. Стандартная ошибка под H0:
+        SE(VR(k) - 1) = sqrt( 2*(2k-1)*(k-1) / (3*k*n) )
+        z = (VR(k) - 1) / SE  ~  N(0, 1)
+
+    Двусторонний p-value: 2 * (1 - Phi(|z|)).
+
+    Args:
+        returns: лог-доходности (как из compute_returns()).
+        k: горизонт агрегации, k >= 2.
+
+    Returns:
+        VarianceRatioResult, либо None если данных слишком мало (< 4k).
+
+    Reference:
+        Lo, A. W., MacKinlay, A. C. (1988). Stock market prices do not follow
+        random walks: Evidence from a simple specification test. Review of
+        Financial Studies, 1(1), 41-66.
+    """
+    if k < 2:
+        return None
+    n = len(returns)
+    if n < 4 * k:
+        return None
+
+    mu = _mean(returns)
+    var_1 = sum((r - mu) ** 2 for r in returns) / n
+    if var_1 <= 0:
+        return None
+
+    # Аггрегированные k-периодные returns (overlapping)
+    aggregated: List[float] = []
+    for t in range(k - 1, n):
+        aggregated.append(sum(returns[t - k + 1 : t + 1]))
+    if len(aggregated) < 2:
+        return None
+    mu_k = _mean(aggregated)
+    # Дисперсия k-периодного returns под H0 = k * Var(r_t).
+    # Lo–MacKinlay используют unbiased estimator:
+    #   sigma2_k = 1/(n-k+1) * sum_{t=k}^{n} (y_k(t) - k*mu)^2 * m
+    # где m = n / (n - k + 1) — поправка. Для простоты берём смещённую
+    # версию и нормализуем 1/len(aggregated), это для swing-горизонта
+    # достаточная аппроксимация и сильно проще.
+    var_k = sum((y - mu_k) ** 2 for y in aggregated) / len(aggregated)
+
+    vr = var_k / (k * var_1)
+    se = math.sqrt(max(1e-12, (2 * (2 * k - 1) * (k - 1)) / (3.0 * k * n)))
+    z = (vr - 1.0) / se
+    p_value = 2.0 * (1.0 - _normal_cdf(abs(z)))
+    random_walk = abs(z) < 1.96  # 5% two-sided
+
+    return VarianceRatioResult(
+        k=k,
+        vr=vr,
+        z_stat=z,
+        p_value=p_value,
+        random_walk=random_walk,
+    )
+
+
+# ── Permutation Entropy (Bandt & Pompe 2002) ────────────────────────────────
+
+
+def permutation_entropy(
+    returns: Sequence[float],
+    order: int = 3,
+    delay: int = 1,
+) -> Optional[float]:
+    """Перестановочная энтропия Бандта-Помпе, нормированная в [0, 1].
+
+    Идея: окно длины `order` пробегает по ряду; для каждого окна
+    запоминается перестановка (ranking) его элементов. Получаем
+    эмпирическое распределение по order! возможным перестановкам и
+    считаем нормированную Шенноновскую энтропию.
+
+    PE ≈ 1.0 → распределение перестановок равномерное → ряд хаотичен.
+    PE ≈ 0.3..0.7 → структура (тренд / mean-reversion) → ряд предсказуем.
+    PE ~ 0 → детерминированный сигнал (для рынка — почти не встречается).
+
+    Преимущество над обычной Шенноновской энтропией: устойчивее на коротких
+    рядах, не требует дискретизации в bins, инвариант к монотонным
+    преобразованиям.
+
+    Args:
+        returns: ряд лог-доходностей.
+        order: m, длина окна (3..7 разумно; m=3 даёт 6 перестановок,
+            m=4 — 24). По умолчанию 3.
+        delay: τ, шаг между точками внутри окна. По умолчанию 1
+            (берём подряд идущие точки).
+
+    Returns:
+        PE в [0, 1], либо None если выборка слишком мала
+        (нужно >= order! * 5 точек для статистики).
+
+    Reference:
+        Bandt, C., Pompe, B. (2002). Permutation entropy: a natural
+        complexity measure for time series. Phys. Rev. Lett. 88(17): 174102.
+    """
+    if order < 2 or delay < 1:
+        return None
+    n = len(returns)
+    needed = order * delay
+    if n < needed + 1:
+        return None
+    # Слишком мало точек для покрытия order! ≈ редких перестановок.
+    if n < math.factorial(order) * 5:
+        return None
+
+    from collections import Counter
+
+    perm_counts: Counter = Counter()
+    total = 0
+    for i in range(n - needed + 1):
+        window = [returns[i + j * delay] for j in range(order)]
+        # Ранги (с разрывами): для каждого индекса — его позиция при сортировке.
+        # Не используем numpy, чтобы оставить модуль pure-python.
+        indexed = sorted(range(order), key=lambda x: window[x])
+        rank: tuple[int, ...] = tuple(indexed)
+        perm_counts[rank] += 1
+        total += 1
+
+    if total == 0:
+        return None
+
+    h = 0.0
+    for c in perm_counts.values():
+        p = c / total
+        if p > 0:
+            h -= p * math.log(p)
+    h_max = math.log(math.factorial(order))
+    if h_max <= 0:
+        return None
+    pe_normalized = h / h_max
+    return max(0.0, min(1.0, pe_normalized))
+
+
 def analyze_complexity(closes: Sequence[float]) -> Optional[MarketComplexity]:
     """Главная точка входа: ряд цен закрытия → MarketComplexity.
 
