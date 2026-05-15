@@ -1049,6 +1049,49 @@ def _quant_lines(p: dict, indent: str = "    ") -> list[str]:
     return out
 
 
+def _trigger_lines(
+    p: dict,
+    indent: str = "    ",
+    prefix: str = "$",
+) -> list[str]:
+    """Две строки с MA-триггерами LONG / SHORT для одного актива.
+
+    Формат::
+
+        ▲ выше $81,963 (MA200) → LONG
+        ▼ ниже $74,969 (MA50) → SHORT
+
+    Выбор уровней:
+      • верхний (▲) = max(MA50, MA200) — закрытие выше → LONG-сетап
+      • нижний (▼) = min(MA50, MA200) — закрытие ниже → SHORT-сетап
+
+    Логика совпадает с `build_short_report` (main.py) и Synth-агентом — это
+    стандартный per-asset double-trigger CASH-план в нашей системе. В
+    /markets эти строки делают намерение визуально явным: пользователь
+    сразу видит ДВА конкретных уровня, не выискивая их в trend-строке.
+
+    Возвращает [] если хотя бы одного из MA нет (короткий ряд / упавший
+    фетчер). Это сохраняет graceful-degradation: не падаем, просто
+    скрываем триггеры.
+    """
+    ma50 = p.get("ma50")
+    ma200 = p.get("ma200")
+    if not isinstance(ma50, (int, float)) or not isinstance(ma200, (int, float)):
+        return []
+    if ma200 >= ma50:
+        up_level, up_tag = ma200, "MA200"
+        dn_level, dn_tag = ma50, "MA50"
+    else:
+        up_level, up_tag = ma50, "MA50"
+        dn_level, dn_tag = ma200, "MA200"
+    up = _fmt_money(up_level, prefix=prefix)
+    dn = _fmt_money(dn_level, prefix=prefix)
+    return [
+        f"{indent}▲ выше {up} ({up_tag}) → LONG",
+        f"{indent}▼ ниже {dn} ({dn_tag}) → SHORT",
+    ]
+
+
 def format_prices_for_agents(prices: dict) -> str:
     if not prices:
         return "Рыночные данные временно недоступны."
@@ -1087,6 +1130,13 @@ def format_prices_for_agents(prices: dict) -> str:
                 line += f"  {_fmt_change(ch30, decimals=1)} (30д)"
             line += f"  [{p['source']}]"
             lines.append(line)
+
+            # MA-триггеры LONG/SHORT — две строки перед trend-блоком. Это
+            # визуально приклеивает per-asset план («▲ выше $X → LONG; ▼ ниже
+            # $Y → SHORT») к цене, не дожидаясь дайджеста. Совпадает с
+            # форматом, который генерит Synth-агент в `plans[].trigger`.
+            for t in _trigger_lines(p):
+                lines.append(t)
 
             # Тренд и MA — адаптивная точность через _fmt_money:
             # XRP MA50=$1.30 раньше рендерился как `$1`, Synth писал «$1 (MA50)».
@@ -1160,6 +1210,9 @@ def format_prices_for_agents(prices: dict) -> str:
             ch = p["change_24h"]
             lines.append(f"  {label}: {p['price']:,.2f}  "
                          f"{_fmt_change(ch)}  [{p['source']}]")
+            # SPX/NDX/VIX рендерим без $-префикса — это индексы, не доллары.
+            for t in _trigger_lines(p, prefix=""):
+                lines.append(t)
             tl = _macro_trend_line(p)
             if tl:
                 lines.append(f"    {tl}")
@@ -1176,6 +1229,10 @@ def format_prices_for_agents(prices: dict) -> str:
             u  = f" {unit}" if unit else ""
             lines.append(f"  {label}: {p['price']:,.2f}{u}  "
                          f"{_fmt_change(ch)}  [{p['source']}]")
+            # OIL/GOLD — в долларах ($/барр, $/унц); DXY — индекс без $.
+            trig_prefix = "$" if k in ("OIL_WTI", "GOLD") else ""
+            for t in _trigger_lines(p, prefix=trig_prefix):
+                lines.append(t)
             tl = _macro_trend_line(p, unit=u if k == "OIL_WTI" or k == "GOLD" else "")
             if tl:
                 lines.append(f"    {tl}")
