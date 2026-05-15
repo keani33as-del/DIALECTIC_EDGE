@@ -272,7 +272,7 @@ class TestVolatilityForecast(unittest.TestCase):
         self.assertGreater(vf_spike.sigma_1d, vf_quiet.sigma_1d * 2.0)
 
 
-# ── End-to-end rendering via web_search._quant_lines ────────────────────────
+# ── End-to-end rendering via web_search._quant_lines (compact 2-line format) ──
 
 
 class TestQuantLinesRendering(unittest.TestCase):
@@ -283,25 +283,27 @@ class TestQuantLinesRendering(unittest.TestCase):
         closes = _closes_from_returns(returns)
         return _compute_complexity_fields(closes)
 
-    def test_quant_lines_for_random_walk(self):
+    def test_quant_lines_for_random_walk_at_most_two_lines(self):
         from web_search import _quant_lines
 
         fields = self._full_fields(_gen_random_walk(220, seed=1))
         lines = _quant_lines(fields)
+        # Compact format: вердикт + Markov — максимум 2 строки.
+        self.assertLessEqual(len(lines), 2)
         joined = "\n".join(lines)
-        self.assertIn("СЛОЖНОСТЬ", joined)
-        self.assertIn("VRT", joined)
-        self.assertIn("МАРКОВ", joined)
-        self.assertIn("ВОЛА", joined)
+        # Verdict line carries Hurst (H=) and one of the regime labels.
+        self.assertIn("H=", joined)
+        # Markov line is always last and prefixed by 🎲 Markov.
+        self.assertIn("Markov", joined)
 
-    def test_quant_lines_for_persistent_includes_random_walk_rejected(self):
+    def test_quant_lines_for_persistent_includes_h0_rejected(self):
         from web_search import _quant_lines
 
         fields = self._full_fields(_gen_persistent(220, ar=0.5, seed=2))
         lines = _quant_lines(fields)
         joined = "\n".join(lines)
-        # Persistent series should reject H0
-        self.assertIn("random walk отвергнут", joined)
+        # Persistent series should reject H0 — фолдится в verdict-строку.
+        self.assertIn("H0 отвергнут", joined)
 
     def test_quant_lines_skip_when_no_data(self):
         from web_search import _quant_lines
@@ -309,7 +311,7 @@ class TestQuantLinesRendering(unittest.TestCase):
         # No complexity-related fields at all → no lines.
         self.assertEqual(_quant_lines({"price": 100.0}), [])
 
-    def test_markov_line_format(self):
+    def test_markov_line_compact_format(self):
         from web_search import _markov_line
 
         line = _markov_line({
@@ -318,10 +320,16 @@ class TestQuantLinesRendering(unittest.TestCase):
             "markov_dwell_bars": 2.5,
         })
         self.assertIsNotNone(line)
+        # Compact form: "Markov UP (~2.5 баров)  UP 50% / FLAT 30% / DOWN 20%"
+        self.assertIn("Markov UP", line)
         self.assertIn("UP 50%", line)
         self.assertIn("FLAT 30%", line)
         self.assertIn("DOWN 20%", line)
         self.assertIn("2.5 баров", line)
+        # Legacy verbose markers should be gone.
+        self.assertNotIn("МАРКОВ:", line)
+        self.assertNotIn("текущее=", line)
+        self.assertNotIn("next:", line)
 
     def test_markov_line_skips_when_missing(self):
         from web_search import _markov_line
@@ -329,39 +337,47 @@ class TestQuantLinesRendering(unittest.TestCase):
         self.assertIsNone(_markov_line({}))
         self.assertIsNone(_markov_line({"markov_state": "UP"}))  # no probs
 
-    def test_volatility_line_format(self):
-        from web_search import _volatility_line
+    def test_verdict_line_carries_vrt_and_vol(self):
+        from web_search import _complexity_line
 
-        line = _volatility_line({
-            "vol_sigma_1d_pct": 2.34,
-            "vol_sigma_annual_pct": 44.7,
-            "vol_realized_1d_pct": 1.82,
-        })
-        self.assertIsNotNone(line)
-        self.assertIn("σ(1d)=2.34%", line)
-        self.assertIn("реализовано вчера=1.82%", line)
-        self.assertIn("annualized=45%", line)
-
-    def test_volatility_line_skips_without_sigma(self):
-        from web_search import _volatility_line
-
-        self.assertIsNone(_volatility_line({}))
-        self.assertIsNone(_volatility_line({"vol_realized_1d_pct": 1.0}))
-
-    def test_vrt_perm_line_format(self):
-        from web_search import _vrt_perm_line
-
-        line = _vrt_perm_line({
-            "vrt_ratio": 1.42,
-            "vrt_zstat": 6.22,
-            "vrt_random_walk": False,
+        line = _complexity_line({
+            "complexity_hint": "TRENDING",
+            "hurst": 0.58,
             "perm_entropy": 0.99,
+            "tradeable_score": 0.65,
+            "vrt_ratio": 1.42,
+            "vrt_random_walk": False,
+            "vol_sigma_1d_pct": 1.84,
+            "vol_sigma_annual_pct": 35.2,
         })
         self.assertIsNotNone(line)
-        self.assertIn("VRT(k=2)=1.42", line)
-        self.assertIn("z=+6.22", line)
-        self.assertIn("отвергнут", line)
-        self.assertIn("perm_entropy=0.99", line)
+        # Verdict line is a single string carrying all 5 categories of info.
+        self.assertIn("ТРЕНД", line)
+        self.assertIn("H=0.58", line)
+        self.assertIn("PE=0.99", line)
+        self.assertIn("VR=1.42", line)
+        self.assertIn("H0 отвергнут", line)
+        self.assertIn("σ̂=1.84%", line)
+        self.assertIn("год.35%", line)
+
+    def test_verdict_line_warns_on_random_walk_with_low_score(self):
+        from web_search import _complexity_line
+
+        line = _complexity_line({
+            "complexity_hint": "RANDOM_WALK",
+            "hurst": 0.50,
+            "perm_entropy": 0.99,
+            "tradeable_score": 0.22,
+            "vrt_ratio": 0.96,
+            "vrt_random_walk": True,
+            "vol_sigma_1d_pct": 2.30,
+            "vol_sigma_annual_pct": 44.0,
+        })
+        self.assertIsNotNone(line)
+        self.assertIn("RANDOM WALK", line)
+        self.assertIn("⚠️ untradeable", line)
+        self.assertIn("H0 не отвергнут", line)
+        self.assertIn("σ̂=2.30%", line)
 
 
 if __name__ == "__main__":

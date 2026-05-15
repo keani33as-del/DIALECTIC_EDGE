@@ -92,11 +92,12 @@ class TestComplexityLine(unittest.TestCase):
             "tradeable_score": 0.55,
         })
         assert line is not None
-        self.assertIn("Hurst=0.42", line)
-        self.assertIn("энтропия=0.78", line)
+        self.assertIn("H=0.42", line)
         self.assertIn("score=0.55", line)
-        self.assertIn("MEAN_REVERTING", line)
+        self.assertIn("MEAN-REVERTING", line)
         self.assertNotIn("untradeable", line)
+        # Compact format uses an emoji-leading verdict, not the legacy header
+        self.assertNotIn("СЛОЖНОСТЬ", line)
 
     def test_warns_when_score_below_threshold(self):
         line = _complexity_line({
@@ -110,7 +111,9 @@ class TestComplexityLine(unittest.TestCase):
         self.assertIn("untradeable", line)
 
     def test_handles_partial_fields(self):
-        # entropy<MIN_BARS scenario: hurst is None but entropy filled
+        # entropy<MIN_BARS scenario: hurst is None but entropy filled. Renderer
+        # falls back to legacy 'entropy_normalized' label when perm_entropy
+        # is also missing.
         line = _complexity_line({
             "complexity_hint": "MEAN_REVERTING",
             "hurst": None,
@@ -118,8 +121,29 @@ class TestComplexityLine(unittest.TestCase):
             "tradeable_score": 0.40,
         })
         assert line is not None
-        self.assertNotIn("Hurst=", line)
-        self.assertIn("энтропия=0.85", line)
+        self.assertNotIn("H=", line)
+        self.assertIn("энтр=0.85", line)
+        self.assertIn("score=0.40", line)
+
+    def test_renders_vrt_and_vol_when_present(self):
+        # New compact format folds VRT and EWMA σ-forecast into the same line.
+        line = _complexity_line({
+            "complexity_hint": "TRENDING",
+            "hurst": 0.58,
+            "perm_entropy": 0.99,
+            "tradeable_score": 0.65,
+            "vrt_ratio": 1.42,
+            "vrt_random_walk": False,
+            "vol_sigma_1d_pct": 1.84,
+            "vol_sigma_annual_pct": 35.2,
+        })
+        assert line is not None
+        self.assertIn("ТРЕНД", line)
+        self.assertIn("PE=0.99", line)
+        self.assertIn("VR=1.42", line)
+        self.assertIn("H0 отвергнут", line)
+        self.assertIn("σ̂=1.84%", line)
+        self.assertIn("год.35%", line)
 
 
 class TestFormatPricesForAgentsRendersComplexity(unittest.TestCase):
@@ -143,9 +167,9 @@ class TestFormatPricesForAgentsRendersComplexity(unittest.TestCase):
         }
         out = format_prices_for_agents(prices)
         self.assertIn("Bitcoin (BTC)", out)
-        self.assertIn("СЛОЖНОСТЬ", out)
-        self.assertIn("Hurst=0.62", out)
-        self.assertIn("TRENDING", out)
+        # Compact verdict line replaces the old "СЛОЖНОСТЬ" header.
+        self.assertIn("ТРЕНД", out)
+        self.assertIn("H=0.62", out)
 
     def test_crypto_without_complexity_renders_without_line(self):
         prices = {
@@ -159,7 +183,12 @@ class TestFormatPricesForAgentsRendersComplexity(unittest.TestCase):
         }
         out = format_prices_for_agents(prices)
         self.assertIn("Ethereum (ETH)", out)
-        self.assertNotIn("СЛОЖНОСТЬ", out)
+        # Без complexity-полей verdict-строка пропускается полностью.
+        # Базовая "ТРЕНД:"-строка от MA50/MA200 — отдельная, она остаётся.
+        # Проверяем уникальный маркер verdict-строки: "H=" (Hurst) появляется
+        # ТОЛЬКО в нашей quant-сводке и нигде больше.
+        self.assertNotIn("H=", out)
+        self.assertNotIn("Markov", out)
 
     def test_macro_index_includes_complexity_line(self):
         prices = {
@@ -181,8 +210,8 @@ class TestFormatPricesForAgentsRendersComplexity(unittest.TestCase):
         }
         out = format_prices_for_agents(prices)
         self.assertIn("S&P 500", out)
-        self.assertIn("СЛОЖНОСТЬ", out)
-        self.assertIn("Hurst=0.58", out)
+        self.assertIn("ТРЕНД", out)
+        self.assertIn("H=0.58", out)
 
     def test_random_walk_renders_untradeable_warning(self):
         # End-to-end: a real synthetic random walk → analyze_complexity →
