@@ -264,6 +264,44 @@ async def _coingecko_crypto(session) -> dict:
 
 # ─── Тренд: 7d/30d изменение + MA50 + структура ──────────────────────────────
 
+
+def _compute_complexity_fields(closes) -> dict:
+    """Hurst + Shannon entropy fields for a daily-closes series.
+
+    Returns a dict slice with `hurst` / `entropy_normalized` / `tradeable_score`
+    / `complexity_hint`, ready to be merged into the per-asset trend dict.
+    Returns {} when the series is too short (analyze_complexity returns None)
+    or when the import / computation fails.
+
+    The actual math lives in core.market_complexity. This helper exists so the
+    Binance and Yahoo fetchers stay symmetric and so the dependency is loaded
+    lazily — web_search.py is imported eagerly at bot startup and we don't
+    want the core math module to be a hard requirement.
+    """
+    try:
+        from core.market_complexity import analyze_complexity
+    except Exception as e:
+        logger.debug(f"market_complexity import failed: {e}")
+        return {}
+    try:
+        c = analyze_complexity(closes)
+    except Exception as e:
+        logger.debug(f"analyze_complexity failed: {e}")
+        return {}
+    if c is None:
+        return {}
+    return {
+        "hurst": round(c.hurst, 3) if c.hurst is not None else None,
+        "entropy_normalized": (
+            round(c.entropy_normalized, 3)
+            if c.entropy_normalized is not None
+            else None
+        ),
+        "tradeable_score": round(c.tradeable_score, 3),
+        "complexity_hint": c.regime_hint,
+    }
+
+
 async def _fetch_trend_data(session, symbol_binance: str, key: str) -> dict:
     """
     Получает расширенные данные тренда через Binance klines API (бесплатно):
@@ -369,6 +407,11 @@ async def _fetch_trend_data(session, symbol_binance: str, key: str) -> dict:
         result["lh"] = lh
         result["ll"] = ll
 
+        # Hurst + Shannon entropy. Дешёво (~1 мс на 200 баров) и даёт агентам
+        # независимый сигнал, торгуется ли вообще этот ряд (random_walk =
+        # сигналы по MA = монетка).
+        result.update(_compute_complexity_fields(closes))
+
     except Exception as e:
         logger.debug(f"Trend data {symbol_binance}: {e}")
     return result
@@ -450,6 +493,11 @@ async def _fetch_yahoo_trend(session, ticker: str, key: str) -> dict:
             rsi = _compute_rsi(closes, 14)
             if rsi is not None:
                 result["rsi_14d"] = rsi
+
+            # Hurst + энтропия — нужны и для крипты с Yahoo-фоллбэка (когда
+            # Binance падает), и для макро. Yahoo `range=1y` гарантирует
+            # ~250 баров что выше MIN_BARS_FOR_HURST=64.
+            result.update(_compute_complexity_fields(closes))
 
             # Простой trend label (как в _fetch_trend_data, но без HH/HL)
             ch_7d = result.get("change_7d", 0) or 0
@@ -771,6 +819,54 @@ def _cpi_yoy(raw: str) -> str:
 
 # ─── Форматирование для агентов ───────────────────────────────────────────────
 
+
+_COMPLEXITY_LABELS = {
+    "TRENDING":       "trending",
+    "MEAN_REVERTING": "mean-reverting",
+    "RANDOM_WALK":    "random walk",
+    "CHAOTIC":        "chaotic",
+    "MIXED":          "mixed",
+    "UNKNOWN":        "unknown",
+}
+
+
+def _complexity_line(p: dict, indent: str = "    ") -> str | None:
+    """Render the Hurst+entropy one-liner for an asset.
+
+    Returned format example:
+        🧮 СЛОЖНОСТЬ: Hurst=0.42 | энтропия=0.78 | score=0.55 → MEAN_REVERTING
+
+    Returns None when complexity_hint is missing or UNKNOWN — the agents and the
+    /markets renderer just skip the line. This is what keeps the line additive
+    on assets where the upstream fetcher returned <64 bars.
+    """
+    hint = p.get("complexity_hint")
+    if not hint or hint == "UNKNOWN":
+        return None
+
+    h = p.get("hurst")
+    e = p.get("entropy_normalized")
+    s = p.get("tradeable_score")
+
+    parts: list[str] = []
+    if isinstance(h, (int, float)):
+        parts.append(f"Hurst={h:.2f}")
+    if isinstance(e, (int, float)):
+        parts.append(f"энтропия={e:.2f}")
+    if isinstance(s, (int, float)):
+        parts.append(f"score={s:.2f}")
+    if not parts:
+        return None
+
+    label = _COMPLEXITY_LABELS.get(hint, hint.lower())
+    warn = ""
+    if isinstance(s, (int, float)) and s < 0.3:
+        # Score <0.3 means random_walk/chaotic regime — agents must NOT take
+        # an MA-based directional bet here. Loud warning so it gets noticed.
+        warn = " ⚠️ untradeable"
+    return f"{indent}🧮 СЛОЖНОСТЬ: {' | '.join(parts)} → {hint} ({label}){warn}"
+
+
 def format_prices_for_agents(prices: dict) -> str:
     if not prices:
         return "Рыночные данные временно недоступны."
@@ -823,6 +919,13 @@ def format_prices_for_agents(prices: dict) -> str:
                     pct200 = ((p['price'] - ma200) / ma200 * 100)
                     trend_line += f" | MA200: {_fmt_money(ma200, prefix='$')} ({pos200}, {pct200:+.1f}%)"
                 lines.append(trend_line)
+
+            # Hurst + энтропия (если фетчер положил поля). Bull/Bear/Synth
+            # видят эту строку в РЕАЛЬНЫХ РЫНОЧНЫХ ДАННЫХ и могут отказаться
+            # от направленного тезиса при random_walk / chaotic.
+            cline = _complexity_line(p)
+            if cline:
+                lines.append(cline)
 
             # Объём
             if vol:
@@ -878,6 +981,9 @@ def format_prices_for_agents(prices: dict) -> str:
             tl = _macro_trend_line(p)
             if tl:
                 lines.append(f"    {tl}")
+            cline = _complexity_line(p)
+            if cline:
+                lines.append(cline)
 
     lines.append("\n[СЫРЬЁ И ВАЛЮТЫ]")
     for k, label, unit in [("OIL_WTI","Нефть WTI","$/барр"),
@@ -892,6 +998,9 @@ def format_prices_for_agents(prices: dict) -> str:
             tl = _macro_trend_line(p, unit=u if k == "OIL_WTI" or k == "GOLD" else "")
             if tl:
                 lines.append(f"    {tl}")
+            cline = _complexity_line(p)
+            if cline:
+                lines.append(cline)
 
     lines.append("\n⚠️ ИНСТРУКЦИЯ: используй ТОЛЬКО эти цифры. "
                  "Если актива нет — пиши 'нет данных'.")
