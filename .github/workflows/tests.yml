@@ -1,0 +1,45 @@
+name: tests
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unittest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install runtime dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # Minimal set required by the import chain triggered by
+          # `tests/test_market_complexity.py`:
+          #   tests → core.market_complexity → core/__init__.py
+          #   → decision_engine → analysis_service → database (aiosqlite)
+          #   → news_fetcher (feedparser) → core/correlation (numpy).
+          # Network / AI / charting / FinBERT deps are NOT pulled in by the
+          # import chain (matplotlib, streamlit, google-generativeai, redis,
+          # torch/transformers, aiogram), so we skip them and save 30-60s.
+          pip install \
+            aiohttp==3.10.5 \
+            aiosqlite==0.20.0 \
+            feedparser==6.0.11 \
+            numpy \
+            certifi
+
+      - name: Run unit tests
+        run: |
+          python -m unittest discover -s tests -p "test_*.py" -v

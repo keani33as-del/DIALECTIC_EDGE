@@ -754,6 +754,15 @@ async def fetch_current_prices(symbols: list[str]) -> dict:
                     _signal_cache[sym]["rsi"] = regime.rsi
                     _signal_cache[sym]["trend_strength"] = regime.trend_strength
                     _signal_cache[sym]["regime_recommendation"] = regime.recommendation
+                    # Hurst + Shannon entropy. Числа уже посчитаны внутри
+                    # RegimeDetector.detect() и режут confidence, но раньше
+                    # сами значения никуда не уходили — теперь их видит и
+                    # автотрейдер в скоринге, и /markets рендерер (через
+                    # web_search.format_prices_for_agents → _complexity_line).
+                    _signal_cache[sym]["hurst"] = regime.hurst
+                    _signal_cache[sym]["entropy_normalized"] = regime.entropy_normalized
+                    _signal_cache[sym]["tradeable_score"] = regime.tradeable_score
+                    _signal_cache[sym]["complexity_hint"] = regime.complexity_hint
                     logger.info(
                         f"Regime {sym}: {regime.regime} | "
                         f"Conf: {regime.confidence:.2f} | "
