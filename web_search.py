@@ -266,40 +266,113 @@ async def _coingecko_crypto(session) -> dict:
 
 
 def _compute_complexity_fields(closes) -> dict:
-    """Hurst + Shannon entropy fields for a daily-closes series.
+    """Полный пакет «торгуемости» для дневного ряда закрытий.
 
-    Returns a dict slice with `hurst` / `entropy_normalized` / `tradeable_score`
-    / `complexity_hint`, ready to be merged into the per-asset trend dict.
-    Returns {} when the series is too short (analyze_complexity returns None)
-    or when the import / computation fails.
+    Считает (всё опционально, отсутствующие поля просто не попадут в dict):
 
-    The actual math lives in core.market_complexity. This helper exists so the
-    Binance and Yahoo fetchers stay symmetric and so the dependency is loaded
-    lazily — web_search.py is imported eagerly at bot startup and we don't
-    want the core math module to be a hard requirement.
+    1) **Hurst + Shannon entropy** (core.market_complexity.analyze_complexity)
+       — поля `hurst`, `entropy_normalized`, `tradeable_score`,
+       `complexity_hint`.
+    2) **Variance Ratio Test (Lo–MacKinlay)** и
+       **Permutation Entropy (Bandt–Pompe)** — `vrt_ratio`, `vrt_zstat`,
+       `vrt_pvalue`, `vrt_random_walk`, `perm_entropy`. Дешёвый sanity-check
+       на random-walk + улучшение Shannon entropy на коротких рядах.
+    3) **Markov regime (3-state)** (core.markov_regime) — поля
+       `markov_state`, `markov_next_probs`, `markov_dwell_bars`.
+       Дискретная цепь Маркова на квантилях returns, даёт next-bar probs
+       и expected dwell.
+    4) **EWMA volatility forecast** (core.volatility_forecast) — поля
+       `vol_sigma_1d_pct`, `vol_sigma_annual_pct`, `vol_realized_1d_pct`.
+       Forward-looking σ_{t+1} вместо backward-looking ATR.
+
+    Returns {} при импорт-фейле всего пакета. Если отдельный компонент
+    возвращает None (короткая выборка / вырожденный ряд) — соответствующие
+    поля просто отсутствуют и `_complexity_line` их пропустит.
+
+    Импорты ленивые: web_search.py подгружается на старте бота, мы не хотим
+    делать core.* хардом-зависимостью для bootstrap.
     """
+    out: dict = {}
+
+    # Hurst + Shannon entropy + интегральный complexity_hint
     try:
         from core.market_complexity import analyze_complexity
-    except Exception as e:
-        logger.debug(f"market_complexity import failed: {e}")
-        return {}
-    try:
         c = analyze_complexity(closes)
+        if c is not None:
+            out.update({
+                "hurst": round(c.hurst, 3) if c.hurst is not None else None,
+                "entropy_normalized": (
+                    round(c.entropy_normalized, 3)
+                    if c.entropy_normalized is not None
+                    else None
+                ),
+                "tradeable_score": round(c.tradeable_score, 3),
+                "complexity_hint": c.regime_hint,
+            })
     except Exception as e:
         logger.debug(f"analyze_complexity failed: {e}")
-        return {}
-    if c is None:
-        return {}
-    return {
-        "hurst": round(c.hurst, 3) if c.hurst is not None else None,
-        "entropy_normalized": (
-            round(c.entropy_normalized, 3)
-            if c.entropy_normalized is not None
-            else None
-        ),
-        "tradeable_score": round(c.tradeable_score, 3),
-        "complexity_hint": c.regime_hint,
-    }
+
+    # Returns переиспользуем для VRT / PE / Markov / EWMA — пересчитываем
+    # один раз (дешёво, ~200 вычитаний для крипты).
+    try:
+        from core.market_complexity import compute_returns
+        returns = compute_returns(closes)
+    except Exception as e:
+        logger.debug(f"compute_returns failed: {e}")
+        returns = []
+
+    if returns:
+        # VRT(k=2) — k=2 даёт максимальную чувствительность к
+        # day-to-day автокорреляции. Параметры дальше можно тюнить.
+        try:
+            from core.market_complexity import variance_ratio_test
+            vrt = variance_ratio_test(returns, k=2)
+            if vrt is not None:
+                out["vrt_ratio"] = round(vrt.vr, 3)
+                out["vrt_zstat"] = round(vrt.z_stat, 2)
+                out["vrt_pvalue"] = round(vrt.p_value, 4)
+                out["vrt_random_walk"] = vrt.random_walk
+        except Exception as e:
+            logger.debug(f"variance_ratio_test failed: {e}")
+
+        # Permutation entropy (order=3) — устойчивее Shannon на коротких рядах.
+        try:
+            from core.market_complexity import permutation_entropy
+            pe = permutation_entropy(returns, order=3)
+            if pe is not None:
+                out["perm_entropy"] = round(pe, 3)
+        except Exception as e:
+            logger.debug(f"permutation_entropy failed: {e}")
+
+        # Markov 3-state regime на returns
+        try:
+            from core.markov_regime import analyze_markov_regime
+            mk = analyze_markov_regime(returns)
+            if mk is not None:
+                out["markov_state"] = mk.current_state
+                out["markov_next_probs"] = {
+                    k: round(v, 3) for k, v in mk.next_step_probs.items()
+                }
+                # Конечный dwell нам интересен только для текущего состояния,
+                # иначе агентам слишком много чисел.
+                d = mk.expected_dwell_bars.get(mk.current_state)
+                if d is not None and d != float("inf"):
+                    out["markov_dwell_bars"] = round(d, 1)
+        except Exception as e:
+            logger.debug(f"analyze_markov_regime failed: {e}")
+
+        # EWMA volatility forecast (RiskMetrics λ=0.94, 365-day annualization)
+        try:
+            from core.volatility_forecast import forecast_volatility_ewma
+            vf = forecast_volatility_ewma(returns)
+            if vf is not None:
+                out["vol_sigma_1d_pct"] = round(vf.sigma_1d_pct, 2)
+                out["vol_sigma_annual_pct"] = round(vf.sigma_annualized_pct, 1)
+                out["vol_realized_1d_pct"] = round(vf.realized_1d_pct, 2)
+        except Exception as e:
+            logger.debug(f"forecast_volatility_ewma failed: {e}")
+
+    return out
 
 
 async def _fetch_trend_data(session, symbol_binance: str, key: str) -> dict:
@@ -867,6 +940,113 @@ def _complexity_line(p: dict, indent: str = "    ") -> str | None:
     return f"{indent}🧮 СЛОЖНОСТЬ: {' | '.join(parts)} → {hint} ({label}){warn}"
 
 
+_MARKOV_STATE_LABELS = {
+    "DOWN": "падение",
+    "FLAT": "флэт",
+    "UP":   "рост",
+}
+
+
+def _vrt_perm_line(p: dict, indent: str = "    ") -> str | None:
+    """Variance Ratio Test + Permutation Entropy одной строкой.
+
+    Пример:
+        📐 VRT(k=2)=0.92, z=-1.10 (random walk не отвергнут) | perm_entropy=0.97
+
+    Семантика для агентов:
+        - VR > 1.10 → положительная автокорреляция (тренд по дневкам).
+        - VR < 0.90 → отрицательная автокорреляция (mean-reverting).
+        - |z| < 1.96 → нельзя статистически отвергнуть случайное блуждание.
+        - perm_entropy → 1 → хаос. < 0.85 → есть структура.
+    """
+    vr = p.get("vrt_ratio")
+    z = p.get("vrt_zstat")
+    rw = p.get("vrt_random_walk")
+    pe = p.get("perm_entropy")
+    parts: list[str] = []
+    if isinstance(vr, (int, float)) and isinstance(z, (int, float)):
+        rw_note = " (random walk не отвергнут)" if rw else " (random walk отвергнут)"
+        parts.append(f"VRT(k=2)={vr:.2f}, z={z:+.2f}{rw_note}")
+    if isinstance(pe, (int, float)):
+        parts.append(f"perm_entropy={pe:.2f}")
+    if not parts:
+        return None
+    return f"{indent}📐 {' | '.join(parts)}"
+
+
+def _markov_line(p: dict, indent: str = "    ") -> str | None:
+    """Markov 3-state one-liner.
+
+    Пример:
+        🎲 МАРКОВ: текущее=FLAT (флэт) | next: UP 41% / FLAT 32% / DOWN 27%
+                  | ожидаемая длина серии ~3.2 баров
+
+    Returns None если состояние или next_probs отсутствуют (данных мало).
+    """
+    state = p.get("markov_state")
+    nxt = p.get("markov_next_probs")
+    dwell = p.get("markov_dwell_bars")
+    if not state or not isinstance(nxt, dict):
+        return None
+
+    state_ru = _MARKOV_STATE_LABELS.get(state, state.lower())
+
+    def _pct(x: float) -> str:
+        return f"{x * 100:.0f}%"
+
+    nxt_parts: list[str] = []
+    for s in ("UP", "FLAT", "DOWN"):
+        v = nxt.get(s)
+        if isinstance(v, (int, float)):
+            nxt_parts.append(f"{s} {_pct(v)}")
+
+    tail = ""
+    if isinstance(dwell, (int, float)):
+        tail = f" | ожидаемая длина серии ~{dwell:.1f} баров"
+
+    body = f"текущее={state} ({state_ru})"
+    if nxt_parts:
+        body += f" | next: {' / '.join(nxt_parts)}"
+    return f"{indent}🎲 МАРКОВ: {body}{tail}"
+
+
+def _volatility_line(p: dict, indent: str = "    ") -> str | None:
+    """EWMA volatility forecast one-liner.
+
+    Пример:
+        📊 ВОЛА: σ(1d)=2.3% (EWMA forecast) | реализовано вчера=1.8%
+                 | annualized=44%
+
+    Returns None если EWMA-блок отсутствует (вырожденный ряд / мало баров).
+    """
+    s1 = p.get("vol_sigma_1d_pct")
+    sa = p.get("vol_sigma_annual_pct")
+    rv = p.get("vol_realized_1d_pct")
+    if not isinstance(s1, (int, float)):
+        return None
+    parts = [f"σ(1d)={s1:.2f}% (EWMA forecast)"]
+    if isinstance(rv, (int, float)):
+        parts.append(f"реализовано вчера={rv:.2f}%")
+    if isinstance(sa, (int, float)):
+        parts.append(f"annualized={sa:.0f}%")
+    return f"{indent}📊 ВОЛА: {' | '.join(parts)}"
+
+
+def _quant_lines(p: dict, indent: str = "    ") -> list[str]:
+    """Возвращает все «количественные» строки для одного актива.
+
+    Порядок: Hurst+entropy → VRT+perm_entropy → Markov → EWMA vol.
+    Каждая строка опциональна; если соответствующие поля отсутствуют —
+    строка просто не появится в выводе.
+    """
+    out: list[str] = []
+    for fn in (_complexity_line, _vrt_perm_line, _markov_line, _volatility_line):
+        line = fn(p, indent=indent)
+        if line:
+            out.append(line)
+    return out
+
+
 def format_prices_for_agents(prices: dict) -> str:
     if not prices:
         return "Рыночные данные временно недоступны."
@@ -920,12 +1100,12 @@ def format_prices_for_agents(prices: dict) -> str:
                     trend_line += f" | MA200: {_fmt_money(ma200, prefix='$')} ({pos200}, {pct200:+.1f}%)"
                 lines.append(trend_line)
 
-            # Hurst + энтропия (если фетчер положил поля). Bull/Bear/Synth
-            # видят эту строку в РЕАЛЬНЫХ РЫНОЧНЫХ ДАННЫХ и могут отказаться
-            # от направленного тезиса при random_walk / chaotic.
-            cline = _complexity_line(p)
-            if cline:
-                lines.append(cline)
+            # Полный пакет «количественных» метрик: Hurst+entropy, VRT+perm_entropy,
+            # Markov state + next-bar probs, EWMA σ-forecast. Bull/Bear/Synth
+            # видят эти строки в РЕАЛЬНЫХ РЫНОЧНЫХ ДАННЫХ и могут отказаться
+            # от направленного тезиса при random_walk / chaotic / vrt не отвергает H0.
+            for q in _quant_lines(p):
+                lines.append(q)
 
             # Объём
             if vol:
@@ -981,9 +1161,8 @@ def format_prices_for_agents(prices: dict) -> str:
             tl = _macro_trend_line(p)
             if tl:
                 lines.append(f"    {tl}")
-            cline = _complexity_line(p)
-            if cline:
-                lines.append(cline)
+            for q in _quant_lines(p):
+                lines.append(q)
 
     lines.append("\n[СЫРЬЁ И ВАЛЮТЫ]")
     for k, label, unit in [("OIL_WTI","Нефть WTI","$/барр"),
@@ -998,9 +1177,8 @@ def format_prices_for_agents(prices: dict) -> str:
             tl = _macro_trend_line(p, unit=u if k == "OIL_WTI" or k == "GOLD" else "")
             if tl:
                 lines.append(f"    {tl}")
-            cline = _complexity_line(p)
-            if cline:
-                lines.append(cline)
+            for q in _quant_lines(p):
+                lines.append(q)
 
     lines.append("\n⚠️ ИНСТРУКЦИЯ: используй ТОЛЬКО эти цифры. "
                  "Если актива нет — пиши 'нет данных'.")
