@@ -903,83 +903,104 @@ _COMPLEXITY_LABELS = {
 }
 
 
-def _complexity_line(p: dict, indent: str = "    ") -> str | None:
-    """Render the Hurst+entropy one-liner for an asset.
-
-    Returned format example:
-        🧮 СЛОЖНОСТЬ: Hurst=0.42 | энтропия=0.78 | score=0.55 → MEAN_REVERTING
-
-    Returns None when complexity_hint is missing or UNKNOWN — the agents and the
-    /markets renderer just skip the line. This is what keeps the line additive
-    on assets where the upstream fetcher returned <64 bars.
-    """
-    hint = p.get("complexity_hint")
-    if not hint or hint == "UNKNOWN":
-        return None
-
-    h = p.get("hurst")
-    e = p.get("entropy_normalized")
-    s = p.get("tradeable_score")
-
-    parts: list[str] = []
-    if isinstance(h, (int, float)):
-        parts.append(f"Hurst={h:.2f}")
-    if isinstance(e, (int, float)):
-        parts.append(f"энтропия={e:.2f}")
-    if isinstance(s, (int, float)):
-        parts.append(f"score={s:.2f}")
-    if not parts:
-        return None
-
-    label = _COMPLEXITY_LABELS.get(hint, hint.lower())
-    warn = ""
-    if isinstance(s, (int, float)) and s < 0.3:
-        # Score <0.3 means random_walk/chaotic regime — agents must NOT take
-        # an MA-based directional bet here. Loud warning so it gets noticed.
-        warn = " ⚠️ untradeable"
-    return f"{indent}🧮 СЛОЖНОСТЬ: {' | '.join(parts)} → {hint} ({label}){warn}"
-
-
 _MARKOV_STATE_LABELS = {
     "DOWN": "падение",
     "FLAT": "флэт",
     "UP":   "рост",
 }
 
+# Эмодзи-вердикты по `complexity_hint`. Видимый верх-«знак» строки сразу
+# даёт пользователю и LLM-агенту понятный signal: персистентный тренд /
+# mean-reversion / случайное блуждание / хаос. ⚠ на untradeable.
+_REGIME_EMOJI = {
+    "TRENDING":       "📈",
+    "MEAN_REVERTING": "🔄",
+    "RANDOM_WALK":    "🪙",
+    "CHAOTIC":        "🌪️",
+    "MIXED":          "⚖️",
+    "UNKNOWN":        "❓",
+}
 
-def _vrt_perm_line(p: dict, indent: str = "    ") -> str | None:
-    """Variance Ratio Test + Permutation Entropy одной строкой.
+# Подпись к режиму на русском. Достаточно короткая чтобы не съедать
+# полстроки. «↑» / «↓» как дополнительный визуальный маркер направления
+# не ставим — направление будет в Markov-строке (current_state).
+_REGIME_RU = {
+    "TRENDING":       "ТРЕНД",
+    "MEAN_REVERTING": "MEAN-REVERTING",
+    "RANDOM_WALK":    "RANDOM WALK",
+    "CHAOTIC":        "ХАОС",
+    "MIXED":          "МИКС",
+    "UNKNOWN":        "?",
+}
 
-    Пример:
-        📐 VRT(k=2)=0.92, z=-1.10 (random walk не отвергнут) | perm_entropy=0.97
 
-    Семантика для агентов:
-        - VR > 1.10 → положительная автокорреляция (тренд по дневкам).
-        - VR < 0.90 → отрицательная автокорреляция (mean-reverting).
-        - |z| < 1.96 → нельзя статистически отвергнуть случайное блуждание.
-        - perm_entropy → 1 → хаос. < 0.85 → есть структура.
+def _complexity_line(p: dict, indent: str = "    ") -> str | None:
+    """Однострочный «вердикт» режима + ключевые цифры.
+
+    Сжатая замена бывших 4 отдельных строк (Hurst-блок + VRT + EWMA). Идея:
+    одна строка-«заголовок» с вердиктом и плотным набором цифр,
+    подсвеченным эмодзи. Все цифры по-прежнему доступны агентам.
+
+    Returned format example:
+        📈 ТРЕНД  H=0.56  PE=0.99  score=0.60  VR=1.42 (H0 отвергнут)  σ̂=1.84% (год.35%)
+
+    Returns None when complexity_hint is missing or UNKNOWN — обе поверхности
+    (/markets и /daily) просто пропустят строку. Это сохраняет
+    additive-семантику на активах с короткой историей (<64 баров).
     """
-    vr = p.get("vrt_ratio")
-    z = p.get("vrt_zstat")
-    rw = p.get("vrt_random_walk")
+    hint = p.get("complexity_hint")
+    if not hint or hint == "UNKNOWN":
+        return None
+
+    h = p.get("hurst")
     pe = p.get("perm_entropy")
+    e = p.get("entropy_normalized")
+    s = p.get("tradeable_score")
+    vr = p.get("vrt_ratio")
+    vr_rw = p.get("vrt_random_walk")
+    vol_1d = p.get("vol_sigma_1d_pct")
+    vol_ann = p.get("vol_sigma_annual_pct")
+
+    # Цифры, дробью-разделителем '  ' (двойной пробел) — визуально проще
+    # читать чем 'X | Y | Z'.
     parts: list[str] = []
-    if isinstance(vr, (int, float)) and isinstance(z, (int, float)):
-        rw_note = " (random walk не отвергнут)" if rw else " (random walk отвергнут)"
-        parts.append(f"VRT(k=2)={vr:.2f}, z={z:+.2f}{rw_note}")
+    if isinstance(h, (int, float)):
+        parts.append(f"H={h:.2f}")
+    # Permutation entropy предпочтительнее Шенноновской (устойчивее на
+    # коротких рядах); если её нет — fallback на Шеннон.
     if isinstance(pe, (int, float)):
-        parts.append(f"perm_entropy={pe:.2f}")
+        parts.append(f"PE={pe:.2f}")
+    elif isinstance(e, (int, float)):
+        parts.append(f"энтр={e:.2f}")
+    if isinstance(s, (int, float)):
+        parts.append(f"score={s:.2f}")
+    if isinstance(vr, (int, float)):
+        rw_tag = "H0 не отвергнут" if vr_rw else "H0 отвергнут"
+        parts.append(f"VR={vr:.2f} ({rw_tag})")
+    if isinstance(vol_1d, (int, float)):
+        if isinstance(vol_ann, (int, float)):
+            parts.append(f"σ̂={vol_1d:.2f}% (год.{vol_ann:.0f}%)")
+        else:
+            parts.append(f"σ̂={vol_1d:.2f}%")
+
     if not parts:
         return None
-    return f"{indent}📐 {' | '.join(parts)}"
+
+    emoji = _REGIME_EMOJI.get(hint, "•")
+    ru = _REGIME_RU.get(hint, hint)
+    warn = ""
+    if isinstance(s, (int, float)) and s < 0.3:
+        # Score <0.3 means random_walk/chaotic regime — agents must NOT take
+        # an MA-based directional bet here. Loud warning so it gets noticed.
+        warn = " ⚠️ untradeable"
+    return f"{indent}{emoji} {ru}{warn}  " + "  ".join(parts)
 
 
 def _markov_line(p: dict, indent: str = "    ") -> str | None:
-    """Markov 3-state one-liner.
+    """Markov 3-state — компактная вторая строка.
 
     Пример:
-        🎲 МАРКОВ: текущее=FLAT (флэт) | next: UP 41% / FLAT 32% / DOWN 27%
-                  | ожидаемая длина серии ~3.2 баров
+        🎲 Markov FLAT (~1.6 баров)  UP 27% / FLAT 37% / DOWN 36%
 
     Returns None если состояние или next_probs отсутствуют (данных мало).
     """
@@ -988,8 +1009,6 @@ def _markov_line(p: dict, indent: str = "    ") -> str | None:
     dwell = p.get("markov_dwell_bars")
     if not state or not isinstance(nxt, dict):
         return None
-
-    state_ru = _MARKOV_STATE_LABELS.get(state, state.lower())
 
     def _pct(x: float) -> str:
         return f"{x * 100:.0f}%"
@@ -1000,47 +1019,30 @@ def _markov_line(p: dict, indent: str = "    ") -> str | None:
         if isinstance(v, (int, float)):
             nxt_parts.append(f"{s} {_pct(v)}")
 
-    tail = ""
+    dwell_tag = ""
     if isinstance(dwell, (int, float)):
-        tail = f" | ожидаемая длина серии ~{dwell:.1f} баров"
+        dwell_tag = f" (~{dwell:.1f} баров)"
 
-    body = f"текущее={state} ({state_ru})"
+    body = f"Markov {state}{dwell_tag}"
     if nxt_parts:
-        body += f" | next: {' / '.join(nxt_parts)}"
-    return f"{indent}🎲 МАРКОВ: {body}{tail}"
-
-
-def _volatility_line(p: dict, indent: str = "    ") -> str | None:
-    """EWMA volatility forecast one-liner.
-
-    Пример:
-        📊 ВОЛА: σ(1d)=2.3% (EWMA forecast) | реализовано вчера=1.8%
-                 | annualized=44%
-
-    Returns None если EWMA-блок отсутствует (вырожденный ряд / мало баров).
-    """
-    s1 = p.get("vol_sigma_1d_pct")
-    sa = p.get("vol_sigma_annual_pct")
-    rv = p.get("vol_realized_1d_pct")
-    if not isinstance(s1, (int, float)):
-        return None
-    parts = [f"σ(1d)={s1:.2f}% (EWMA forecast)"]
-    if isinstance(rv, (int, float)):
-        parts.append(f"реализовано вчера={rv:.2f}%")
-    if isinstance(sa, (int, float)):
-        parts.append(f"annualized={sa:.0f}%")
-    return f"{indent}📊 ВОЛА: {' | '.join(parts)}"
+        body += "  " + " / ".join(nxt_parts)
+    return f"{indent}🎲 {body}"
 
 
 def _quant_lines(p: dict, indent: str = "    ") -> list[str]:
-    """Возвращает все «количественные» строки для одного актива.
+    """Возвращает компактные «количественные» строки для одного актива.
 
-    Порядок: Hurst+entropy → VRT+perm_entropy → Markov → EWMA vol.
-    Каждая строка опциональна; если соответствующие поля отсутствуют —
-    строка просто не появится в выводе.
+    Замена бывших 4 строк (Hurst / VRT / Markov / EWMA): теперь максимум
+    2 строки на актив:
+        строка 1 — вердикт режима + Hurst/PE/score/VRT/σ̂ inline;
+        строка 2 — Markov: текущее состояние + next-bar probs + dwell.
+
+    Каждая опциональна — если поля отсутствуют (короткий ряд / вырожденный
+    return-series / упавший фетчер), соответствующая строка пропадает.
+    Это сохраняет gracefuldegradation, как было до сжатия.
     """
     out: list[str] = []
-    for fn in (_complexity_line, _vrt_perm_line, _markov_line, _volatility_line):
+    for fn in (_complexity_line, _markov_line):
         line = fn(p, indent=indent)
         if line:
             out.append(line)
