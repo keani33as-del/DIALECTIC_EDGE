@@ -5,7 +5,6 @@
 [![Python](https://img.shields.io/badge/Python-3.12-blue)](https://www.python.org/) [![License](https://img.shields.io/badge/License-Private-red)]() [![Status](https://img.shields.io/badge/Status-Production-success)]() [![Deploy](https://img.shields.io/badge/Deploy-Railway-purple)](https://railway.app/) [![Telegram](https://img.shields.io/badge/Frontend-Telegram-blue)](https://telegram.org/)
 
 ---
-
 ## 🎯 Что это
 
 **Dialectic Edge** — автономная торговая система, которая работает на принципах системного фонда, а не retail-трейдера:
