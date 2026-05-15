@@ -681,6 +681,47 @@ async def fetch_realtime_prices() -> dict:
                 if "ma50" in trend_val:
                     prices[f"MA50_{key}"] = trend_val["ma50"]
 
+        # ── Fallback на Yahoo для крипты, если Binance API не отдал MA ──
+        # Symptom: в Telegram видно "Bitcoin (BTC) ... CoinGecko" без строки
+        # "ТРЕНД: ... | MA50 ... | MA200 ...". Причина: Binance klines API
+        # упал/таймаут (часто блокируется в РФ или rate-limit), `_fetch_trend_data`
+        # тихо вернул {}. CoinGecko даёт цену но не MA. Подстраховка — Yahoo.
+        crypto_yahoo_tickers = {
+            "BTC": "BTC-USD",
+            "ETH": "ETH-USD",
+            "SOL": "SOL-USD",
+            "BNB": "BNB-USD",
+            "XRP": "XRP-USD",
+        }
+        crypto_missing_ma = [
+            k for k in ("BTC", "ETH", "SOL", "BNB", "XRP")
+            if k in prices and "ma200" not in prices[k]
+        ]
+        if crypto_missing_ma:
+            logger.debug(
+                "Crypto MA fallback to Yahoo for: %s", crypto_missing_ma
+            )
+            yahoo_results = await asyncio.gather(
+                *[
+                    _fetch_yahoo_trend(session, crypto_yahoo_tickers[k], k)
+                    for k in crypto_missing_ma
+                ],
+                return_exceptions=True,
+            )
+            for k, yres in zip(crypto_missing_ma, yahoo_results):
+                if not yres or isinstance(yres, Exception):
+                    continue
+                # Мерджим только новые поля — не затираем уже что-то от Binance
+                for field, val in yres.items():
+                    if field not in prices[k]:
+                        prices[k][field] = val
+                if "ma200" in yres:
+                    prices[f"MA200_{k}"] = yres["ma200"]
+                if "ma50" in yres:
+                    prices[f"MA50_{k}"] = yres["ma50"]
+                if "atr_14d" in yres:
+                    prices[f"ATR_{k}"] = yres["atr_14d"]
+
         # Макро: prices + MA-тренд
         for key, val in [("SPX", spx), ("NDX", ndx), ("VIX", vix),
                          ("DXY", dxy), ("OIL_WTI", oil), ("GOLD", gold)]:
