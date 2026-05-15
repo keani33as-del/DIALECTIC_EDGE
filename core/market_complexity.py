@@ -145,7 +145,7 @@ def _rescaled_range(series: Sequence[float]) -> float:
 
 
 def hurst_exponent(returns: Sequence[float], min_chunk: int = 8) -> Optional[float]:
-    """Hurst exponent через R/S analysis.
+    """Hurst exponent через R/S analysis (с Anis-Lloyd корректировкой).
 
     Args:
         returns: ряд лог-приращений (или просто returns — главное, чтобы был
@@ -158,11 +158,14 @@ def hurst_exponent(returns: Sequence[float], min_chunk: int = 8) -> Optional[flo
     Метод:
         1. Делим ряд на чанки разных размеров (min_chunk, 2*min_chunk, 4*...).
         2. Для каждого размера считаем средний R/S по всем чанкам.
-        3. Линейная регрессия log(R/S) vs log(n) — наклон = Hurst.
+        3. Корректируем R/S через Anis-Lloyd expected value под H=0.5
+           (без коррекции R/S завышен на коротких рядах ⇒ Hurst≈0.55-0.65
+           даже на чистом random walk, что приводит к ложному TRENDING).
+        4. Линейная регрессия log(R/S_corrected) vs log(n) — наклон = Hurst.
 
     Замечания:
         Метод чувствителен к коротким рядам — на n<64 даёт шум. Поэтому
-        вход возвращаем None если len(returns) < MIN_BARS_FOR_HURST.
+        возвращаем None если len(returns) < MIN_BARS_FOR_HURST.
     """
     n = len(returns)
     if n < MIN_BARS_FOR_HURST:
@@ -198,8 +201,17 @@ def hurst_exponent(returns: Sequence[float], min_chunk: int = 8) -> Optional[flo
         if avg_rs <= 0:
             continue
 
+        # Anis-Lloyd correction: E[R/S] под нулевой гипотезой H=0.5.
+        # Делим эмпирический R/S на ожидаемый, чтобы H вышел ≈ 0.5
+        # на чистом random walk (без коррекции — стабильно ≈ 0.6).
+        expected_rs = _anis_lloyd_expected(chunk_size)
+        corrected_rs = avg_rs / expected_rs if expected_rs > 0 else avg_rs
+        # И умножаем обратно на sqrt(n) — теоретическое asymptotic поведение
+        # под H=0.5. Тогда наклон log(corrected*sqrt(n))/log(n) даёт Hurst.
+        corrected_rs *= math.sqrt(chunk_size)
+
         log_n.append(math.log(chunk_size))
-        log_rs.append(math.log(avg_rs))
+        log_rs.append(math.log(corrected_rs))
 
     if len(log_n) < 3:
         return None
@@ -219,6 +231,32 @@ def hurst_exponent(returns: Sequence[float], min_chunk: int = 8) -> Optional[flo
 
     # Кламп в разумные пределы (теоретически H ∈ [0,1])
     return max(0.0, min(1.0, hurst))
+
+
+def _anis_lloyd_expected(n: int) -> float:
+    """Ожидаемое значение R/S под нулевой гипотезой H=0.5 (Anis & Lloyd 1976).
+
+    Формула:
+        E[R/S](n) = ((n-0.5)/n) * (1/sqrt(n*pi/2)) * sum_{k=1}^{n-1} sqrt((n-k)/k)
+
+    Это эталон против которого мы сравниваем эмпирический R/S. Без этой
+    нормировки H систематически завышается на коротких рядах (n<512).
+
+    На очень больших n эта формула медленно сходится к sqrt(n*pi/2),
+    поэтому для n>1000 используем асимптотику для скорости.
+    """
+    if n < 2:
+        return 1.0
+    if n > 1000:
+        # Асимптотика E[R/S] ≈ sqrt(n*pi/2)
+        return math.sqrt(n * math.pi / 2)
+
+    # Точная формула Anis-Lloyd
+    sum_term = 0.0
+    for k in range(1, n):
+        sum_term += math.sqrt((n - k) / k)
+
+    return ((n - 0.5) / n) * (1.0 / math.sqrt(n * math.pi / 2)) * sum_term
 
 
 # ── Математика: Shannon entropy ─────────────────────────────────────────────
@@ -308,6 +346,11 @@ def _interpret(hurst: Optional[float], entropy: Optional[float]) -> tuple[str, s
             0.5,
         )
 
+    # Pre-format строк, чтобы безопасно подставлять в f-string ниже
+    # (применить :.2f к None крашит интерпретатор → нужен явный fallback).
+    h_str = f"{hurst:.2f}" if hurst is not None else "?"
+    e_str = f"{entropy:.2f}" if entropy is not None else "?"
+
     # Расшифровка Hurst
     if hurst is None:
         hurst_label = "unknown"
@@ -343,7 +386,7 @@ def _interpret(hurst: Optional[float], entropy: Optional[float]) -> tuple[str, s
     # Интегральный score: среднее с лёгким даунбиасом если хоть один сигнал плохой
     tradeable_score = (hurst_score + entropy_score) / 2.0
 
-    # Если оба плохие — режем сильнее (мультипликативный штраф)
+    # Если оба плохие — штраф применён (мультипликативный *0.5)
     if hurst_label == "random_walk" and entropy_label == "chaotic":
         tradeable_score *= 0.5
 
@@ -351,34 +394,49 @@ def _interpret(hurst: Optional[float], entropy: Optional[float]) -> tuple[str, s
     if hurst_label == "trending" and entropy_label == "ordered":
         tradeable_score = min(1.0, tradeable_score * 1.15)
 
-    # Сводный лейбл режима
-    if hurst_label == "trending" and entropy_label in ("ordered", "neutral"):
+    # Сводный лейбл режима.
+    # ВАЖНО: проверяем «плохие» состояния ПЕРВЫМИ, чтобы не получить
+    # ложный TRENDING на ряду где Hurst случайно завысился (известный bias
+    # R/S на коротких выборках без Anis-Lloyd correction).
+    if hurst_label == "random_walk":
+        regime_hint = "RANDOM_WALK"
+        recommendation = (
+            f"Hurst={h_str}, энтропия={e_str}. "
+            "Рынок в режиме случайного блуждания. "
+            "СИГНАЛЫ НЕ РАБОТАЮТ. Лучше отдохнуть."
+        )
+    elif entropy_label == "chaotic":
+        regime_hint = "CHAOTIC"
+        recommendation = (
+            f"Hurst={h_str}, энтропия={e_str}. "
+            "Высокая энтропия — рынок хаотичен (часто event-day). "
+            "СИГНАЛЫ НЕ РАБОТАЮТ. Лучше отдохнуть."
+        )
+    elif hurst_label == "trending" and entropy_label in ("ordered", "neutral", "unknown"):
         regime_hint = "TRENDING"
         recommendation = (
-            f"Hurst={hurst:.2f} (тренд), энтропия={entropy:.2f} ({entropy_label}). "
+            f"Hurst={h_str} (тренд), энтропия={e_str} ({entropy_label}). "
             "Сигналы по MA должны работать. Можно торговать стандартно."
         )
-    elif hurst_label == "mean_reverting" and entropy_label in ("ordered", "neutral"):
+    elif hurst_label == "mean_reverting" and entropy_label in ("ordered", "neutral", "unknown"):
         regime_hint = "MEAN_REVERTING"
         recommendation = (
-            f"Hurst={hurst:.2f} (mean-reverting). Тренды быстро разворачиваются — "
-            "будь осторожнее с пробоями, лучше торговать от границ диапазона."
-        )
-    elif hurst_label == "random_walk" or entropy_label == "chaotic":
-        regime_hint = "RANDOM_WALK" if hurst_label == "random_walk" else "CHAOTIC"
-        recommendation = (
-            f"Hurst={hurst if hurst is not None else '?':.2f}, "
-            f"энтропия={entropy if entropy is not None else '?':.2f}. "
-            "Рынок в режиме случайного блуждания / хаоса. "
-            "СИГНАЛЫ НЕ РАБОТАЮТ. Лучше отдохнуть."
+            f"Hurst={h_str} (mean-reverting). "
+            "Тренды быстро разворачиваются — будь осторожнее с пробоями, "
+            "лучше торговать от границ диапазона."
         )
     else:
         regime_hint = "MIXED"
         recommendation = (
-            f"Смешанный режим (Hurst={hurst if hurst is not None else '?':.2f}, "
-            f"энтропия={entropy if entropy is not None else '?':.2f}). "
+            f"Смешанный режим (Hurst={h_str}, энтропия={e_str}). "
             "Уменьшенные позиции, ждать чёткого подтверждения."
         )
+
+    # ── Дополнительный safeguard на случай завышенного Hurst (короткие
+    # ряды → R/S bias). Если ряд оценён как trending по Hurst, но
+    # энтропия высокая (близко к chaos-порогу) — режем score, не доверяем.
+    if hurst_label == "trending" and entropy is not None and entropy > 0.90:
+        tradeable_score = min(tradeable_score, 0.45)
 
     return regime_hint, recommendation, max(0.0, min(1.0, tradeable_score))
 
