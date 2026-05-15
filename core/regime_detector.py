@@ -13,13 +13,21 @@ regime_detector.py — Определение рыночного режима.
   - ATR (волатильность)
   - RSI (перекупленность/перепроданность)
   - Volume trend
+  - Hurst exponent + Shannon entropy (опциональный фильтр торгуемости,
+    см. core/market_complexity.py — режет confidence в random-walk режиме)
 """
 
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Optional
+
+try:
+    from .market_complexity import analyze_complexity, MarketComplexity
+except ImportError:  # pragma: no cover — на случай если модуль не нашёлся
+    analyze_complexity = None  # type: ignore[assignment]
+    MarketComplexity = None  # type: ignore[assignment,misc]
 
 logger = logging.getLogger(__name__)
 
@@ -35,9 +43,16 @@ class MarketRegime:
     ma_signal: str        # BULLISH_CROSS, BEARISH_CROSS, ABOVE_MA, BELOW_MA
     volume_trend: str     # INCREASING, DECREASING, NEUTRAL
     recommendation: str   # Actionable advice
+    # ── Дополнительные метрики «торгуемости» (опционально) ────────────────
+    # Заполняются если len(candles) >= ~65 и market_complexity модуль доступен.
+    # Позволяют отфильтровать random-walk режим до открытия позиции.
+    hurst: Optional[float] = None              # 0..1, ~0.5 = случайное блуждание
+    entropy_normalized: Optional[float] = None  # 0..1, чем выше — тем хаотичнее
+    tradeable_score: Optional[float] = None     # 0..1, < 0.3 = не торговать
+    complexity_hint: Optional[str] = None       # TRENDING/RANDOM_WALK/CHAOTIC/...
 
     def to_dict(self) -> dict:
-        return {
+        out = {
             "regime": self.regime,
             "confidence": round(self.confidence, 2),
             "trend_strength": round(self.trend_strength, 1),
@@ -47,6 +62,16 @@ class MarketRegime:
             "volume_trend": self.volume_trend,
             "recommendation": self.recommendation,
         }
+        # Добавляем complexity-метрики только если они посчитались
+        if self.hurst is not None:
+            out["hurst"] = round(self.hurst, 3)
+        if self.entropy_normalized is not None:
+            out["entropy_normalized"] = round(self.entropy_normalized, 3)
+        if self.tradeable_score is not None:
+            out["tradeable_score"] = round(self.tradeable_score, 3)
+        if self.complexity_hint is not None:
+            out["complexity_hint"] = self.complexity_hint
+        return out
 
 
 class RegimeDetector:
@@ -176,6 +201,44 @@ class RegimeDetector:
                 "Скальпинг от границ диапазона или отдых."
             )
 
+        # === ОПЦИОНАЛЬНО: Hurst + Shannon entropy фильтр ===
+        # На длинных историях (>=65 баров) считаем «торгуемость» рынка как
+        # независимый математический фильтр. В random-walk / хаотичном режиме
+        # любая стратегия даёт ~50/50 — режем confidence чтобы UPTREND/DOWNTREND
+        # не открывали позиции на шуме.
+        hurst_val: Optional[float] = None
+        entropy_val: Optional[float] = None
+        tradeable_val: Optional[float] = None
+        complexity_hint: Optional[str] = None
+
+        if analyze_complexity is not None:
+            try:
+                complexity = analyze_complexity(closes)
+            except Exception as e:
+                logger.warning("market_complexity failed: %s", e)
+                complexity = None
+
+            if complexity is not None:
+                hurst_val = complexity.hurst
+                entropy_val = complexity.entropy_normalized
+                tradeable_val = complexity.tradeable_score
+                complexity_hint = complexity.regime_hint
+
+                # Мягкая корректировка: если рынок «не торгуем» по математике,
+                # то даже UPTREND/DOWNTREND не должен брать позицию на полную.
+                # Не меняем сам regime — только confidence + recommendation.
+                if tradeable_val < 0.3 and regime in ("UPTREND", "DOWNTREND"):
+                    confidence = min(confidence, 0.4)
+                    recommendation = (
+                        f"{recommendation} ⚠️ Hurst={hurst_val:.2f}, "
+                        f"энтропия={entropy_val:.2f} — рынок в режиме "
+                        f"{complexity_hint}, сигналы тренда ненадёжны. "
+                        "Уменьшить размер позиции или подождать."
+                    )
+                elif tradeable_val > 0.7 and regime in ("UPTREND", "DOWNTREND"):
+                    # Лёгкий буст confidence в чисто трендовом режиме
+                    confidence = min(0.98, confidence * 1.05)
+
         return MarketRegime(
             regime=regime,
             confidence=confidence,
@@ -185,6 +248,10 @@ class RegimeDetector:
             ma_signal=ma_signal,
             volume_trend=volume_trend,
             recommendation=recommendation,
+            hurst=hurst_val,
+            entropy_normalized=entropy_val,
+            tradeable_score=tradeable_val,
+            complexity_hint=complexity_hint,
         )
 
     def get_position_size_multiplier(self, regime: MarketRegime) -> float:
