@@ -3597,6 +3597,131 @@ async def cmd_signals_deprecated(message: Message):
     )
 
 
+# ─── /signal — auto SL/TP recommender ─────────────────────────────────────────
+
+def _fmt_signal_message(result: dict) -> str:
+    """Рендерит результат `rank_signals(...)` в Telegram-сообщение.
+
+    Format:
+      • Если top != None → один setup с уровнями SL/TP, R/R, size, score
+        и списком обоснований.
+      • Если top == None → «сегодня сидим» + top-3 кандидатов по score
+        с короткими причинами почему недоторговываем.
+
+    Это деёт пользователю либо одну конкретную рекомендацию (одно
+    нажатие в Bybit), либо понятный «не торгуй сегодня» — без
+    необходимости вручную скоррелировать `/markets` через 11 активов.
+    """
+    from core.signal_scorer import SignalSetup
+
+    capital = result.get("capital", 123.0)
+    min_score = result.get("min_score", 60)
+    scored = result.get("scored") or []
+    top = result.get("top")
+
+    lines: list[str] = []
+    lines.append("🎯 *АВТО-СИГНАЛ* (детерминированный scoring)")
+    lines.append("")
+    lines.append(f"Скан: {len(scored)} актив(ов) | Порог: {min_score}/100")
+    lines.append("")
+
+    if isinstance(top, SignalSetup):
+        # ── Setup найден ──
+        emoji = "📈" if top.direction == "LONG" else "📉"
+        stars = "⭐" * min(5, max(1, top.score // 20))
+        lines.append(f"🥇 *ТОП SETUP:* {top.asset} *{top.direction}* {emoji}")
+        lines.append("```")
+        lines.append(f"Entry:   ${top.entry}")
+        lines.append(f"Stop:    ${top.stop}  ({top.stop_pct:+.1f}% = "
+                     f"{top.stop_pct / top.sigma_1d_pct:+.1f}σ̂)")
+        lines.append(f"Target:  ${top.target}  ({top.target_pct:+.1f}% = "
+                     f"{top.target_pct / top.sigma_1d_pct:+.1f}σ̂)")
+        lines.append(f"R/R:     {top.rr_ratio}x")
+        lines.append(f"Size:    ${top.size_usd}  ({top.size_usd / capital * 100:.0f}% "
+                     f"от ${capital:.0f})")
+        lines.append("```")
+        lines.append(f"*Score: {top.score}/100* {stars}")
+        for r in top.reasons:
+            lines.append(f"• {r}")
+        lines.append("")
+        lines.append("⚠️ _Это suggestion, не приказ. Подтверди вход в Bybit вручную._")
+        lines.append("⚠️ _SL — рыночный. Округлено до tick биржи (XRP=0.1, BTC=0.01 и т.д.)._")
+    else:
+        # ── Setup не найден ──
+        lines.append("⚪ *Сегодня чистого setup нет.* Сидим.")
+        lines.append("")
+        if scored:
+            lines.append("Топ-3 по trade-score (всё ниже порога):")
+            for s in scored[:3]:
+                top_reason = s.reasons[0] if s.reasons else "—"
+                lines.append(
+                    f"• *{s.asset}* {s.total}/100 — {top_reason}"
+                )
+            lines.append("")
+        lines.append(
+            "Это нормально — наша модель велит сидеть в ~90% дней. "
+            "Сетап без edge = слив комиссий."
+        )
+        lines.append("")
+        lines.append("Запусти `/markets` чтобы посмотреть полную картину.")
+
+    return "\n".join(lines)
+
+
+@dp.message(Command("signal"))
+async def cmd_signal(message: Message):
+    """Команда `/signal` — детерминированный auto SL/TP recommender.
+
+    Берёт live-prices (тот же источник что `/markets`), скорит каждый
+    актив 0-100 (trend + complexity + VRT + Markov + raw score) и
+    выдаёт ОДИН setup если score ≥ 60, или «сегодня сидим» иначе.
+
+    Опциональный аргумент: `/signal 200` — задать капитал (по умолчанию
+    $123 — текущий баланс пользователя).
+    """
+    user_id = message.from_user.id
+    await upsert_user(user_id, message.from_user.username or "")
+    wait_msg = await message.answer("⏳ Считаю scoring по всем активам...")
+
+    # Парсим опциональный капитал. `/signal 200` → capital=200.
+    text = (message.text or "").strip()
+    parts = text.split()
+    capital = 123.0
+    if len(parts) >= 2:
+        try:
+            capital = max(10.0, float(parts[1].replace(",", ".")))
+        except ValueError:
+            pass
+
+    try:
+        from core.signal_scorer import rank_signals
+        from web_search import fetch_realtime_prices
+
+        prices = await fetch_realtime_prices()
+        if not prices:
+            await bot.edit_message_text(
+                "❌ Не удалось получить цены. Попробуй позже.",
+                chat_id=message.chat.id,
+                message_id=wait_msg.message_id,
+            )
+            return
+
+        result = rank_signals(prices, capital=capital)
+        text = _fmt_signal_message(result)
+        await bot.edit_message_text(
+            text,
+            chat_id=message.chat.id,
+            message_id=wait_msg.message_id,
+            parse_mode="Markdown",
+        )
+    except Exception as e:
+        await bot.edit_message_text(
+            f"❌ Ошибка: {e}",
+            chat_id=message.chat.id,
+            message_id=wait_msg.message_id,
+        )
+
+
 @dp.message(Command("status"))
 async def cmd_status(message: Message):
     await upsert_user(message.from_user.id)
@@ -4429,6 +4554,7 @@ async def cmd_help(message: Message):
         "• `/analyze [текст]` — анализ новости\n"
         "• `/markets` — живой контекст + сигналы, кнопки подписки\n"
         "• `/help markets` — подробный гайд по цифрам в /markets 📊\n"
+        "• `/signal [capital]` — auto SL/TP setup на основе нашего scoring 🎯\n"
         "• `/trackrecord` — история точности (всё)\n"
         "• `/trackrecordglobal` — Global\n"
         "• `/trackrecordrussia` — Россия Edge 🇷🇺\n"
