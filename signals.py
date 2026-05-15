@@ -480,10 +480,12 @@ async def build_markets_panel_message(github_repo: str | None = None) -> tuple[l
         _smart_money_available = False
 
     # Тянем bundle, live-контекст и smart-money параллельно — суммарно ~1-2с.
+    # `for_user=True` — компактный формат для /markets: без дубль-заголовка,
+    # без AI-инструкций, с пустыми строками между активами.
     if _smart_money_available:
         bundle, live_result, smart_money = await asyncio.gather(
             fetch_markets_bundle(github_repo),
-            get_full_realtime_context(),
+            get_full_realtime_context(for_user=True),
             fetch_smart_money_signals(),
             return_exceptions=False,
         )
@@ -495,7 +497,7 @@ async def build_markets_panel_message(github_repo: str | None = None) -> tuple[l
     else:
         bundle, live_result = await asyncio.gather(
             fetch_markets_bundle(github_repo),
-            get_full_realtime_context(),
+            get_full_realtime_context(for_user=True),
             return_exceptions=False,
         )
         sm_block = None
@@ -505,14 +507,15 @@ async def build_markets_panel_message(github_repo: str | None = None) -> tuple[l
     separator = "━━━━━━━━━━━━━━━━━━━━━━━━━"
 
     # ── Сообщение 1: заголовок + живой контекст ───────────────────────────
-    msg_live = "\n".join([
+    msg_live_header = "\n".join([
         f"📊 *РЫНКИ И СИГНАЛЫ* — _{now}_",
         "",
         separator,
         "🌍 *Живой контекст*",
         separator,
-        live_formatted,
+        "",
     ])
+    msg_live = msg_live_header + live_formatted
 
     # ── Сообщение 2: smart-money + сигналы ────────────────────────────────
     extra_parts: list[str] = []
@@ -521,13 +524,79 @@ async def build_markets_panel_message(github_repo: str | None = None) -> tuple[l
     extra_parts.extend([separator, bundle["signals_message"]])
     msg_extra = "\n".join(extra_parts)
 
-    # Telegram cap = 4096; защита на случай если live_formatted распухнет ещё.
+    # Telegram cap = 4096; если live-контекст распух — режем по границе
+    # секций (`[КРИПТОРЫНОК]` / `[МАКРО...]` / `[ФОНДОВЫЕ...]` / `[СЫРЬЁ...]`),
+    # а не в середине актива. Раньше резалось страшным "…часть текста скрыта"
+    # и юзер не видел нефть/индексы целиком — теперь все секции попадают.
     messages: list[str] = []
     for chunk in (msg_live, msg_extra):
-        if len(chunk) > 4000:
-            chunk = chunk[: 4000 - 24] + "\n\n_…часть текста скрыта_"
-        messages.append(chunk)
+        for part in _split_markets_message(chunk, max_len=4000):
+            messages.append(part)
     return messages, bundle
+
+
+def _split_markets_message(text: str, *, max_len: int = 4000) -> list[str]:
+    """Режет /markets-сообщение по границам секций, чтобы не обрезать
+    в середине актива.
+
+    Стратегия:
+      1. Если text ≤ max_len — возвращаем как есть.
+      2. Иначе ищем разделители (`\n\n[`) — это начало новой секции
+         (`[КРИПТОРЫНОК]`, `[МАКРОЭКОНОМИКА США]`, `[ФОНДОВЫЕ ИНДЕКСЫ]`,
+         `[СЫРЬЁ И ВАЛЮТЫ]`). Накапливаем секции в текущий chunk пока
+         он ≤ max_len, иначе flush.
+      3. Если одна секция сама > max_len — режем по asset-границам
+         (`\n  ` — двойной пробел перед label = новый актив).
+      4. Fallback: hard cut по max_len (этого почти не должно случаться).
+    """
+    if len(text) <= max_len:
+        return [text]
+
+    # Шаг 1: разбиваем на секции
+    sections = text.split("\n\n[")
+    # Первая часть не имеет "[" префикса; остальным возвращаем
+    parts: list[str] = [sections[0]] + [f"[{s}" for s in sections[1:]]
+
+    chunks: list[str] = []
+    cur = ""
+    for s in parts:
+        candidate = (cur + "\n\n" + s) if cur else s
+        if len(candidate) <= max_len:
+            cur = candidate
+            continue
+        # cur слишком большой — flush, а текущую секцию пытаемся положить отдельно
+        if cur:
+            chunks.append(cur)
+        if len(s) <= max_len:
+            cur = s
+        else:
+            # Секция сама больше max_len — режем по asset-границам
+            chunks.extend(_split_by_assets(s, max_len=max_len))
+            cur = ""
+    if cur:
+        chunks.append(cur)
+    return chunks
+
+
+def _split_by_assets(section: str, *, max_len: int = 4000) -> list[str]:
+    """Режет секцию (`[КРИПТОРЫНОК]\n  Bitcoin (BTC): ...`) по границам
+    активов. Каждый актив начинается со строки `\n  ` (2 пробела).
+    """
+    lines = section.split("\n")
+    chunks: list[str] = []
+    cur_lines: list[str] = []
+    for line in lines:
+        candidate = "\n".join(cur_lines + [line])
+        if len(candidate) <= max_len:
+            cur_lines.append(line)
+            continue
+        # flush
+        if cur_lines:
+            chunks.append("\n".join(cur_lines))
+        cur_lines = [line]
+    if cur_lines:
+        chunks.append("\n".join(cur_lines))
+    return chunks
 
 
 class SignalsSystem:

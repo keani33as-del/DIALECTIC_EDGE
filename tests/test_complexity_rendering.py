@@ -386,5 +386,96 @@ class TestTriggerLines(unittest.TestCase):
         self.assertNotIn("▼ ниже", out)
 
 
+class TestForUserFormat(unittest.TestCase):
+    """`format_prices_for_agents(..., for_user=True)` — формат для /markets.
+
+    Отличия от агентского формата:
+      • без дубль-заголовка `=== ВЕРИФИЦИРОВАННЫЕ РЫНОЧНЫЕ ДАННЫЕ ===`
+      • без AI-инструкции `⚠️ используй ТОЛЬКО эти цифры` снизу
+      • пустые строки между активами (читаемость для Telegram-юзера)
+      • остальные данные (цены, MA, quant) — идентичны
+    """
+
+    def _prices(self) -> dict:
+        return {
+            "BTC": {
+                "price": 79110.0,
+                "change_24h": -2.64,
+                "change_7d": -1.4,
+                "change_30d": 5.8,
+                "source": "Binance",
+                "trend": "SIDEWAYS",
+                "trend_emoji": "↔️",
+                "ma50": 74968.0,
+                "ma200": 81956.0,
+                "above_ma50": True,
+                "above_ma200": False,
+                "hurst": 0.42,
+                "tradeable_score": 0.49,
+                "complexity_hint": "MEAN_REVERTING",
+                "volume_24h_usd": 1367,
+            },
+            "ETH": {
+                "price": 2223.0,
+                "change_24h": -3.04,
+                "source": "Binance",
+                "trend": "DOWNTREND",
+                "trend_emoji": "📉",
+                "ma50": 2251.0,
+                "ma200": 2620.0,
+                "above_ma50": False,
+                "above_ma200": False,
+                "volume_24h_usd": 658,
+            },
+        }
+
+    def test_agents_format_has_header_and_footer(self):
+        out = format_prices_for_agents(self._prices())
+        self.assertIn("=== ВЕРИФИЦИРОВАННЫЕ РЫНОЧНЫЕ ДАННЫЕ", out)
+        self.assertIn("⚠️ ИНСТРУКЦИЯ: используй ТОЛЬКО эти цифры", out)
+
+    def test_user_format_strips_header(self):
+        out = format_prices_for_agents(self._prices(), for_user=True)
+        self.assertNotIn("=== ВЕРИФИЦИРОВАННЫЕ РЫНОЧНЫЕ ДАННЫЕ", out)
+
+    def test_user_format_strips_ai_instruction(self):
+        out = format_prices_for_agents(self._prices(), for_user=True)
+        self.assertNotIn("⚠️ ИНСТРУКЦИЯ: используй ТОЛЬКО эти цифры", out)
+
+    def test_user_format_has_blank_line_between_assets(self):
+        out = format_prices_for_agents(self._prices(), for_user=True)
+        # После последней строки BTC (Объём 24ч) и перед Ethereum должна
+        # быть пустая строка. Проверяем что есть последовательность:
+        # `Объём 24ч: $1,367M USD\n\n  Ethereum`.
+        self.assertIn("$1,367M USD\n\n  Ethereum", out)
+
+    def test_user_format_keeps_same_data(self):
+        """Пользовательский формат содержит ТЕ ЖЕ данные что и агентский,
+        просто без обёрток."""
+        agents = format_prices_for_agents(self._prices())
+        user = format_prices_for_agents(self._prices(), for_user=True)
+        for needle in (
+            "Bitcoin (BTC): $79,110",
+            "Ethereum (ETH): $2,223",
+            "▲ выше $81,956 (MA200) → LONG",
+            "↔️ ТРЕНД: SIDEWAYS",
+            "📉 ТРЕНД: DOWNTREND",
+        ):
+            self.assertIn(needle, agents)
+            self.assertIn(needle, user)
+
+    def test_user_format_does_not_explode_on_empty_macro(self):
+        """Когда секции пустые (MACRO/SPX/OIL отсутствуют) — нет
+        бесконечных пустых строк, нет ошибок."""
+        out = format_prices_for_agents(self._prices(), for_user=True)
+        # Не должно быть 4+ подряд переводов строки
+        self.assertNotIn("\n\n\n\n", out)
+
+    def test_user_format_no_trailing_blank_lines(self):
+        out = format_prices_for_agents(self._prices(), for_user=True)
+        # Хвост не должен быть пустыми строками
+        self.assertFalse(out.endswith("\n\n"))
+
+
 if __name__ == "__main__":
     unittest.main()

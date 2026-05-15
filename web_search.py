@@ -1092,7 +1092,19 @@ def _trigger_lines(
     ]
 
 
-def format_prices_for_agents(prices: dict) -> str:
+def format_prices_for_agents(prices: dict, *, for_user: bool = False) -> str:
+    """Рендерит prices dict в текст для агентов или пользователя.
+
+    Параметры:
+      for_user=False (default) — формат для Bull/Bear/Synth AI-агентов:
+        ─ заголовок «=== ВЕРИФИЦИРОВАННЫЕ РЫНОЧНЫЕ ДАННЫЕ (timestamp) ===»
+        ─ инструкция «⚠️ используй ТОЛЬКО эти цифры» снизу
+        ─ без пустых строк между активами (компактно для LLM context)
+      for_user=True — формат для команды /markets (Telegram-юзер):
+        ─ без дубль-заголовка (уже есть в обёртке `📊 РЫНКИ И СИГНАЛЫ`)
+        ─ без AI-инструкции снизу
+        ─ пустая строка между активами (для читаемости)
+    """
     if not prices:
         return "Рыночные данные временно недоступны."
 
@@ -1102,7 +1114,9 @@ def format_prices_for_agents(prices: dict) -> str:
     # удивлялся "почему 24ч разные". В подпись добавляем HH:MM, чтобы
     # очевидно было, что окно скользит.
     now_hm = datetime.now().strftime("%H:%M")
-    lines = [f"=== ВЕРИФИЦИРОВАННЫЕ РЫНОЧНЫЕ ДАННЫЕ ({now}) ==="]
+    lines: list[str] = []
+    if not for_user:
+        lines.append(f"=== ВЕРИФИЦИРОВАННЫЕ РЫНОЧНЫЕ ДАННЫЕ ({now}) ===")
 
     lines.append("\n[КРИПТОРЫНОК]")
     for k, label in [("BTC","Bitcoin"),("ETH","Ethereum"),("SOL","Solana"),
@@ -1163,6 +1177,11 @@ def format_prices_for_agents(prices: dict) -> str:
             if vol:
                 lines.append(f"    Объём 24ч: ${vol:,.0f}M USD")
 
+            # Между активами — пустая строка только для пользовательской
+            # ветки (читаемость). У агентов компактный формат.
+            if for_user:
+                lines.append("")
+
     if "MACRO" in prices:
         m   = prices["MACRO"]
         fng = m.get("fng", {})
@@ -1218,6 +1237,8 @@ def format_prices_for_agents(prices: dict) -> str:
                 lines.append(f"    {tl}")
             for q in _quant_lines(p):
                 lines.append(q)
+            if for_user:
+                lines.append("")
 
     lines.append("\n[СЫРЬЁ И ВАЛЮТЫ]")
     for k, label, unit in [("OIL_WTI","Нефть WTI","$/барр"),
@@ -1238,15 +1259,24 @@ def format_prices_for_agents(prices: dict) -> str:
                 lines.append(f"    {tl}")
             for q in _quant_lines(p):
                 lines.append(q)
+            if for_user:
+                lines.append("")
 
-    lines.append("\n⚠️ ИНСТРУКЦИЯ: используй ТОЛЬКО эти цифры. "
-                 "Если актива нет — пиши 'нет данных'.")
+    if not for_user:
+        lines.append("\n⚠️ ИНСТРУКЦИЯ: используй ТОЛЬКО эти цифры. "
+                     "Если актива нет — пиши 'нет данных'.")
+    # Сжимаем хвостовые пустые строки (от for_user=True) — не более одной.
+    while lines and lines[-1] == "":
+        lines.pop()
     return "\n".join(lines)
 
 
-async def get_full_realtime_context() -> tuple[dict, str]:
+async def get_full_realtime_context(*, for_user: bool = False) -> tuple[dict, str]:
+    """Тянет prices + рендерит. `for_user=True` использует читаемый формат
+    для команды /markets (без AI-инструкций / дубль-заголовка, с пустыми
+    строками между активами)."""
     prices    = await fetch_realtime_prices()
-    formatted = format_prices_for_agents(prices)
+    formatted = format_prices_for_agents(prices, for_user=for_user)
     
     try:
         from cot_data import format_cot_for_agents, get_cot_for_assets
