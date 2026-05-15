@@ -19,6 +19,7 @@ import unittest
 from web_search import (
     _compute_complexity_fields,
     _complexity_line,
+    _trigger_lines,
     format_prices_for_agents,
 )
 
@@ -238,6 +239,151 @@ class TestFormatPricesForAgentsRendersComplexity(unittest.TestCase):
         out = format_prices_for_agents(prices)
         self.assertIn("⚠️", out)
         self.assertIn("untradeable", out)
+
+
+class TestTriggerLines(unittest.TestCase):
+    """LONG/SHORT MA-trigger renderer.
+
+    Контракт `_trigger_lines`:
+      • При наличии обеих MA → две строки `▲ выше … → LONG` и
+        `▼ ниже … → SHORT`.
+      • Верхний уровень = max(MA50, MA200), нижний = min(MA50, MA200) —
+        логика идентична `build_short_report` в main.py.
+      • При отсутствии MA → пустой список (graceful degradation для
+        активов с коротким рядом).
+      • Префикс `$` опционален — индексы (SPX/NDX/DXY/VIX) рендерим
+        без него, а сырьё (OIL/GOLD) — с ним.
+    """
+
+    def test_empty_when_no_ma(self):
+        self.assertEqual(_trigger_lines({}), [])
+        self.assertEqual(_trigger_lines({"ma50": 100.0}), [])
+        self.assertEqual(_trigger_lines({"ma200": 200.0}), [])
+
+    def test_upper_picks_max_lower_picks_min(self):
+        # BTC SIDEWAYS: цена между MA50 ($74,969) и MA200 ($81,957) →
+        # верхний триггер должен быть MA200 (выше), нижний MA50 (ниже).
+        lines = _trigger_lines({"ma50": 74969.0, "ma200": 81957.0})
+        self.assertEqual(len(lines), 2)
+        self.assertIn("▲ выше", lines[0])
+        self.assertIn("$81,957", lines[0])
+        self.assertIn("(MA200)", lines[0])
+        self.assertIn("→ LONG", lines[0])
+        self.assertIn("▼ ниже", lines[1])
+        self.assertIn("$74,969", lines[1])
+        self.assertIn("(MA50)", lines[1])
+        self.assertIn("→ SHORT", lines[1])
+
+    def test_uptrend_ma50_above_ma200(self):
+        # SPX UPTREND: MA50 > MA200 → верхний это MA50, нижний — MA200.
+        lines = _trigger_lines({"ma50": 6910.0, "ma200": 6775.0}, prefix="")
+        self.assertEqual(len(lines), 2)
+        self.assertIn("6,910", lines[0])
+        self.assertIn("(MA50)", lines[0])
+        self.assertIn("→ LONG", lines[0])
+        self.assertIn("6,775", lines[1])
+        self.assertIn("(MA200)", lines[1])
+        self.assertIn("→ SHORT", lines[1])
+
+    def test_no_dollar_prefix_when_disabled(self):
+        # SPX/NDX/VIX/DXY — индексы, без $.
+        lines = _trigger_lines({"ma50": 6910.0, "ma200": 6775.0}, prefix="")
+        self.assertNotIn("$", lines[0])
+        self.assertNotIn("$", lines[1])
+
+    def test_dollar_prefix_default(self):
+        lines = _trigger_lines({"ma50": 74969.0, "ma200": 81957.0})
+        self.assertIn("$", lines[0])
+        self.assertIn("$", lines[1])
+
+    def test_xrp_low_price_precision(self):
+        # XRP MA50=$1.30, MA200=$1.65 → раньше `_fmt_money` без adaptive
+        # precision рендерил их как $1 / $2. Здесь проверяем что мы выдаем
+        # `$1.30` / `$1.65` (две цифры после точки сохраняются).
+        lines = _trigger_lines({"ma50": 1.30, "ma200": 1.65})
+        self.assertIn("$1.65", lines[0])
+        self.assertIn("$1.30", lines[1])
+
+    def test_indent_default_is_four_spaces(self):
+        lines = _trigger_lines({"ma50": 100.0, "ma200": 200.0})
+        self.assertTrue(lines[0].startswith("    ▲"))
+        self.assertTrue(lines[1].startswith("    ▼"))
+
+    def test_format_prices_renders_triggers_for_crypto(self):
+        # Smoke-тест: убеждаемся что в полном выводе live-контекста
+        # для крипты появляются обе MA-trigger строки.
+        prices = {
+            "BTC": {
+                "price": 79199.0,
+                "change_24h": -2.8,
+                "source": "Binance",
+                "trend": "SIDEWAYS",
+                "trend_emoji": "↔️",
+                "ma50": 74969.0,
+                "ma200": 81957.0,
+                "above_ma50": True,
+                "above_ma200": False,
+            }
+        }
+        out = format_prices_for_agents(prices)
+        # Две строки триггеров — обе должны быть в выводе.
+        self.assertIn("▲ выше $81,957 (MA200) → LONG", out)
+        self.assertIn("▼ ниже $74,969 (MA50) → SHORT", out)
+        # И они должны идти ДО строки тренда (визуально первыми).
+        idx_long = out.index("▲ выше")
+        idx_trend = out.index("ТРЕНД:")
+        self.assertLess(idx_long, idx_trend)
+
+    def test_format_prices_renders_triggers_for_macro(self):
+        prices = {
+            "SPX": {
+                "price": 7501.0,
+                "change_24h": 0.3,
+                "source": "Yahoo",
+                "trend": "UPTREND",
+                "trend_emoji": "📈",
+                "ma50": 6910.0,
+                "ma200": 6775.0,
+                "above_ma50": True,
+                "above_ma200": True,
+            }
+        }
+        out = format_prices_for_agents(prices)
+        # SPX без $-префикса.
+        self.assertIn("▲ выше 6,910 (MA50) → LONG", out)
+        self.assertIn("▼ ниже 6,775 (MA200) → SHORT", out)
+
+    def test_format_prices_renders_triggers_for_commodity(self):
+        prices = {
+            "OIL_WTI": {
+                "price": 103.0,
+                "change_24h": 1.5,
+                "source": "Yahoo",
+                "trend": "UPTREND",
+                "trend_emoji": "📈",
+                "ma50": 97.22,
+                "ma200": 70.63,
+                "above_ma50": True,
+                "above_ma200": True,
+            }
+        }
+        out = format_prices_for_agents(prices)
+        # WTI рендерится с $-префиксом.
+        self.assertIn("▲ выше $97.22 (MA50) → LONG", out)
+        self.assertIn("▼ ниже $70.63 (MA200) → SHORT", out)
+
+    def test_format_prices_skips_triggers_when_ma_missing(self):
+        prices = {
+            "ETH": {
+                "price": 4000.0,
+                "change_24h": -0.3,
+                "source": "Binance",
+                # ma50/ma200 отсутствуют — нет триггеров
+            }
+        }
+        out = format_prices_for_agents(prices)
+        self.assertNotIn("▲ выше", out)
+        self.assertNotIn("▼ ниже", out)
 
 
 if __name__ == "__main__":
