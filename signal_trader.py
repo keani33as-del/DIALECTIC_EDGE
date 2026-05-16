@@ -10,19 +10,26 @@ import asyncio
 import json
 import logging
 import os
-from datetime import datetime, timedelta
+import time
+from datetime import datetime, timedelta, timezone
 
 from config import (
     AUTOTRADE_CONTEXT_MAX_AGE_HOURS,
+    AUTOTRADE_CONTRARIAN_RSI_OVERBOUGHT,
+    AUTOTRADE_CONTRARIAN_RSI_OVERSOLD,
     AUTOTRADE_ENTRY_TOLERANCE_PCT,
     AUTOTRADE_FOLLOW_SIGNALS_WHEN_NEUTRAL,
     AUTOTRADE_INTERVAL_SEC,
+    AUTOTRADE_MIN_HOLD_MINUTES,
     AUTOTRADE_NEUTRAL_MIN_BIAS_SCORE,
     AUTOTRADE_NEUTRAL_SL_PCT,
     AUTOTRADE_NEUTRAL_TP_PCT,
     AUTOTRADE_OPEN_SCORE_THRESHOLD,
     AUTOTRADE_RECENT_CONTEXT_LIMIT,
+    AUTOTRADE_REENTRY_COOLDOWN_MIN,
+    AUTOTRADE_REVERSAL_PROFIT_GUARD_PCT,
     AUTOTRADE_REVERSAL_SCORE_THRESHOLD,
+    AUTOTRADE_REVERSAL_STRENGTH_DELTA,
     AUTOTRADE_SIGNAL_BIAS_CACHE_SEC,
     DATA_SOURCE_BINANCE_SIGNALS,
     FEATURE_AUTOTRADE,
@@ -133,6 +140,68 @@ _econ_calendar = EconomicCalendar()
 _signal_cache: dict = {}
 _signal_cache_time: datetime | None = None
 _signal_cache_meta: tuple[str, bool] | None = None
+
+# Anti-whiplash: после закрытия позиции по «развороту сигнала» блокируем
+# повторный вход в этот же символ на AUTOTRADE_REENTRY_COOLDOWN_MIN минут.
+# Иначе следующий цикл (через 60 сек) видит ровно тот же signal_bias и
+# заходит в ту же сторону → -комиссия → выходит → и т. д. См. PR
+# autotrade-whiplash-fix.
+_reentry_cooldowns: dict[str, float] = {}
+
+
+def _reentry_blocked(symbol: str, now_ts: float | None = None) -> bool:
+    """True, если для symbol ещё активен cooldown после reversal-close."""
+    cooldown_sec = max(0, int(AUTOTRADE_REENTRY_COOLDOWN_MIN)) * 60
+    if cooldown_sec <= 0:
+        return False
+    deadline = _reentry_cooldowns.get(symbol)
+    if deadline is None:
+        return False
+    if now_ts is None:
+        now_ts = time.time()
+    if now_ts >= deadline:
+        # Истёк — чистим, чтобы dict не пух.
+        _reentry_cooldowns.pop(symbol, None)
+        return False
+    return True
+
+
+def _arm_reentry_cooldown(symbol: str, now_ts: float | None = None) -> None:
+    """Включаем cooldown на повторный вход в symbol."""
+    cooldown_sec = max(0, int(AUTOTRADE_REENTRY_COOLDOWN_MIN)) * 60
+    if cooldown_sec <= 0:
+        return
+    if now_ts is None:
+        now_ts = time.time()
+    _reentry_cooldowns[symbol] = now_ts + cooldown_sec
+
+
+def _position_age_minutes(position: dict, meta: dict | None = None) -> float | None:
+    """Возраст позиции в минутах. None если непонятно (нет created_at и
+    нет entry_ts в meta) — звено выше должно решить, как с этим жить.
+
+    Источники, по приоритету:
+      1. meta['entry_ts'] (unix-секунды; пишется при открытии новых позиций)
+      2. position['created_at'] из SQLite — "YYYY-MM-DD HH:MM:SS" в UTC
+    """
+    if meta is None:
+        meta = _parse_trade_meta(position) if isinstance(position, dict) else {}
+    try:
+        entry_ts = float(meta.get("entry_ts") or 0.0)
+    except (TypeError, ValueError):
+        entry_ts = 0.0
+    if entry_ts > 0:
+        return max(0.0, (time.time() - entry_ts) / 60.0)
+
+    created_at_raw = (position.get("created_at") or "").strip()
+    if not created_at_raw:
+        return None
+    try:
+        dt = datetime.strptime(created_at_raw, "%Y-%m-%d %H:%M:%S")
+        dt = dt.replace(tzinfo=timezone.utc)
+        return max(0.0, (datetime.now(timezone.utc) - dt).total_seconds() / 60.0)
+    except (ValueError, TypeError):
+        return None
 
 
 def _direction_to_int(direction: str) -> int:
@@ -605,6 +674,11 @@ def _append_signal_follow_candidates(
     for symbol in sorted(CRYPTO_SIGNAL_SYMBOLS):
         if symbol in existing:
             continue
+        # Anti-whiplash: только что закрылись по развороту — не лезем обратно
+        # на том же сигнале. Логируем, чтобы был след в /autotrade_status.
+        if _reentry_blocked(symbol):
+            logger.info(f"⏭ {symbol}: re-entry cooldown active — skipping signal-follow")
+            continue
         b = signal_bias.get(symbol) or {}
         direction = (b.get("direction") or "NEUTRAL").upper()
         score = float(b.get("score") or 0.0)
@@ -614,8 +688,27 @@ def _append_signal_follow_candidates(
         if price <= 0:
             continue
 
+        # RSI-фильтр для контр-трендовых входов: «buy the dip» имеет смысл
+        # только когда актив реально перепродан, а не просто signal_bias
+        # развернулся. Без этого мы хватали падающие ножи в downtrend.
+        # RSI берём из _signal_cache (его наполняет fetch_current_prices через
+        # RegimeDetector). Если RSI неизвестен — пропускаем, чтобы не открывать
+        # вслепую.
+        sym_cache = _signal_cache.get(symbol, {})
+        rsi_val = sym_cache.get("rsi")
+        try:
+            rsi_val = float(rsi_val) if rsi_val is not None else None
+        except (TypeError, ValueError):
+            rsi_val = None
+
         if direction == "SHORT":
-            # Price falling — BUY the dip
+            # Price falling — BUY the dip только если перепродано.
+            if rsi_val is None or rsi_val > AUTOTRADE_CONTRARIAN_RSI_OVERSOLD:
+                logger.debug(
+                    f"⏭ {symbol}: SHORT bias, но RSI={rsi_val} > "
+                    f"{AUTOTRADE_CONTRARIAN_RSI_OVERSOLD} — не падающий нож"
+                )
+                continue
             trade_dir = "BUY"
             tp = AUTOTRADE_NEUTRAL_TP_PCT
             sl = AUTOTRADE_NEUTRAL_SL_PCT
@@ -623,9 +716,16 @@ def _append_signal_follow_candidates(
             target = price * (1 + tp)
             stop = price * (1 - sl)
         else:
-            # Price rising — SELL if we hold it
+            # Price rising — SELL только если уже держим. И только при
+            # перекупленности — иначе ловим вершину в healthy uptrend.
             if symbol not in held_symbols:
                 logger.debug(f"LONG signal for {symbol} but not held — skipping")
+                continue
+            if rsi_val is None or rsi_val < AUTOTRADE_CONTRARIAN_RSI_OVERBOUGHT:
+                logger.debug(
+                    f"⏭ {symbol}: LONG bias, но RSI={rsi_val} < "
+                    f"{AUTOTRADE_CONTRARIAN_RSI_OVERBOUGHT} — не перекуплено"
+                )
                 continue
             trade_dir = "SELL"
             tp = AUTOTRADE_NEUTRAL_TP_PCT
@@ -649,6 +749,10 @@ def _append_signal_follow_candidates(
             "latest_created_at": "",
             "news_summary": "",
             "signal_follow_only": True,
+            # Сохраняем снимок биаса в момент входа — закрытие по reversal
+            # потом сравнит с ним «усилился ли сигнал».
+            "entry_signal_direction": direction,
+            "entry_signal_score": round(abs(score), 2),
         })
     out = dict(consensus)
     out["candidates"] = list(consensus.get("candidates", [])) + add
@@ -1175,32 +1279,79 @@ async def _close_on_signal_reversal(position: dict, prices: dict, signal_bias: d
     """
     Close position if market signal reversed against our direction.
     E.g., we bought (BUY), but now signal shows SHORT (price falling) — close and cut loss.
+
+    Anti-whiplash guards (см. PR autotrade-whiplash-fix):
+      1. min hold time — позиция должна прожить ≥ AUTOTRADE_MIN_HOLD_MINUTES;
+         иначе мы выходим на том же сигнале, по которому только что зашли.
+      2. signal strength delta — текущий |score| должен превысить тот, что
+         был при входе, минимум на AUTOTRADE_REVERSAL_STRENGTH_DELTA. Иначе
+         «разворот» — это та же noise-волна.
+      3. profit guard — если позиция уже в нормальном плюсе
+         (≥ AUTOTRADE_REVERSAL_PROFIT_GUARD_PCT %), не закрываем по reversal
+         и отдаём trailing-стопу из _close_position_if_needed.
     """
     symbol = position["symbol"]
     if symbol not in CRYPTO_SIGNAL_SYMBOLS:
         return None
-    
+
     current_price = float(prices.get(symbol) or 0.0)
     if current_price <= 0:
         return None
-    
+
     meta = _parse_trade_meta(position)
     direction = (position.get("direction") or "").upper()
     signal_direction = (signal_bias.get(symbol, {}).get("direction") or "NEUTRAL").upper()
-    
+
     reversal_threshold = REVERSAL_SCORE_THRESHOLD
     signal = signal_bias.get(symbol, {})
     signal_score = abs(float(signal.get("score") or 0.0))
-    
-    reason = ""
-    
-    if direction == "BUY" and signal_direction == "SHORT" and signal_score >= reversal_threshold:
-        reason = f"Signal reversal: {signal_direction} (score={signal_score:.1f})"
-    elif direction == "SELL" and signal_direction == "LONG" and signal_score >= reversal_threshold:
-        reason = f"Signal reversal: {signal_direction} (score={signal_score:.1f})"
-    
-    if not reason:
+
+    # Базовое условие разворота — против нас и выше абсолютного порога.
+    is_reversal = (
+        (direction == "BUY" and signal_direction == "SHORT" and signal_score >= reversal_threshold)
+        or (direction == "SELL" and signal_direction == "LONG" and signal_score >= reversal_threshold)
+    )
+    if not is_reversal:
         return None
+
+    # Guard 1: min hold time. Если позиция новее — это та же истерика,
+    # которая нас сюда привела.
+    age_min = _position_age_minutes(position, meta)
+    if age_min is not None and age_min < AUTOTRADE_MIN_HOLD_MINUTES:
+        logger.info(
+            f"⏸ {symbol} {direction}: reversal signal_score={signal_score:.1f}, "
+            f"но возраст {age_min:.1f}мин < min_hold={AUTOTRADE_MIN_HOLD_MINUTES} — держим"
+        )
+        return None
+
+    # Guard 2: signal strength delta. Сравниваем текущий |score| с
+    # сохранённым в момент входа. Если сигнал не усилился — это шум.
+    try:
+        entry_signal_score = abs(float(meta.get("entry_signal_score") or 0.0))
+    except (TypeError, ValueError):
+        entry_signal_score = 0.0
+    if entry_signal_score > 0 and signal_score < entry_signal_score + AUTOTRADE_REVERSAL_STRENGTH_DELTA:
+        logger.info(
+            f"⏸ {symbol} {direction}: reversal signal_score={signal_score:.1f} "
+            f"vs entry={entry_signal_score:.1f} (delta < {AUTOTRADE_REVERSAL_STRENGTH_DELTA}) — держим"
+        )
+        return None
+
+    # Guard 3: profit guard. Уже в плюсе — отдаём trailing-стопу.
+    entry_price_chk = float(position.get("entry_price") or 0.0)
+    if entry_price_chk > 0:
+        if direction == "BUY":
+            unrealized_pct = (current_price - entry_price_chk) / entry_price_chk * 100.0
+        else:
+            unrealized_pct = (entry_price_chk - current_price) / entry_price_chk * 100.0
+        if unrealized_pct >= AUTOTRADE_REVERSAL_PROFIT_GUARD_PCT:
+            logger.info(
+                f"⏸ {symbol} {direction}: reversal, но позиция в плюсе "
+                f"{unrealized_pct:+.2f}% ≥ {AUTOTRADE_REVERSAL_PROFIT_GUARD_PCT}% — отдаём trailing-стопу"
+            )
+            return None
+
+    reason = f"Signal reversal: {signal_direction} (score={signal_score:.1f})"
     
     signal_id = position.get("id", -1)
     entry_price_rev = float(position.get("entry_price") or 0.0)
@@ -1249,6 +1400,10 @@ async def _close_on_signal_reversal(position: dict, prices: dict, signal_bias: d
         await _export_backtest_snapshot()
     except Exception as _e:
         logger.warning("export after reversal close error: %s", _e)
+
+    # Армим cooldown — следующий цикл не должен открыть тот же символ
+    # обратно на том же сигнале.
+    _arm_reentry_cooldown(symbol)
 
     return {
         "event": "closed",
@@ -1769,6 +1924,18 @@ async def _check_and_trade_locked(bot, admin_ids: list[int]) -> list[dict]:
         partial_tp_price = entry * 1.02
         trailing_pct = 1.5  # Activate trailing stop at +3% profit
         
+        # Снимок сигнала на момент входа: пригодится в _close_on_signal_reversal
+        # для guard «усилился ли сигнал». Для signal-follow кандидатов берём
+        # сохранённый при добавлении биас; для остальных — текущий signal_direction.
+        entry_signal_dir_meta = candidate.get(
+            "entry_signal_direction",
+            candidate.get("signal_direction", "NEUTRAL"),
+        )
+        try:
+            entry_signal_score_meta = abs(float(candidate.get("entry_signal_score") or 0.0))
+        except (TypeError, ValueError):
+            entry_signal_score_meta = 0.0
+
         trade_meta = json.dumps({
             "target": final_target,
             "stop": final_stop,
@@ -1786,6 +1953,9 @@ async def _check_and_trade_locked(bot, admin_ids: list[int]) -> list[dict]:
             "risk_pct": risk_calc.get("risk_pct", 0),
             "whale_sentiment": whale_sent,
             "defense_mode": defense_active,
+            "entry_ts": time.time(),
+            "entry_signal_direction": entry_signal_dir_meta,
+            "entry_signal_score": round(entry_signal_score_meta, 2),
         }, ensure_ascii=False)
 
         # Safety: убедимся, что размер позиции осмысленный (> 0). Логируем и пропускаем иначе.

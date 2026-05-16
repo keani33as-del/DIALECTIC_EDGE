@@ -128,8 +128,26 @@ AUTOTRADE_SIGNAL_BIAS_CACHE_SEC = int(os.getenv("AUTOTRADE_SIGNAL_BIAS_CACHE_SEC
 AUTOTRADE_FOLLOW_SIGNALS_WHEN_NEUTRAL = os.getenv("AUTOTRADE_FOLLOW_SIGNALS_WHEN_NEUTRAL", "1").strip().lower() in (
     "1", "true", "yes", "on",
 )
-AUTOTRADE_NEUTRAL_MIN_BIAS_SCORE = float(os.getenv("AUTOTRADE_NEUTRAL_MIN_BIAS_SCORE", "8"))
+AUTOTRADE_NEUTRAL_MIN_BIAS_SCORE = float(os.getenv("AUTOTRADE_NEUTRAL_MIN_BIAS_SCORE", "14"))
 AUTOTRADE_NEUTRAL_TP_PCT = float(os.getenv("AUTOTRADE_NEUTRAL_TP_PCT", "0.04"))
 AUTOTRADE_NEUTRAL_SL_PCT = float(os.getenv("AUTOTRADE_NEUTRAL_SL_PCT", "0.02"))
+# Anti-whiplash: позиция должна прожить минимум столько минут, чтобы её
+# можно было закрыть по «развороту сигнала». Меньше — это шум: вход и выход
+# на одном и том же signal_bias за один цикл (60 сек).
+AUTOTRADE_MIN_HOLD_MINUTES = int(os.getenv("AUTOTRADE_MIN_HOLD_MINUTES", "15"))
+# Чтобы закрыть на развороте, текущий |score| сигнала должен превысить
+# сохранённый при входе |score| хотя бы на эту дельту. Иначе «разворот» —
+# это та же самая истерика, что нас сюда привела.
+AUTOTRADE_REVERSAL_STRENGTH_DELTA = float(os.getenv("AUTOTRADE_REVERSAL_STRENGTH_DELTA", "6.0"))
+# Если позиция уже в плюсе хотя бы на эти % — не закрываем по reversal,
+# отдаём на откуп trailing-стопу из _close_position_if_needed.
+AUTOTRADE_REVERSAL_PROFIT_GUARD_PCT = float(os.getenv("AUTOTRADE_REVERSAL_PROFIT_GUARD_PCT", "1.5"))
+# Cooldown на повторный вход в тот же символ после reversal-close (мин).
+AUTOTRADE_REENTRY_COOLDOWN_MIN = int(os.getenv("AUTOTRADE_REENTRY_COOLDOWN_MIN", "30"))
+# Контр-трендовый buy-the-dip: открываем BUY только если RSI ≤ этого
+# порога (oversold). SELL-the-rip — только если RSI ≥ (100 - порог).
+# Без этого ловим «падающие ножи» в сильных нисходящих трендах.
+AUTOTRADE_CONTRARIAN_RSI_OVERSOLD = float(os.getenv("AUTOTRADE_CONTRARIAN_RSI_OVERSOLD", "35"))
+AUTOTRADE_CONTRARIAN_RSI_OVERBOUGHT = float(os.getenv("AUTOTRADE_CONTRARIAN_RSI_OVERBOUGHT", "65"))
 # Ограничить размер JSON-снимка контекста модели в БД (символов)
 DIGEST_SNAPSHOT_MAX_CHARS = int(os.getenv("DIGEST_SNAPSHOT_MAX_CHARS", "12000"))
