@@ -20,6 +20,7 @@ except ImportError:
     pass
 
 from aiogram import Bot, Dispatcher, F
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.types import (
     Message, CallbackQuery, BufferedInputFile,
@@ -4493,7 +4494,7 @@ def _markets_help_text() -> str:
         "Режимы:\n"
         "• 📈 *TRENDING* — H > 0.55, ходить по тренду\n"
         "• 🔄 *MEAN-REVERTING* — H < 0.45, играть откаты\n"
-        "• 🎲 *RANDOM_WALK* — H ≈ 0.5, не торговать направленно\n"
+        "• 🎲 *RANDOM-WALK* — H ≈ 0.5, не торговать направленно\n"
         "• ⚡ *CHAOTIC* — низкая энтропия, шум, не торговать\n\n"
         "Метрики (все опциональны — отсутствуют на коротких рядах):\n"
         "• *H (Hurst)* — степень тренда vs возврат, 0–1. "
@@ -4520,13 +4521,26 @@ def _markets_help_text() -> str:
         "━━━━━━━━━━━━━━━━━━━\n"
         "*Как читать всё вместе:*\n"
         "1️⃣ Совпадает ли *тренд* с *режимом*? UPTREND + TRENDING = силён. "
-        "UPTREND + MEAN_REVERTING = жди отката\n"
+        "UPTREND + MEAN-REVERTING = жди отката\n"
         "2️⃣ *score > 0.6* + VRT *H0 отвергнут* + *Markov не FLAT* = "
         "чистый сигнал\n"
         "3️⃣ *σ̂* задаёт размер стопа: SL ≈ -1.5×σ̂, TP ≈ +3×σ̂\n"
         "4️⃣ Если *score < 0.3* — *не торгуй*. Это указание, не подсказка\n\n"
         "Связанные команды: /daily /help /pitch"
     )
+
+
+async def _answer_md_safe(message: Message, text: str) -> None:
+    """Отдаёт Markdown-сообщение, но если Telegram парсер ругнётся
+    («can't parse entities» из-за непарных `*`/`_`/``` ` ```) — шлёт
+    plain-text, чтобы юзер всё равно увидел текст а не молчание бота.
+
+    Без этой обёртки баг в одном символе → команда «не работает».
+    """
+    try:
+        await message.answer(text, parse_mode="Markdown")
+    except TelegramBadRequest:
+        await message.answer(text)
 
 
 @dp.message(Command("help"))
@@ -4538,7 +4552,7 @@ async def cmd_help(message: Message):
     parts = text.split(maxsplit=1)
     sub = parts[1].strip().lower() if len(parts) > 1 else ""
     if sub in ("markets", "/markets", "market", "маркет", "маркетс"):
-        await message.answer(_markets_help_text(), parse_mode="Markdown")
+        await _answer_md_safe(message, _markets_help_text())
         return
     await message.answer(
         "📖 *Dialectic Edge v7.1*\n\n"
