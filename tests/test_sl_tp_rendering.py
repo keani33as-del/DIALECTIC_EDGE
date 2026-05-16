@@ -14,13 +14,37 @@
 Эти тесты — фундамент: они описывают «что должен видеть юзер в
 `/markets` при наличии σ̂». Любая регрессия формата или формулы их
 сломает до проверки на пользователе.
+
+Замечание: справку из `main.py` мы достаём через AST (как
+`tests/test_help_markets_markdown.py`), не `import main` — CI не ставит
+aiogram / matplotlib / FinBERT.
 """
 
 from __future__ import annotations
 
+import ast
+import os
 import unittest
 
 from web_search import _fmt_pct, _sl_tp_lines, format_prices_for_agents
+
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _extract_markets_help_text() -> str:
+    """Достаёт значение `return` из `_markets_help_text()` без import main.py.
+    Идентичный приём — см. `tests/test_help_markets_markdown.py`."""
+    src_path = os.path.join(REPO_ROOT, "main.py")
+    with open(src_path, encoding="utf-8") as f:
+        src = f.read()
+    tree = ast.parse(src)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "_markets_help_text":
+            for stmt in node.body:
+                if isinstance(stmt, ast.Return) and stmt.value is not None:
+                    return ast.literal_eval(stmt.value)
+    raise AssertionError("_markets_help_text() not found in main.py")
 
 
 class TestFmtPct(unittest.TestCase):
@@ -217,18 +241,19 @@ class TestHelpDocumentsSlTp(unittest.TestCase):
     """`/help markets` теперь упоминает SL/TP блок — без шпаргалки юзер
     смотрит на новые цифры и не понимает что это."""
 
-    def test_help_mentions_sl_tp_section(self):
-        from main import _markets_help_text
+    @classmethod
+    def setUpClass(cls):
+        cls.text = _extract_markets_help_text()
 
-        text = _markets_help_text()
+    def test_help_mentions_sl_tp_section(self):
         # Заголовок секции по новой нумерации.
-        self.assertIn("SL / TP от текущей цены", text)
+        self.assertIn("SL / TP от текущей цены", self.text)
         # Формула, чтобы юзер мог считать сам.
-        self.assertIn("1.5", text)
-        self.assertIn("σ̂", text)
-        self.assertIn("R/R", text)
+        self.assertIn("1.5", self.text)
+        self.assertIn("σ̂", self.text)
+        self.assertIn("R/R", self.text)
         # Telegram-лимит 4096 символов — справка должна укладываться.
-        self.assertLessEqual(len(text), 4096)
+        self.assertLessEqual(len(self.text), 4096)
 
 
 if __name__ == "__main__":
