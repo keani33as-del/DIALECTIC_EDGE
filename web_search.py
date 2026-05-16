@@ -1049,6 +1049,84 @@ def _quant_lines(p: dict, indent: str = "    ") -> list[str]:
     return out
 
 
+def _fmt_pct(v: float) -> str:
+    """`+5.0%` / `−2.5%` — минус юникодный (U+2212), как в `signal_trader._fmt_pct`."""
+    s = f"{v:+.1f}%"
+    return s.replace("-", "−")
+
+
+def _sl_tp_lines(
+    p: dict,
+    asset: str,
+    indent: str = "    ",
+    prefix: str = "$",
+) -> list[str]:
+    """Две строки SL/TP — для LONG и для SHORT — от текущей цены, по σ̂.
+
+    Формат::
+
+        🎯 LONG  TP $82,512 (+4.9%)  SL $77,160 (−2.5%)  R/R 2:1
+        🎯 SHORT TP $75,200 (−4.9%)  SL $81,076 (+2.5%)  R/R 2:1
+
+    Идея: пользователь в `/markets` сразу видит конкретные уровни SL/TP
+    для входа в обе стороны — если он хочет войти сейчас или если по
+    нашему анализу будет пробой в любую сторону. Без этой строки юзеру
+    приходилось вручную считать `entry × (1 ± k·σ̂)` от глаза.
+
+    Формула 1:1 совпадает с `core.signal_scorer.make_setup`:
+      LONG:  SL = price·(1 − 1.5σ̂),  TP = price·(1 + 3σ̂)
+      SHORT: SL = price·(1 + 1.5σ̂),  TP = price·(1 − 3σ̂)
+      R/R = 2.0x всегда (TP_dist = 2·SL_dist).
+
+    Округляем до tick'а биржи через `ASSET_TICK_SIZE`, иначе при копи-
+    пасте в Bybit-Spot брокер отвергает ордер из-за лишних знаков (мы
+    уже наступали на XRP — 1 знак после точки).
+
+    Возвращает [] если:
+      • `vol_sigma_1d_pct` отсутствует (короткий ряд / упавший фетчер);
+      • цена ≤ 0 (плохие данные);
+      • `core.signal_scorer` недоступен (graceful-degradation).
+    """
+    try:
+        from core.signal_scorer import (
+            ASSET_TICK_SIZE,
+            SL_SIGMA_MULT,
+            TP_SIGMA_MULT,
+            _round_to_tick,
+        )
+    except ImportError:
+        return []
+
+    sigma_pct = p.get("vol_sigma_1d_pct")
+    price = p.get("price")
+    if not isinstance(sigma_pct, (int, float)) or sigma_pct <= 0:
+        return []
+    if not isinstance(price, (int, float)) or price <= 0:
+        return []
+
+    sigma_frac = float(sigma_pct) / 100.0
+    sl_pct = SL_SIGMA_MULT * sigma_frac
+    tp_pct = TP_SIGMA_MULT * sigma_frac
+
+    tick = ASSET_TICK_SIZE.get(asset, 0.0001)
+    price_f = float(price)
+
+    long_tp = _round_to_tick(price_f * (1.0 + tp_pct), tick)
+    long_sl = _round_to_tick(price_f * (1.0 - sl_pct), tick)
+    short_tp = _round_to_tick(price_f * (1.0 - tp_pct), tick)
+    short_sl = _round_to_tick(price_f * (1.0 + sl_pct), tick)
+
+    long_line = (
+        f"{indent}🎯 LONG  TP {_fmt_money(long_tp, prefix=prefix)} ({_fmt_pct(tp_pct * 100)})  "
+        f"SL {_fmt_money(long_sl, prefix=prefix)} ({_fmt_pct(-sl_pct * 100)})  R/R 2:1"
+    )
+    short_line = (
+        f"{indent}🎯 SHORT TP {_fmt_money(short_tp, prefix=prefix)} ({_fmt_pct(-tp_pct * 100)})  "
+        f"SL {_fmt_money(short_sl, prefix=prefix)} ({_fmt_pct(sl_pct * 100)})  R/R 2:1"
+    )
+    return [long_line, short_line]
+
+
 def _trigger_lines(
     p: dict,
     indent: str = "    ",
@@ -1150,6 +1228,13 @@ def format_prices_for_agents(prices: dict, *, for_user: bool = False) -> str:
             # $Y → SHORT») к цене, не дожидаясь дайджеста. Совпадает с
             # форматом, который генерит Synth-агент в `plans[].trigger`.
             for t in _trigger_lines(p):
+                lines.append(t)
+
+            # SL/TP-уровни от текущей цены для LONG и SHORT — чтобы юзер
+            # сразу видел, куда ставить стоп и тейк, без ручного счёта
+            # `price × (1 ± k·σ̂)`. Появляется только если σ̂ посчиталась
+            # (вместе со строкой `🔄 ... σ̂=...%`).
+            for t in _sl_tp_lines(p, asset=k):
                 lines.append(t)
 
             # Тренд и MA — адаптивная точность через _fmt_money:
