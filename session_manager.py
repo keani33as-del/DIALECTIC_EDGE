@@ -8,6 +8,7 @@ session_manager.py — Управление торговыми сессиями.
 
 import json
 import logging
+import os
 import re
 from datetime import datetime
 from typing import Optional
@@ -21,7 +22,11 @@ from config import (
 logger = logging.getLogger(__name__)
 
 SESSION_MIN_CAPITAL = 10.0  # Ниже этого — сессия закрывается
-SESSION_START_CAPITAL = 100.0
+# Дефолтный стартовый капитал бумажной сессии. Раньше было 100 — за
+# 1.5 месяца whiplash-вход/выход съел его до $52. Меняем дефолт; новые
+# сессии и hard_reset() стартуют с этой суммы (можно перебить через
+# AUTOTRADE_START_CAPITAL).
+SESSION_START_CAPITAL = float(os.getenv("AUTOTRADE_START_CAPITAL", "500.0"))
 MAX_SESSIONS_IN_FILE = 20  # Храним последние 20 сессий
 
 # Адаптивные параметры по умолчанию

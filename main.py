@@ -5127,8 +5127,10 @@ async def cmd_backtest_capital(message: Message):
 @dp.message(Command("backtest_clear"))
 async def cmd_backtest_clear(message: Message):
     """Clear backtest signals and reset capital."""
-    await clear_backtest_signals(reset_capital=100.0)
-    await message.answer("🗑 Бэктест очищен, капитал сброшен до $100")
+    from session_manager import SESSION_START_CAPITAL as _SSC
+
+    await clear_backtest_signals(reset_capital=_SSC)
+    await message.answer(f"🗑 Бэктест очищен, капитал сброшен до ${_SSC:,.0f}")
 
 
 @dp.message(Command("autotrade_reset"))
@@ -5139,19 +5141,23 @@ async def cmd_autotrade_reset(message: Message):
     автотрейда тут же подтягивает старый капитал из BACKTEST.md и продолжает
     топтаться на $51. Эта команда синхронно сбрасывает все три источника.
     """
+    from session_manager import session_manager as _sm, SESSION_START_CAPITAL as _SSC
+
     parts = message.text.split()
-    new_capital = 100.0
+    new_capital = _SSC
     if len(parts) >= 2:
         try:
             new_capital = float(parts[1].replace(",", ""))
             if new_capital <= 0:
-                await message.answer("Сумма должна быть больше 0. Пример: /autotrade_reset 100")
+                await message.answer(
+                    f"Сумма должна быть больше 0. Пример: /autotrade_reset {_SSC:.0f}"
+                )
                 return
         except ValueError:
-            await message.answer("Неверная сумма. Пример: /autotrade_reset 100")
+            await message.answer(
+                f"Неверная сумма. Пример: /autotrade_reset {_SSC:.0f}"
+            )
             return
-
-    from session_manager import session_manager as _sm
 
     # 1. Чистим SQLite-сигналы и капитал
     await clear_backtest_signals(reset_capital=new_capital)

@@ -859,7 +859,7 @@ async def set_backtest_enabled(enabled: bool) -> dict:
     return await get_backtest_config()
 
 
-async def clear_backtest_signals(reset_capital: float = 100.0) -> None:
+async def clear_backtest_signals(reset_capital: float = 500.0) -> None:
     """Wipe all backtest signals and reset capital — used by /backtest_clear."""
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("DELETE FROM backtest_signals")
