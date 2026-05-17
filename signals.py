@@ -729,6 +729,194 @@ async def fetch_markets_bundle(github_repo: str | None = None) -> dict:
     }
 
 
+# ─── Минималистичный /markets с выбором секции ────────────────────────────────
+# Раньше /markets возвращал ~5к символов мульти-сообщения (живой контекст +
+# smart-money + сигналы). Юзер: «нажимаю по 5 раз и листать неудобно». Идея:
+# первый экран /markets теперь — короткая сводка (крипта + сигналы), а
+# дальше — кнопки выбора секции (Крипта / Макро / Индексы / Сырьё / COT /
+# ETF / Сигналы / Всё). Реализация переиспользует уже отлажённые функции из
+# `web_search` (per-section minimal renderer) и `signals.fetch_markets_bundle`
+# (binance + verdict + signals_message).
+
+MARKETS_SECTIONS: tuple[str, ...] = (
+    "summary",  # default: крипта (minimal) + сигналы
+    "crypto",
+    "macro",
+    "indices",
+    "commod",
+    "cot",
+    "etf",
+    "signals",
+    "all",
+)
+
+
+def _markets_header(section: str) -> str:
+    titles = {
+        "summary": "📊 *Рынки — сводка*",
+        "crypto": "💲 *Рынки — крипта*",
+        "macro": "🌐 *Рынки — макро*",
+        "indices": "📈 *Рынки — индексы*",
+        "commod": "⛽ *Рынки — сырьё*",
+        "cot": "📊 *Рынки — COT*",
+        "etf": "💼 *Рынки — ETF потоки*",
+        "signals": "📡 *Рынки — сигналы*",
+        "all": "🏛 *Рынки — всё*",
+    }
+    now = datetime.now().strftime("%d.%m %H:%M")
+    return f"{titles.get(section, '📊 *Рынки*')} — _{now}_"
+
+
+async def build_markets_section_message(
+    github_repo: str | None = None,
+    *,
+    section: str = "summary",
+) -> tuple[list[str], dict]:
+    """Per-секционный /markets для нового inline-меню выбора секции.
+
+    Возвращает (`messages`, `bundle`) где `messages` — список Telegram-чанков
+    (для совместимости с `cmd_markets`), `bundle` — словарь с raw данными
+    (`binance_data`, `signals`, `verdict`, `prices`, `cot`, `etf`, …) для
+    дальнейшего использования вызывающим кодом.
+
+    section:
+      • ``summary`` (default) — короткий экран: крипта (minimal) + сигналы
+      • ``crypto`` / ``macro`` / ``indices`` / ``commod`` — одна секция цен
+      • ``cot``     — COT данные (CFTC)
+      • ``etf``     — ETF flows + market breadth
+      • ``signals`` — best trade + market signals (как `build_signals_message`)
+      • ``all``     — всё разом (как старый /markets)
+    """
+    section = section if section in MARKETS_SECTIONS else "summary"
+    header = _markets_header(section)
+    bundle: dict = {"section": section, "github_repo": github_repo}
+
+    # Если секция касается сигналов или summary — нужны binance_data + verdict.
+    needs_signals = section in ("summary", "signals", "all")
+    # Если секция касается цен (крипта/макро/индексы/сырьё/all) — нужен prices.
+    needs_prices = section in ("summary", "crypto", "macro", "indices", "commod", "all")
+
+    # Параллельный fetch — тащим только то, что нужно для секции.
+    from web_search import fetch_realtime_prices, format_prices_minimal
+
+    tasks: dict[str, asyncio.Task] = {}
+    if needs_signals:
+        tasks["bundle"] = asyncio.create_task(fetch_markets_bundle(github_repo))
+    if needs_prices:
+        tasks["prices"] = asyncio.create_task(fetch_realtime_prices())
+    if section in ("cot", "all"):
+        async def _fetch_cot():
+            try:
+                from cot_data import format_cot_for_agents, get_cot_for_assets
+
+                cot_data = await get_cot_for_assets(["Bitcoin", "Gold", "Crude Oil"])
+                return cot_data, format_cot_for_agents(cot_data)
+            except Exception as e:
+                logger.warning(f"COT fetch error: {e}")
+                return {}, "COT данные временно недоступны."
+        tasks["cot"] = asyncio.create_task(_fetch_cot())
+    if section in ("etf", "all"):
+        async def _fetch_etf():
+            try:
+                from etf_flows import (
+                    format_etf_flows_for_agents,
+                    get_etf_flows,
+                    get_market_breadth,
+                )
+
+                flows = await get_etf_flows()
+                breadth = await get_market_breadth()
+                return flows, format_etf_flows_for_agents(flows), breadth
+            except Exception as e:
+                logger.warning(f"ETF fetch error: {e}")
+                return {}, "ETF данные временно недоступны.", {}
+        tasks["etf"] = asyncio.create_task(_fetch_etf())
+
+    results: dict = {}
+    if tasks:
+        done = await asyncio.gather(*tasks.values(), return_exceptions=True)
+        for key, value in zip(tasks.keys(), done):
+            if isinstance(value, Exception):
+                logger.warning(f"build_markets_section_message[{key}]: {value}")
+                results[key] = None
+            else:
+                results[key] = value
+
+    md_bundle = results.get("bundle") or {}
+    prices = results.get("prices") or {}
+    cot_pair = results.get("cot") or ({}, "")
+    etf_triple = results.get("etf") or ({}, "", {})
+
+    bundle.update(md_bundle)
+    bundle["prices"] = prices
+    bundle["cot"] = cot_pair[0] if isinstance(cot_pair, tuple) else {}
+    bundle["etf_flows"] = etf_triple[0] if isinstance(etf_triple, tuple) else {}
+    bundle["market_breadth"] = etf_triple[2] if isinstance(etf_triple, tuple) and len(etf_triple) > 2 else {}
+
+    # ── Рендер тела секции ───────────────────────────────────────────────
+    body_parts: list[str] = []
+
+    if section == "summary":
+        body_parts.append("💲 *Крипта*")
+        body_parts.append(format_prices_minimal(prices, section="crypto", include_title=False) or "Нет данных")
+        body_parts.append("")
+        body_parts.append("📡 *Сигналы*")
+        body_parts.append(md_bundle.get("signals_message", "Нет данных"))
+
+    elif section == "crypto":
+        body_parts.append(format_prices_minimal(prices, section="crypto", include_title=False) or "Нет данных")
+
+    elif section == "macro":
+        body_parts.append(format_prices_minimal(prices, section="macro", include_title=False) or "Нет данных")
+
+    elif section == "indices":
+        body_parts.append(format_prices_minimal(prices, section="indices", include_title=False) or "Нет данных")
+
+    elif section == "commod":
+        body_parts.append(format_prices_minimal(prices, section="commod", include_title=False) or "Нет данных")
+
+    elif section == "cot":
+        body_parts.append(cot_pair[1] if isinstance(cot_pair, tuple) else "")
+
+    elif section == "etf":
+        body_parts.append(etf_triple[1] if isinstance(etf_triple, tuple) else "")
+        # Market breadth — короткой строкой
+        breadth = bundle.get("market_breadth") or {}
+        if breadth.get("breadth"):
+            body_parts.append("")
+            body_parts.append(
+                f"_Breadth: {breadth['breadth']}_  "
+                f"SPY {breadth.get('spy_5d', 0):+.2f}%  "
+                f"QQQ {breadth.get('qqq_5d', 0):+.2f}%  "
+                f"IWM {breadth.get('iwm_5d', 0):+.2f}%"
+            )
+
+    elif section == "signals":
+        body_parts.append(md_bundle.get("signals_message", "Нет данных"))
+
+    elif section == "all":
+        # Все секции по очереди — но в минимальном стиле, чтобы было удобно
+        # листать. COT/ETF — отдельным блоком.
+        body_parts.append(format_prices_minimal(prices, section="all", include_title=True))
+        body_parts.append("")
+        if isinstance(cot_pair, tuple) and cot_pair[1]:
+            body_parts.append("📊 *COT*")
+            body_parts.append(cot_pair[1])
+            body_parts.append("")
+        if isinstance(etf_triple, tuple) and etf_triple[1]:
+            body_parts.append("💼 *ETF потоки*")
+            body_parts.append(etf_triple[1])
+            body_parts.append("")
+        body_parts.append("📡 *Сигналы*")
+        body_parts.append(md_bundle.get("signals_message", "Нет данных"))
+
+    text = header + "\n\n" + "\n".join(p for p in body_parts if p is not None).rstrip()
+
+    # Режем по тем же границам что и full /markets — секции и активы.
+    messages = _split_markets_message(text, max_len=4000)
+    return messages, bundle
+
+
 async def build_markets_panel_message(github_repo: str | None = None) -> tuple[list[str], dict]:
     """Текст для команды /markets: живой контекст + smart-money + сигналы.
 
