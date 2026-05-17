@@ -3599,76 +3599,148 @@ async def handle_russia_choice(callback: CallbackQuery):
 # ─── /markets (живой контекст + сигналы Binance/Bybit, как в signals.py) ─────
 
 
-def _markets_signal_keyboard(is_enabled: bool) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🎯 Лучшая сделка", callback_data="cmd:signal")],
-        [
-            InlineKeyboardButton(text="📡 Обновить", callback_data="markets:check"),
-            InlineKeyboardButton(text="🧪 Скринер", callback_data="cmd:screener"),
-        ],
-        [InlineKeyboardButton(
-            text="🔕 Выключить сигналы" if is_enabled else "🔔 Включить сигналы",
+# Минималистичный набор кнопок: выбор секции (`markets:section:*`) + действия.
+# Юзер просил «меньше жмодци, только нужные, минимализм»: оставляем 8 кнопок
+# (4 ряда по 2). Активная секция помечена точкой («• Крипта»), чтобы видеть
+# где находишься без edit_message_text-навигации.
+
+_SECTION_BUTTONS: tuple[tuple[str, str], ...] = (
+    ("crypto", "💲 Крипта"),
+    ("macro", "🌐 Макро"),
+    ("indices", "📈 Индексы"),
+    ("commod", "⛽ Сырьё"),
+    ("cot", "📊 COT"),
+    ("etf", "💼 ETF"),
+    ("signals", "📡 Сигналы"),
+    ("all", "🏛 Всё"),
+)
+
+
+def _section_label(key: str, label: str, current: str) -> str:
+    return f"• {label}" if key == current else label
+
+
+def _markets_section_keyboard(
+    is_enabled: bool, current: str = "summary"
+) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    # 4 ряда по 2 кнопки — выбор секции.
+    pairs = list(zip(_SECTION_BUTTONS[0::2], _SECTION_BUTTONS[1::2]))
+    for (k1, l1), (k2, l2) in pairs:
+        rows.append([
+            InlineKeyboardButton(
+                text=_section_label(k1, l1, current),
+                callback_data=f"markets:section:{k1}",
+            ),
+            InlineKeyboardButton(
+                text=_section_label(k2, l2, current),
+                callback_data=f"markets:section:{k2}",
+            ),
+        ])
+    # Управляющий ряд: лучшая сделка + обновить + сигналы on/off.
+    rows.append([
+        InlineKeyboardButton(text="🎯 Лучшая", callback_data="cmd:signal"),
+        InlineKeyboardButton(
+            text="🔄 Обновить",
+            callback_data=f"markets:section:{current}",
+        ),
+        InlineKeyboardButton(
+            text="🔕" if is_enabled else "🔔",
             callback_data="markets:disable" if is_enabled else "markets:enable",
-        )],
-        [
-            InlineKeyboardButton(text="📊 Бэктест", callback_data="markets:backtest"),
-            InlineKeyboardButton(text="📋 Дайджест", callback_data="cmd:daily"),
-        ],
+        ),
     ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+# Обратная совместимость для старых хэндлеров (markets:check / backtest).
+def _markets_signal_keyboard(is_enabled: bool) -> InlineKeyboardMarkup:
+    return _markets_section_keyboard(is_enabled, current="summary")
+
+
+async def _render_markets_section(
+    *,
+    chat_id: int,
+    user_id: int,
+    section: str,
+    wait_message_id: int | None = None,
+) -> None:
+    """Рендерит /markets для указанной секции.
+
+    Если задан ``wait_message_id`` — первое сообщение `edit_message_text`
+    поверх него (так заменяем «⏳ Загружаю…» или предыдущий экран секции).
+    Иначе — все сообщения как `send_message`. Клавиатура + status_text
+    цепляются к последнему сообщению.
+    """
+    github_repo = os.getenv("GITHUB_REPO", "ANAEHY/dialectic_edge")
+    from signals import build_markets_section_message
+
+    messages, _bundle = await build_markets_section_message(github_repo, section=section)
+    is_enabled = await get_user_signals_status(user_id)
+    status_text = (
+        "\n\n✅ _Сигналы вкл — пришлю на сильном сигнале_"
+        if is_enabled
+        else "\n\n🔔 _Нажми колокольчик — буду слать сильные сигналы_"
+    )
+
+    if not messages:
+        text = "❌ Нет данных."
+        kb = _markets_section_keyboard(is_enabled, current=section)
+        if wait_message_id is not None:
+            await bot.edit_message_text(
+                text, chat_id=chat_id, message_id=wait_message_id, reply_markup=kb
+            )
+        else:
+            await bot.send_message(chat_id, text, reply_markup=kb)
+        return
+
+    # Первое сообщение — edit (если есть placeholder), иначе send.
+    first = clean_markdown(messages[0])
+    is_single = len(messages) == 1
+    first_kb = _markets_section_keyboard(is_enabled, current=section) if is_single else None
+    first_text = first + (status_text if is_single else "")
+    if wait_message_id is not None:
+        await bot.edit_message_text(
+            first_text,
+            chat_id=chat_id,
+            message_id=wait_message_id,
+            parse_mode="Markdown",
+            reply_markup=first_kb,
+        )
+    else:
+        await bot.send_message(
+            chat_id,
+            first_text,
+            parse_mode="Markdown",
+            reply_markup=first_kb,
+        )
+
+    # Остальные — отдельными сообщениями. Клавиатура + status_text → к
+    # последнему.
+    for i, chunk in enumerate(messages[1:], start=1):
+        is_last = (i == len(messages) - 1)
+        body = clean_markdown(chunk) + (status_text if is_last else "")
+        await bot.send_message(
+            chat_id,
+            body,
+            parse_mode="Markdown",
+            reply_markup=_markets_section_keyboard(is_enabled, current=section)
+            if is_last
+            else None,
+        )
 
 
 @dp.message(Command("markets"))
 async def cmd_markets(message: Message):
     user_id = message.from_user.id
     await upsert_user(user_id, message.from_user.username or "")
-    wait_msg = await message.answer("⏳ Загружаю рынки и сигналы...")
-    github_repo = os.getenv("GITHUB_REPO", "ANAEHY/dialectic_edge")
+    wait_msg = await message.answer("⏳ Загружаю рынки...")
     try:
-        from signals import build_markets_panel_message
-
-        messages, _bundle = await build_markets_panel_message(github_repo)
-        is_enabled = await get_user_signals_status(user_id)
-        status_text = (
-            "\n\n✅ *Сигналы включены* — при сильном сигнале пришлю отдельным сообщением"
-            if is_enabled
-            else (
-                "\n\n━━━━━━━━━━━━━━━━━━━━━\n"
-                "Нажми «Включить сигналы» — бот будет присылать при перекосе трейдеров "
-                "или совпадении с вердиктом из DIGEST_CACHE"
-            )
-        )
-        # build_markets_panel_message теперь возвращает список сообщений:
-        # 1) живой контекст; 2) smart-money + сигналы. Раньше всё было в одном
-        # сообщении и блок smart-money обрезался по max_len=3900.
-        # Стратегия:
-        #   - первое сообщение — edit поверх «⏳ Загружаю…» (без клавиатуры);
-        #   - последнее — send_message с клавиатурой + status_text.
-        if not messages:
-            await bot.edit_message_text(
-                "❌ Нет данных.",
-                chat_id=message.chat.id,
-                message_id=wait_msg.message_id,
-            )
-            return
-
-        # Первое сообщение — заменяем «⏳ Загружаю…».
-        await bot.edit_message_text(
-            clean_markdown(messages[0]),
+        await _render_markets_section(
             chat_id=message.chat.id,
-            message_id=wait_msg.message_id,
-            parse_mode="Markdown",
+            user_id=user_id,
+            section="summary",
+            wait_message_id=wait_msg.message_id,
         )
-        # Остальные — отдельными сообщениями. Клавиатура и status_text — к
-        # последнему.
-        for i, chunk in enumerate(messages[1:], start=1):
-            is_last = (i == len(messages) - 1)
-            body = clean_markdown(chunk) + (status_text if is_last else "")
-            await bot.send_message(
-                message.chat.id,
-                body,
-                parse_mode="Markdown",
-                reply_markup=_markets_signal_keyboard(is_enabled) if is_last else None,
-            )
     except Exception as e:
         await bot.edit_message_text(
             f"❌ Ошибка: {e}",
@@ -3895,6 +3967,21 @@ async def cb_markets_signals(callback: CallbackQuery):
         action = data.split(":")[1] if ":" in data else ""
     else:
         action = ""
+
+    # markets:section:<key> — выбор секции (новое меню /markets).
+    if data.startswith("markets:section:"):
+        section = data.split(":", 2)[2] if data.count(":") >= 2 else "summary"
+        await callback.answer("⏳")
+        try:
+            await _render_markets_section(
+                chat_id=callback.message.chat.id,
+                user_id=user_id,
+                section=section,
+                wait_message_id=callback.message.message_id,
+            )
+        except Exception as e:
+            await callback.answer(f"Ошибка: {e}", show_alert=True)
+        return
 
     if action == "enable":
         await set_signals_sub(user_id, True)

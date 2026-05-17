@@ -1439,6 +1439,161 @@ def format_prices_for_agents(prices: dict, *, for_user: bool = False) -> str:
     return "\n".join(lines)
 
 
+# ─── /markets minimal renderer ────────────────────────────────────────────────
+# Используется в новом меню /markets, где юзер выбирает секцию
+# (Крипта/Макро/Индексы/Сырьё) и получает короткую сводку: цена + MA-триггеры
+# (▲/▼). Без эмодзи-«покраски» (🟢🔴) и квант-блока — это «минимализм»
+# отображения, тот же data-источник что и в `format_prices_for_agents`.
+
+ASSET_ICONS_MIN: dict[str, str] = {
+    "BTC": "₿",
+    "ETH": "Ξ",
+    "SOL": "◎",
+    "BNB": "◆",
+    "XRP": "✕",
+}
+
+
+def _fmt_change_min(ch: float | int | None, *, decimals: int = 2) -> str:
+    """`+1.20%` / `−0.50%` без эмодзи. Минус — юникодный U+2212, как в `_fmt_pct`."""
+    try:
+        v = float(ch) if ch is not None else 0.0
+    except (TypeError, ValueError):
+        v = 0.0
+    if abs(v) < 0.005:
+        return f"{v:+.{decimals}f}%".replace("-", "−")
+    return f"{v:+.{decimals}f}%".replace("-", "−")
+
+
+def _crypto_lines_minimal(prices: dict) -> list[str]:
+    lines: list[str] = []
+    for k in ("BTC", "ETH", "SOL", "BNB", "XRP"):
+        if k not in prices:
+            continue
+        p = prices[k]
+        icon = ASSET_ICONS_MIN.get(k, "•")
+        change = p.get("change_24h")
+        price = p.get("price")
+        lines.append(
+            f"{icon} {k} — {_fmt_money(price, prefix='$')}   {_fmt_change_min(change)} 24ч"
+        )
+        # ▲/▼ MA-триггеры (та же логика что в `_trigger_lines`).
+        for trig in _trigger_lines(p, indent="   "):
+            lines.append(trig)
+        lines.append("")
+    while lines and lines[-1] == "":
+        lines.pop()
+    return lines
+
+
+def _macro_lines_minimal(prices: dict) -> list[str]:
+    if "MACRO" not in prices:
+        return []
+    m = prices["MACRO"]
+    fng = m.get("fng", {}) or {}
+    lines: list[str] = [
+        f"ФРС   {m.get('fed_rate', 'N/A')}%",
+        f"CPI   {_cpi_yoy(m.get('cpi_raw', 'N/A'))} YoY",
+    ]
+    fv = fng.get("val", "N/A")
+    fs = fng.get("status", "")
+    fc = int(fng.get("change", 0) or 0)
+    arrow = "↗" if fc > 0 else "↘" if fc < 0 else "→"
+    fs_part = f" ({fs})" if fs else ""
+    lines.append(f"F&G   {fv}/100{fs_part}   {arrow} {fc:+d}/сут")
+    return lines
+
+
+def _indices_lines_minimal(prices: dict) -> list[str]:
+    lines: list[str] = []
+    for k, label in (("SPX", "S&P 500"), ("NDX", "Nasdaq 100"), ("VIX", "VIX")):
+        if k not in prices:
+            continue
+        p = prices[k]
+        ch = p.get("change_24h", 0)
+        try:
+            price = float(p.get("price") or 0)
+        except (TypeError, ValueError):
+            price = 0.0
+        lines.append(f"{label}   {price:,.2f}   {_fmt_change_min(ch)} 24ч")
+        for trig in _trigger_lines(p, indent="   ", prefix=""):
+            lines.append(trig)
+        lines.append("")
+    while lines and lines[-1] == "":
+        lines.pop()
+    return lines
+
+
+def _commod_lines_minimal(prices: dict) -> list[str]:
+    lines: list[str] = []
+    for k, label, unit in (
+        ("OIL_WTI", "Нефть WTI", "$/барр"),
+        ("GOLD", "Золото", "$/унц"),
+        ("DXY", "DXY", ""),
+    ):
+        if k not in prices:
+            continue
+        p = prices[k]
+        ch = p.get("change_24h", 0)
+        try:
+            price = float(p.get("price") or 0)
+        except (TypeError, ValueError):
+            price = 0.0
+        unit_part = f" {unit}" if unit else ""
+        lines.append(f"{label}   {price:,.2f}{unit_part}   {_fmt_change_min(ch)} 24ч")
+        prefix = "$" if k in ("OIL_WTI", "GOLD") else ""
+        for trig in _trigger_lines(p, indent="   ", prefix=prefix):
+            lines.append(trig)
+        lines.append("")
+    while lines and lines[-1] == "":
+        lines.pop()
+    return lines
+
+
+SECTION_TITLES_MIN: dict[str, str] = {
+    "crypto": "💲 *Крипта*",
+    "macro": "🌐 *Макро*",
+    "indices": "📈 *Индексы*",
+    "commod": "⛽ *Сырьё*",
+}
+
+
+def format_prices_minimal(
+    prices: dict, *, section: str = "all", include_title: bool = True
+) -> str:
+    """Минималистичный per-секционный рендер цен.
+
+    `section`:
+      • ``crypto`` — BTC/ETH/SOL/BNB/XRP + ▲/▼ MA-триггеры
+      • ``macro``  — ФРС / CPI / F&G
+      • ``indices``— SPX / NDX / VIX + ▲/▼
+      • ``commod`` — Oil WTI / Gold / DXY + ▲/▼
+      • ``all``    — все секции по очереди
+    """
+    if not prices:
+        return "Рыночные данные временно недоступны."
+
+    blocks: list[tuple[str, list[str]]] = []
+    if section in ("crypto", "all"):
+        blocks.append(("crypto", _crypto_lines_minimal(prices)))
+    if section in ("macro", "all"):
+        blocks.append(("macro", _macro_lines_minimal(prices)))
+    if section in ("indices", "all"):
+        blocks.append(("indices", _indices_lines_minimal(prices)))
+    if section in ("commod", "all"):
+        blocks.append(("commod", _commod_lines_minimal(prices)))
+
+    parts: list[str] = []
+    for key, body in blocks:
+        if not body:
+            continue
+        if include_title and section == "all":
+            parts.append(SECTION_TITLES_MIN.get(key, key) + "\n" + "\n".join(body))
+        else:
+            parts.append("\n".join(body))
+    return "\n\n".join(parts)
+
+
 async def get_full_realtime_context(*, for_user: bool = False) -> tuple[dict, str]:
     """Тянет prices + рендерит. `for_user=True` использует читаемый формат
     для команды /markets (без AI-инструкций / дубль-заголовка, с пустыми
