@@ -235,18 +235,26 @@ PERSISTENT_BTN_DAILY    = "📊 Прогноз"
 PERSISTENT_BTN_PITCH    = "💎 Питч"
 PERSISTENT_BTN_MARKETS  = "🏛 Рынки"
 PERSISTENT_BTN_SETTINGS = "⚙️ Настройки"
+PERSISTENT_BTN_SIGNAL   = "🎯 Лучшая сделка"
+PERSISTENT_BTN_SCREENER = "🧪 Скринер"
+PERSISTENT_BTN_HELP     = "❓ Помощь"
 
 
 def persistent_kb() -> ReplyKeyboardMarkup:
-    """Главное меню снизу. Висит постоянно. 2 ряда по 2 кнопки."""
+    """Главное меню снизу. Висит постоянно. 3 ряда — выше плотность."""
     return ReplyKeyboardMarkup(
         keyboard=[
             [
                 KeyboardButton(text=PERSISTENT_BTN_DAILY),
-                KeyboardButton(text=PERSISTENT_BTN_PITCH),
+                KeyboardButton(text=PERSISTENT_BTN_MARKETS),
+                KeyboardButton(text=PERSISTENT_BTN_SIGNAL),
             ],
             [
-                KeyboardButton(text=PERSISTENT_BTN_MARKETS),
+                KeyboardButton(text=PERSISTENT_BTN_PITCH),
+                KeyboardButton(text=PERSISTENT_BTN_SCREENER),
+                KeyboardButton(text=PERSISTENT_BTN_HELP),
+            ],
+            [
                 KeyboardButton(text=PERSISTENT_BTN_SETTINGS),
             ],
         ],
@@ -2183,21 +2191,23 @@ async def cmd_newbie(message: Message):
 
 def _main_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📘 Инструкция", callback_data="cmd:guide")],
-        [InlineKeyboardButton(text="📖 Инструкция для чайников", callback_data="cmd:instruction")],
+        [InlineKeyboardButton(text="🎯 Лучшая сделка сейчас", callback_data="cmd:signal")],
         [
             InlineKeyboardButton(text="📋 Дайджест", callback_data="cmd:daily"),
             InlineKeyboardButton(text="📊 Рынки + сигналы", callback_data="cmd:markets"),
         ],
         [
-            InlineKeyboardButton(text="💰 Статус", callback_data="cmd:status"),
+            InlineKeyboardButton(text="🧪 Скринер", callback_data="cmd:screener"),
             InlineKeyboardButton(text="📡 Сигнал трейдер", callback_data="cmd:signalstatus"),
         ],
         [
+            InlineKeyboardButton(text="💰 Статус", callback_data="cmd:status"),
             InlineKeyboardButton(text="📈 Профиль", callback_data="cmd:profile"),
-            InlineKeyboardButton(text="📊 Трек-рекорд", callback_data="cmd:trackrecord"),
         ],
-        [InlineKeyboardButton(text="📊 Портфель", callback_data="portfolio:menu:")],
+        [
+            InlineKeyboardButton(text="📊 Трек-рекорд", callback_data="cmd:trackrecord"),
+            InlineKeyboardButton(text="📊 Портфель", callback_data="portfolio:menu:"),
+        ],
         [
             InlineKeyboardButton(text="🧪 Бэктест", callback_data="cmd:backtest"),
             InlineKeyboardButton(text="🔔 Подписка", callback_data="cmd:subscribe"),
@@ -2208,8 +2218,13 @@ def _main_menu_kb() -> InlineKeyboardMarkup:
         ],
         [
             InlineKeyboardButton(text="🗓 Weekly", callback_data="cmd:weeklyreport"),
-            InlineKeyboardButton(text="❓ Help", callback_data="cmd:help"),
+            InlineKeyboardButton(text="💎 Питч", callback_data="cmd:pitch"),
         ],
+        [
+            InlineKeyboardButton(text="📘 Инструкция", callback_data="cmd:guide"),
+            InlineKeyboardButton(text="📖 Для чайников", callback_data="cmd:instruction"),
+        ],
+        [InlineKeyboardButton(text="❓ Help", callback_data="cmd:help")],
     ])
 
 
@@ -2575,7 +2590,9 @@ async def handle_cmd_shortcuts(callback: CallbackQuery):
         "weeklyreport": cmd_weekly,
         "subscribe": cmd_subscribe,
         "help": cmd_help,
+        "signal": cmd_signal,
         "signalstatus": cmd_signal_status,
+        "screener": cmd_screener,
         "backtest": cmd_backtest,
         "guide": lambda m: _send_bot_guide(m.chat.id),
         "instruction": lambda m: _send_detailed_guide(m.chat.id),
@@ -2617,13 +2634,19 @@ async def cmd_start(message: Message):
     # можно сразу идти на «📊 Покажи прогноз сейчас» или ⚙️ Настройки.
     welcome_inline = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🆕 Я новичок — гид + PDF",  callback_data="cmd:newbie")],
-        [InlineKeyboardButton(text="📊 Покажи прогноз сейчас", callback_data="cmd:daily")],
-        [InlineKeyboardButton(text="🏛 Что на рынках сейчас", callback_data="cmd:markets")],
+        [InlineKeyboardButton(text="🎯 Лучшая сделка сейчас",  callback_data="cmd:signal")],
         [
-            InlineKeyboardButton(text="💎 Что я умею",       callback_data="cmd:pitch"),
-            InlineKeyboardButton(text="⚙️ Настройки",       callback_data="cmd:profile"),
+            InlineKeyboardButton(text="📊 Прогноз",            callback_data="cmd:daily"),
+            InlineKeyboardButton(text="🏛 Рынки",              callback_data="cmd:markets"),
         ],
-        [InlineKeyboardButton(text="📘 Команды бота",        callback_data="cmd:guide")],
+        [
+            InlineKeyboardButton(text="🧪 Скринер",            callback_data="cmd:screener"),
+            InlineKeyboardButton(text="💎 Что я умею",         callback_data="cmd:pitch"),
+        ],
+        [
+            InlineKeyboardButton(text="⚙️ Настройки",          callback_data="cmd:profile"),
+            InlineKeyboardButton(text="📘 Команды",            callback_data="cmd:guide"),
+        ],
     ])
 
     # Сначала отдельным сообщением «приклеиваем» постоянное меню снизу —
@@ -2673,6 +2696,21 @@ async def _kb_markets(message: Message):
 @dp.message(F.text == PERSISTENT_BTN_SETTINGS)
 async def _kb_settings(message: Message):
     await cmd_profile(message)
+
+
+@dp.message(F.text == PERSISTENT_BTN_SIGNAL)
+async def _kb_signal(message: Message):
+    await cmd_signal(message)
+
+
+@dp.message(F.text == PERSISTENT_BTN_SCREENER)
+async def _kb_screener(message: Message):
+    await cmd_screener(message)
+
+
+@dp.message(F.text == PERSISTENT_BTN_HELP)
+async def _kb_help(message: Message):
+    await cmd_help(message)
 
 
 # ─── /profile ─────────────────────────────────────────────────────────────────
@@ -3563,12 +3601,19 @@ async def handle_russia_choice(callback: CallbackQuery):
 
 def _markets_signal_keyboard(is_enabled: bool) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎯 Лучшая сделка", callback_data="cmd:signal")],
+        [
+            InlineKeyboardButton(text="📡 Обновить", callback_data="markets:check"),
+            InlineKeyboardButton(text="🧪 Скринер", callback_data="cmd:screener"),
+        ],
         [InlineKeyboardButton(
             text="🔕 Выключить сигналы" if is_enabled else "🔔 Включить сигналы",
             callback_data="markets:disable" if is_enabled else "markets:enable",
         )],
-        [InlineKeyboardButton(text="📡 Обновить", callback_data="markets:check")],
-        [InlineKeyboardButton(text="📊 Бэктест", callback_data="markets:backtest")],
+        [
+            InlineKeyboardButton(text="📊 Бэктест", callback_data="markets:backtest"),
+            InlineKeyboardButton(text="📋 Дайджест", callback_data="cmd:daily"),
+        ],
     ])
 
 
