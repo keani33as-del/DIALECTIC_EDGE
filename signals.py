@@ -797,7 +797,11 @@ async def build_markets_section_message(
     needs_prices = section in ("summary", "crypto", "macro", "indices", "commod", "all")
 
     # Параллельный fetch — тащим только то, что нужно для секции.
-    from web_search import fetch_realtime_prices, format_prices_minimal
+    # `format_prices_section` отдаёт ПОЛНЫЙ рич-формат (24ч/7д/30д, MA-триггеры,
+    # SL/TP LONG/SHORT, Quant-вердикт, ТРЕНД+MA50/200, Random walk/Markov,
+    # объём) — фильтрует только по выбранной секции. Юзер просил вернуть
+    # детальный формат, оставив выбор секции.
+    from web_search import fetch_realtime_prices, format_prices_section
 
     tasks: dict[str, asyncio.Task] = {}
     if needs_signals:
@@ -857,23 +861,24 @@ async def build_markets_section_message(
     body_parts: list[str] = []
 
     if section == "summary":
-        body_parts.append("💲 *Крипта*")
-        body_parts.append(format_prices_minimal(prices, section="crypto", include_title=False) or "Нет данных")
+        # Сводка = крипта (рич-формат) + сигналы. Так юзер сразу видит
+        # самое важное по умолчанию, но если нужно копнуть глубже — кнопки.
+        body_parts.append(format_prices_section(prices, section="crypto") or "Нет данных")
         body_parts.append("")
         body_parts.append("📡 *Сигналы*")
         body_parts.append(md_bundle.get("signals_message", "Нет данных"))
 
     elif section == "crypto":
-        body_parts.append(format_prices_minimal(prices, section="crypto", include_title=False) or "Нет данных")
+        body_parts.append(format_prices_section(prices, section="crypto") or "Нет данных")
 
     elif section == "macro":
-        body_parts.append(format_prices_minimal(prices, section="macro", include_title=False) or "Нет данных")
+        body_parts.append(format_prices_section(prices, section="macro") or "Нет данных")
 
     elif section == "indices":
-        body_parts.append(format_prices_minimal(prices, section="indices", include_title=False) or "Нет данных")
+        body_parts.append(format_prices_section(prices, section="indices") or "Нет данных")
 
     elif section == "commod":
-        body_parts.append(format_prices_minimal(prices, section="commod", include_title=False) or "Нет данных")
+        body_parts.append(format_prices_section(prices, section="commod") or "Нет данных")
 
     elif section == "cot":
         body_parts.append(cot_pair[1] if isinstance(cot_pair, tuple) else "")

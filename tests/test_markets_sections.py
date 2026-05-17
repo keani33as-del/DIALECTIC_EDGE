@@ -256,7 +256,10 @@ class TestBuildMarketsSectionMessage(unittest.TestCase):
 
         self.assertEqual(bundle["section"], "summary")
         text = "\n\n".join(msgs)
-        self.assertIn("Крипта", text)
+        # Summary = крипта (рич-формат) + сигналы. В рич-формате — заголовок
+        # секции `[КРИПТОРЫНОК]` и "Bitcoin (BTC)" вместо иконки `₿`.
+        self.assertIn("КРИПТОРЫНОК", text)
+        self.assertIn("Bitcoin (BTC)", text)
         self.assertIn("Сигналы", text)
         self.assertIn("SIGNAL TEST", text)
 
@@ -269,8 +272,34 @@ class TestBuildMarketsSectionMessage(unittest.TestCase):
             msgs, _ = self._run(build_markets_section_message("o/r", section="crypto"))
 
         text = "\n\n".join(msgs)
-        self.assertIn("₿", text)
+        # Рич-формат: `[КРИПТОРЫНОК]` + полная строка по активу.
+        self.assertIn("КРИПТОРЫНОК", text)
+        self.assertIn("Bitcoin (BTC)", text)
+        self.assertIn("$78,114", text)
+        # ▲/▼ MA-триггеры остаются — это главный сигнал входа.
+        self.assertIn("▲", text)
+        self.assertIn("▼", text)
+        # Чужие секции не появляются.
+        self.assertNotIn("МАКРОЭКОНОМИКА", text)
+        self.assertNotIn("ФОНДОВЫЕ ИНДЕКСЫ", text)
         self.assertNotIn("DO_NOT_SHOW", text)
+
+    def test_crypto_section_preserves_rich_detail(self):
+        """Юзер просил вернуть детальную инфу (24ч, MA-триггеры, ТРЕНД, …) —
+        проверяем что fixture-данные действительно проявляются в выводе."""
+        from signals import build_markets_section_message
+
+        prices = {"BTC": _btc_fixture()}
+        # `_btc_fixture()` имеет trend="BEARISH" / trend_emoji="🔴" → ТРЕНД-строка появится.
+        fake_prices, fake_bundle = self._mock_fetchers(prices=prices)
+        with patch("web_search.fetch_realtime_prices", new=fake_prices), \
+             patch("signals.fetch_markets_bundle", new=fake_bundle):
+            msgs, _ = self._run(build_markets_section_message("o/r", section="crypto"))
+        text = "\n\n".join(msgs)
+        # ТРЕНД-блок + MA-триггеры — это «детальная инфа» которую юзер хотел вернуть.
+        self.assertIn("ТРЕНД", text)
+        self.assertIn("MA50", text)
+        self.assertIn("MA200", text)
 
     def test_signals_section_skips_prices_fetch(self):
         fake_prices, fake_bundle = self._mock_fetchers(signals_msg="🔔 ONLY_SIGNALS")
