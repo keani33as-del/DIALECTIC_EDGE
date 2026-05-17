@@ -310,6 +310,14 @@ class TestBuildMarketsSectionMessage(unittest.TestCase):
         self.assertNotIn("₿", text)
 
 
+try:
+    import aiogram  # noqa: F401
+    _HAS_AIOGRAM = True
+except ImportError:
+    _HAS_AIOGRAM = False
+
+
+@unittest.skipUnless(_HAS_AIOGRAM, "aiogram не установлен (CI: minimal deps)")
 class TestMarketsSectionKeyboard(unittest.TestCase):
     """Активная секция помечена точкой («• Крипта»). Это удобный hint
     для юзера: видно где сейчас, не надо щёлкать туда-сюда."""
