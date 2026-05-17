@@ -360,6 +360,125 @@ def analyze_signals(binance_data: dict, verdict: Optional[dict]) -> list:
     return signals
 
 
+def pick_best_signal(
+    signals: list,
+    binance_data: dict,
+    verdict: Optional[dict] = None,
+) -> Optional[dict]:
+    """Выбирает один лучший сигнал среди кандидатов по R-системе рисков.
+
+    R-система = риск/доход: для каждого кандидата считаем композитный
+    R-score, где база — confidence из `analyze_signals`, плюс бонусы за
+    выравнивание с другими сигналами (трейдеры Bybit, quant_verdict,
+    вердикт `/daily`) и штрафы за конфликты. Используем уже посчитанный
+    `build_signal_bias_map`, чтобы не дублировать логику взвешивания
+    funding/traders/quant.
+
+    Алгоритм:
+      • Считаем bias_map один раз — это per-symbol композитный score
+        (см. `build_signal_bias_map`).
+      • Для каждого сигнала:
+          base = float(confidence)
+          + 12 если direction совпадает с bias_map[symbol].direction
+          + 8 если quant_verdict == direction (доп. подтверждение)
+          + 6 если type == "VERDICT_MATCH" (alignment с /daily)
+          + 4 если type == "BYBIT_TRADERS" и confidence ≥ 70
+          − 35 если bias_map[symbol].quant_blocked (quant-блок)
+          − 18 если direction конфликтует с знаком bias_score (≥8 по модулю)
+      • Implicit R:R = 2:1 (SL = 1.5·σ, TP = 3·σ — как в core/signal_scorer).
+        Если есть quant_components → ATR, ещё +3 (есть данные для стопа).
+      • Возвращаем dict с расширенными полями ⭐ (или None, если пусто).
+
+    Returns:
+        Лучший signal dict с доп. полями `r_score`, `r_ratio`,
+        `bias_alignment`, `quant_confirmed`. None если кандидатов нет.
+    """
+    if not signals:
+        return None
+
+    bias_map = build_signal_bias_map(binance_data or {}, verdict)
+
+    def _short_symbol(sym: str) -> str:
+        return sym.replace("USDT", "").upper()
+
+    best: Optional[dict] = None
+    best_score = float("-inf")
+
+    for sig in signals:
+        symbol_short = _short_symbol(sig.get("symbol", ""))
+        direction = sig.get("direction", "NEUTRAL")
+        confidence = float(sig.get("confidence", 0) or 0)
+
+        bias = bias_map.get(symbol_short) or {}
+        bias_direction = bias.get("direction", "NEUTRAL")
+        bias_score_val = float(bias.get("score", 0) or 0)
+        quant_verdict_v = (bias.get("quant_verdict") or "NEUTRAL").upper()
+        quant_blocked = bool(bias.get("quant_blocked"))
+
+        r_score = confidence
+
+        # Alignment bonuses — direction matches independently computed bias map.
+        bias_alignment = direction != "NEUTRAL" and direction == bias_direction
+        if bias_alignment:
+            r_score += 12
+
+        # Quant verdict confirmation: BB+Donchian+RSI ensemble agrees with direction.
+        quant_confirmed = (
+            quant_verdict_v in ("LONG", "SHORT") and quant_verdict_v == direction
+        )
+        if quant_confirmed:
+            r_score += 8
+
+        if sig.get("type") == "VERDICT_MATCH":
+            r_score += 6
+
+        if sig.get("type") == "BYBIT_TRADERS" and confidence >= 70:
+            r_score += 4
+
+        # Penalties: quant safety gate already blocked direction (high-conf
+        # anti-signal) → почти всегда выкидываем кандидата.
+        if quant_blocked:
+            r_score -= 35
+
+        # Direction conflicts with the bias-map sign at meaningful magnitude.
+        if abs(bias_score_val) >= 8:
+            sign = 1 if bias_score_val > 0 else -1
+            if (direction == "LONG" and sign < 0) or (direction == "SHORT" and sign > 0):
+                r_score -= 18
+
+        # R/R hint: detect whether we have ATR for a real stop-loss. Without
+        # ATR / σ̂ the implicit R:R is best-effort (still 2:1 from σ̂-based
+        # stop in core.signal_scorer convention).
+        has_atr = bool(
+            (binance_data or {}).get(sig.get("symbol", ""), {})
+            .get("quant_components")
+        )
+        if has_atr:
+            r_score += 3
+            r_ratio = 2.0
+        else:
+            r_ratio = 2.0  # σ̂-based default; conservative 2:1
+
+        if r_score > best_score:
+            best_score = r_score
+            best = dict(sig)
+            best["r_score"] = round(r_score, 1)
+            best["r_ratio"] = r_ratio
+            best["bias_alignment"] = bias_alignment
+            best["quant_confirmed"] = quant_confirmed
+            best["bias_score"] = round(bias_score_val, 1)
+
+    if best is None:
+        return None
+
+    # Минимальный порог качества: даже «лучший» сигнал должен набрать ≥ 50
+    # композитного R-score. Иначе помечать звездой просто шум.
+    if best.get("r_score", 0) < 50:
+        return None
+
+    return best
+
+
 def build_signal_bias_map(binance_data: dict, verdict: Optional[dict] = None) -> dict:
     """Collapse raw signal inputs into a per-symbol directional bias map."""
     bias_map = {}
@@ -517,6 +636,37 @@ def build_signals_message(signals: list, binance_data: dict, verdict: Optional[d
     
     # Сигналы
     if signals:
+        # ── Лучшая сделка (R-система рисков) ─────────────────────────────────
+        # Скорим каждый сигнал по composite R-score (confidence + bias align
+        # + quant_confirmed − quant_block) и показываем один топ ★ перед
+        # списком. Если score < 50 — лучшего нет (ничего не помечаем).
+        best = pick_best_signal(signals, binance_data, verdict)
+        best_key: Optional[tuple] = None
+        if best:
+            best_key = (best.get("symbol"), best.get("direction"), best.get("type"))
+            best_emoji = "📈" if best.get("direction") == "LONG" else "📉"
+            best_sym_short = best.get("symbol", "").replace("USDT", "")
+            confirm_bits: list[str] = []
+            if best.get("bias_alignment"):
+                confirm_bits.append("bias")
+            if best.get("quant_confirmed"):
+                confirm_bits.append("quant")
+            if best.get("type") == "VERDICT_MATCH":
+                confirm_bits.append("digest")
+            if best.get("type") == "BYBIT_TRADERS":
+                confirm_bits.append("traders")
+            confirm_str = ", ".join(confirm_bits) if confirm_bits else "single"
+
+            lines.append("⭐ *ЛУЧШАЯ СДЕЛКА СЕЙЧАС*")
+            lines.append(
+                f"{best_emoji} *{best_sym_short}* → *{best.get('direction')}*  "
+                f"R/R≈{best.get('r_ratio', 2.0):.1f}  "
+                f"score {best.get('r_score', 0):.0f}/100"
+            )
+            lines.append(f"   {best.get('reason', '')}")
+            lines.append(f"   _Подтверждения: {confirm_str}_")
+            lines.append("")
+
         lines.append("🔔 *СИГНАЛЫ*")
 
         verdict_value = (verdict or {}).get("verdict") if verdict else None
@@ -533,8 +683,18 @@ def build_signals_message(signals: list, binance_data: dict, verdict: Optional[d
             emoji = "🟢" if s["direction"] == "LONG" else "🔴"
             conf = s["confidence"]
             conf_emoji = "✅" if conf >= 70 else "⚠️"
-            
-            lines.append(f"{emoji} {s['symbol']} → {s['direction']} {conf_emoji}{conf}%")
+
+            # Помечаем ★ конкретный сигнал, который выбрала R-система как
+            # лучший — чтобы юзер сразу видел его в общем списке.
+            star = " ⭐" if best_key and (
+                s.get("symbol") == best_key[0]
+                and s.get("direction") == best_key[1]
+                and s.get("type") == best_key[2]
+            ) else ""
+
+            lines.append(
+                f"{emoji} {s['symbol']} → {s['direction']} {conf_emoji}{conf}%{star}"
+            )
             lines.append(f"   {s['reason']}")
             lines.append("")
     else:
