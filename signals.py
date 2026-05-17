@@ -115,6 +115,32 @@ async def fetch_bybit_long_short_ratio(symbols: list[str] = ["BTCUSDT", "ETHUSDT
     return results
 
 
+async def _fetch_daily_closes(session: aiohttp.ClientSession, symbol: str, limit: int = 210) -> list[float]:
+    """Лёгкий fetch только списка daily закрытий через Binance klines API.
+
+    Используется для квант-фильтра (BB+Donchian+RSI ансамбль + BTC regime gate).
+    Зеркалирует `web_search._fetch_trend_data`, но без вычислений MA/тренда —
+    нам тут нужен ТОЛЬКО ряд closes для `quant_filter.quant_verdict()`. Возвращает
+    пустой список при ошибке/таймауте, чтобы вызывающая сторона графciously
+    деградировала до старого поведения (один MA50/200-триггер).
+    """
+    try:
+        url = f"{BINANCE_SPOT_URL}/api/v3/klines"
+        params = {"symbol": symbol, "interval": "1d", "limit": limit}
+        async with session.get(
+            url, params=params, timeout=aiohttp.ClientTimeout(total=8)
+        ) as r:
+            if r.status != 200:
+                return []
+            klines = await r.json()
+            if not klines:
+                return []
+            return [float(k[4]) for k in klines]
+    except Exception as e:
+        logger.debug(f"daily closes fetch {symbol}: {e}")
+        return []
+
+
 async def fetch_binance_signals(symbols: list[str] | None = None) -> dict:
     """Получает данные: Bybit (если есть ключи) + Binance (fallback)."""
     if symbols is None:
@@ -179,7 +205,50 @@ async def fetch_binance_signals(symbols: list[str] | None = None) -> dict:
                 results[symbol]["short"] = bybit_data[symbol]["short"]
                 results[symbol]["dominant"] = bybit_data[symbol]["dominant"]
                 results[symbol]["has_traders_data"] = True
-    
+
+        # ── Квант-фильтр: BB+Donchian+RSI ансамбль + BTC regime gate ──
+        # Тащим 210 daily closes для каждого символа (Binance klines), кормим
+        # quant_filter.quant_verdict() и кладём результат в каждую запись.
+        # Бэктест: 65.9% hit-rate на 1-5д vs 49.6% MA50/200 (см. docs/quant_research_v2.md).
+        # Это дополнительный сигнал поверх Bybit/funding — build_signal_bias_map
+        # читает quant_verdict из dict'а и может задемоутить direction до
+        # NEUTRAL при сильном конфликте.
+        try:
+            from quant_filter import quant_verdict as _quant_verdict
+
+            closes_map: dict[str, list[float]] = {}
+            tasks = [
+                _fetch_daily_closes(session, sym)
+                for sym in results.keys()
+            ]
+            closes_results = await asyncio.gather(*tasks, return_exceptions=True)
+            for sym, cl in zip(list(results.keys()), closes_results):
+                if isinstance(cl, list) and cl:
+                    closes_map[sym] = cl
+
+            btc_closes = closes_map.get("BTCUSDT")
+            for sym, sym_data in results.items():
+                own_closes = closes_map.get(sym)
+                if not own_closes:
+                    continue
+                try:
+                    qv = _quant_verdict(
+                        own_closes,
+                        btc_closes if sym != "BTCUSDT" else None,
+                    )
+                except Exception as e:
+                    logger.debug(f"quant_verdict {sym}: {e}")
+                    continue
+                sym_data["quant_verdict"] = qv.get("verdict", "NEUTRAL")
+                sym_data["quant_confidence"] = qv.get("confidence", 0)
+                sym_data["quant_reason"] = qv.get("reason", "")
+                sym_data["quant_components"] = qv.get("components", {})
+                sym_data["quant_status"] = qv.get("status", "ok")
+        except ImportError:
+            logger.debug("quant_filter module not available; skipping")
+        except Exception as e:
+            logger.warning(f"quant_filter signals pass error: {e}")
+
     return results
 
 
@@ -330,11 +399,48 @@ def build_signal_bias_map(binance_data: dict, verdict: Optional[dict] = None) ->
                 score -= 8
                 reasons.append("digest bearish")
 
+        # ── Квант-фильтр: BB+Donchian+RSI ансамбль + BTC regime gate ──
+        # На бэктесте даёт +16п.п. hit-rate (49.6% → 65.9%) на 1-5д
+        # горизонте — см. docs/quant_research_v2.md. Логика:
+        #   • LONG quant + score>=0 → boost +6 (двойное подтверждение)
+        #   • SHORT quant + score<=0 → boost −6
+        #   • Сильный конфликт (quant LONG vs score<=−8, или quant SHORT vs
+        #     score>=+8) → штраф −10 в абсолюте, чтобы вытолкнуть в NEUTRAL.
+        # Не падаем если поля отсутствуют (graceful-degradation).
+        quant_v = (data.get("quant_verdict") or "").upper()
+        quant_conf = float(data.get("quant_confidence") or 0)
+        if quant_v in ("LONG", "SHORT") and quant_conf >= 50:
+            quant_dir_score = 6.0 if quant_v == "LONG" else -6.0
+            if (score >= 0 and quant_v == "LONG") or (score <= 0 and quant_v == "SHORT"):
+                score += quant_dir_score
+                reasons.append(f"quant {quant_v} ({quant_conf:.0f}%)")
+            elif (score >= 8 and quant_v == "SHORT") or (score <= -8 and quant_v == "LONG"):
+                # Конфликт с уже сильным сигналом → демоутим, чтобы не
+                # ловить ножи против mean-reversion.
+                penalty = 10.0 if score > 0 else -10.0
+                score -= penalty
+                reasons.append(f"quant CONFLICT {quant_v} (−)")
+
         direction = "NEUTRAL"
         if score >= 8:
             direction = "LONG"
         elif score <= -8:
             direction = "SHORT"
+
+        # Финальный safety-гейт: если у quant сильный анти-сигнал,
+        # перебрасываем direction на NEUTRAL (но score не трогаем — пусть
+        # внешние слои видят сырой счёт). Применяем только если quant
+        # действительно сработал (confidence ≥ 70).
+        quant_blocked = False
+        if quant_v in ("LONG", "SHORT") and quant_conf >= 70:
+            if direction == "LONG" and quant_v == "SHORT":
+                direction = "NEUTRAL"
+                quant_blocked = True
+                reasons.append(f"quant ⛔ блок LONG")
+            elif direction == "SHORT" and quant_v == "LONG":
+                direction = "NEUTRAL"
+                quant_blocked = True
+                reasons.append(f"quant ⛔ блок SHORT")
 
         bias_map[symbol] = {
             "symbol": symbol,
@@ -347,6 +453,10 @@ def build_signal_bias_map(binance_data: dict, verdict: Optional[dict] = None) ->
             "last_price": float(data.get("last_price", 0) or 0),
             "long": long_pct,
             "short": short_pct,
+            "quant_verdict": quant_v or "NEUTRAL",
+            "quant_confidence": quant_conf,
+            "quant_reason": data.get("quant_reason", ""),
+            "quant_blocked": quant_blocked,
         }
 
     return bias_map

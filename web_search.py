@@ -485,6 +485,12 @@ async def _fetch_trend_data(session, symbol_binance: str, key: str) -> dict:
         # сигналы по MA = монетка).
         result.update(_compute_complexity_fields(closes))
 
+        # Сохраняем последние N daily closes для квант-фильтра (quant_filter.py).
+        # Используется в `fetch_realtime_prices` для расчёта BB/Donchian/RSI
+        # ансамбля с BTC-regime gate. Не отдаём агентам/юзеру — служебное поле
+        # с подчёркиванием. ~250 закрытий → ~2KB на актив, безопасно.
+        result["_closes_daily"] = closes[-250:]
+
     except Exception as e:
         logger.debug(f"Trend data {symbol_binance}: {e}")
     return result
@@ -843,6 +849,43 @@ async def fetch_realtime_prices() -> dict:
                 if "atr_14d" in yres:
                     prices[f"ATR_{k}"] = yres["atr_14d"]
 
+        # ── Квант-фильтр (deterministic mean-rev + BTC regime gate) ──
+        # Берёт сохранённые `_closes_daily` для каждой крипты, считает
+        # BB(20,2σ)+Donchian(20)+RSI(14)-ансамбль и гейтит BTC-трендом.
+        # На бэктесте 5 крипто × 365 дней даёт 65.9% hit-rate (vs 49.6% MA50/200),
+        # walk-forward стабильно ≥60% — см. ``docs/quant_research_v2.md``.
+        # Не падаем если модуль/closes недоступны.
+        try:
+            from quant_filter import quant_verdict as _quant_verdict
+            btc_closes = (
+                prices.get("BTC", {}).get("_closes_daily")
+                if "BTC" in prices
+                else None
+            )
+            for k in ("BTC", "ETH", "SOL", "BNB", "XRP"):
+                if k not in prices:
+                    continue
+                own_closes = prices[k].get("_closes_daily")
+                if not own_closes:
+                    continue
+                try:
+                    qv = _quant_verdict(
+                        own_closes,
+                        btc_closes if k != "BTC" else None,
+                    )
+                except Exception as e:
+                    logger.debug(f"quant_verdict {k}: {e}")
+                    continue
+                prices[k]["quant_verdict"] = qv.get("verdict", "NEUTRAL")
+                prices[k]["quant_confidence"] = qv.get("confidence", 0)
+                prices[k]["quant_reason"] = qv.get("reason", "")
+                prices[k]["quant_components"] = qv.get("components", {})
+                prices[k]["quant_status"] = qv.get("status", "ok")
+        except ImportError:
+            logger.debug("quant_filter module not available, skipping")
+        except Exception as e:
+            logger.warning(f"Quant filter pass error: {e}")
+
         # Макро: prices + MA-тренд
         for key, val in [("SPX", spx), ("NDX", ndx), ("VIX", vix),
                          ("DXY", dxy), ("OIL_WTI", oil), ("GOLD", gold)]:
@@ -1127,6 +1170,38 @@ def _sl_tp_lines(
     return [long_line, short_line]
 
 
+def _quant_verdict_line(p: dict, indent: str = "    ") -> str | None:
+    """Одна строка с вердиктом квант-фильтра (BB+Donchian+RSI + BTC gate).
+
+    Формат::
+
+        🟢 Quant: LONG (90%)  BB≤0.1, RSI<30, Donchian-20 пробой вниз; BTC LONG подтверждает
+        ⚪️ Quant: NEUTRAL (0%)  без конфлюэнции (NEUTRAL)
+
+    Показываем под trigger/SL-TP-блоком как «дополнительный сигнал». Это
+    deterministic-вердикт, который на бэктесте показывал 65.9% hit-rate на
+    1-5д горизонте (vs MA50/200 → 49.6%). Используется и для отображения, и
+    для post-processing LLM-вердикта в /daily (см. quant_filter.reconcile_with_llm).
+
+    Возвращает None если поля отсутствуют (короткий ряд, упал фетчер).
+    """
+    verdict = p.get("quant_verdict")
+    if not verdict:
+        return None
+    confidence = p.get("quant_confidence", 0)
+    reason = p.get("quant_reason", "")
+    if verdict == "LONG":
+        emoji = "🟢"
+    elif verdict == "SHORT":
+        emoji = "🔴"
+    else:
+        emoji = "⚪️"
+    line = f"{indent}{emoji} Quant: {verdict} ({confidence}%)"
+    if reason:
+        line += f"  {reason}"
+    return line
+
+
 def _trigger_lines(
     p: dict,
     indent: str = "    ",
@@ -1236,6 +1311,14 @@ def format_prices_for_agents(prices: dict, *, for_user: bool = False) -> str:
             # (вместе со строкой `🔄 ... σ̂=...%`).
             for t in _sl_tp_lines(p, asset=k):
                 lines.append(t)
+
+            # Квант-фильтр (BB+Donchian+RSI ансамбль + BTC regime gate).
+            # На бэктесте 65.9% hit-rate vs 49.6% MA50/200. Появляется
+            # только если есть достаточно истории (60+ дневок); см.
+            # ``quant_filter.py`` и ``docs/quant_research_v2.md``.
+            ql = _quant_verdict_line(p)
+            if ql:
+                lines.append(ql)
 
             # Тренд и MA — адаптивная точность через _fmt_money:
             # XRP MA50=$1.30 раньше рендерился как `$1`, Synth писал «$1 (MA50)».
