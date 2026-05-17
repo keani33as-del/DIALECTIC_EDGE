@@ -1015,7 +1015,54 @@ def _extract_invalidation(report_text: str) -> str:
     return ""
 
 
-def build_digest_context(report_text: str, source_news: str = "") -> dict:
+def _aggregate_quant_verdicts(
+    quant_map: dict[str, dict] | None,
+) -> tuple[str, int, dict]:
+    """Сжимает per-symbol quant verdicts в один overall (для /daily).
+
+    Возвращает (overall_verdict, confidence_avg, summary_dict):
+      • overall_verdict — большинство голосов LONG/SHORT, требуем минимум 2 голоса
+        и положительный margin. На паритете → NEUTRAL.
+      • confidence_avg — средняя уверенность активных голосов (0..100).
+      • summary_dict — {sym: verdict} для логирования / отображения.
+
+    Используется для post-processing LLM-вердикта в /daily через
+    `reconcile_with_llm`: при сильном конфликте LLM↔quant LLM-вердикт
+    демоутится до NEUTRAL, чтобы не торговать против price-action.
+    """
+    if not quant_map:
+        return "NEUTRAL", 0, {}
+    summary: dict[str, str] = {}
+    longs = 0
+    shorts = 0
+    confidences: list[float] = []
+    for sym, qv in quant_map.items():
+        v = (qv.get("verdict") or "").upper()
+        if v not in ("LONG", "SHORT", "NEUTRAL"):
+            continue
+        summary[sym] = v
+        if v == "LONG":
+            longs += 1
+        elif v == "SHORT":
+            shorts += 1
+        conf = qv.get("confidence")
+        if isinstance(conf, (int, float)) and v != "NEUTRAL":
+            confidences.append(float(conf))
+    overall = "NEUTRAL"
+    if longs >= 2 and longs > shorts:
+        overall = "LONG"
+    elif shorts >= 2 and shorts > longs:
+        overall = "SHORT"
+    confidence_avg = int(round(sum(confidences) / len(confidences))) if confidences else 0
+    return overall, confidence_avg, summary
+
+
+def build_digest_context(
+    report_text: str,
+    source_news: str = "",
+    *,
+    quant_verdict_map: dict[str, dict] | None = None,
+) -> dict:
     verdict = extract_verdict(report_text)
     plans = extract_trade_plans(report_text)
 
@@ -1064,6 +1111,38 @@ def build_digest_context(report_text: str, source_news: str = "") -> dict:
     plain_language = _strip_leading_punct(plain_language)
     eli5 = extract_eli5(report_text)
 
+    # ── Квант-фильтр reconcile: LLM-вердикт vs детерминистический ансамбль ──
+    # Берёт per-symbol quant verdicts из автотрейдер-каркаса (BB+Donchian+RSI
+    # + BTC regime gate), сжимает в overall LONG/SHORT/NEUTRAL и сверяет с
+    # LLM-вердиктом из synthesis. Если они сильно расходятся (LLM BUY vs
+    # quant SHORT) — финальный verdict демоутится до NEUTRAL, потому что
+    # 50/50 это монетка. Бэктест: 65.9% hit-rate vs 49.6% — см.
+    # ``docs/quant_research_v2.md`` и ``quant_filter.py``.
+    quant_overall = "NEUTRAL"
+    quant_confidence = 0
+    quant_summary: dict[str, str] = {}
+    quant_note = ""
+    llm_verdict = verdict  # фиксируем оригинал LLM для логирования
+
+    if quant_verdict_map:
+        quant_overall, quant_confidence, quant_summary = _aggregate_quant_verdicts(
+            quant_verdict_map
+        )
+        try:
+            from quant_filter import reconcile_with_llm
+            verdict_norm, note = reconcile_with_llm(verdict, quant_overall)
+            quant_note = note
+            # Маппинг обратно в BUY/SELL/NEUTRAL (наш VERDICT_LABELS space)
+            if verdict_norm == "LONG":
+                verdict = "BUY"
+            elif verdict_norm == "SHORT":
+                verdict = "SELL"
+            else:
+                verdict = "NEUTRAL"
+        except Exception:
+            # graceful-degradation: оставляем LLM-вердикт как был
+            pass
+
     return {
         "verdict": verdict,
         "verdict_label": VERDICT_LABELS.get(verdict, VERDICT_LABELS["NEUTRAL"]),
@@ -1078,6 +1157,13 @@ def build_digest_context(report_text: str, source_news: str = "") -> dict:
         "plans": actionable,
         "watch_levels": watch_levels,
         "full_report": report_text or "",
+        # Quant-filter метаданные. Полезно для UI («LLM BUY vs quant SHORT
+        # → NEUTRAL»), логирования в DIGEST_CACHE и backtest-сверки.
+        "llm_verdict": llm_verdict,
+        "quant_verdict": quant_overall,
+        "quant_confidence": quant_confidence,
+        "quant_summary": quant_summary,
+        "quant_note": quant_note,
     }
 
 

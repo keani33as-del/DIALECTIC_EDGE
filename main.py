@@ -166,6 +166,40 @@ from refactor.handlers.debate_handler import debate_cache, show_debate_round  # 
 _plan_table_cache: dict[int, tuple[list, dict]] = {}
 
 
+def _quant_map_from_prices(prices: dict | None) -> dict[str, dict]:
+    """Извлекает per-symbol quant verdicts из словаря цен.
+
+    ``web_search.fetch_realtime_prices`` обогащает каждый актив полями
+    ``quant_verdict``/``quant_confidence``/``quant_reason``/``quant_components``/
+    ``quant_status`` (см. quant_filter.py). Здесь сжимаем в формат,
+    понятный для ``core.digest_context.build_digest_context`` (передаётся
+    в ``quant_verdict_map=``).
+
+    Только crypto-активы (5 штук) учитываем — для акций / commodities
+    quant-фильтр не имеет смысла (другой режим, другие индикаторы).
+    Если quant_verdict отсутствует — пропускаем; пустой dict означает «не
+    применять фильтр» (graceful-degradation до сырого LLM-вердикта).
+    """
+    if not prices:
+        return {}
+    crypto_keys = ("BTC", "ETH", "SOL", "BNB", "XRP")
+    out: dict[str, dict] = {}
+    for key in crypto_keys:
+        p = prices.get(key) if isinstance(prices, dict) else None
+        if not isinstance(p, dict):
+            continue
+        verdict = p.get("quant_verdict")
+        if not verdict:
+            continue
+        out[key] = {
+            "verdict": verdict,
+            "confidence": p.get("quant_confidence", 0),
+            "reason": p.get("quant_reason", ""),
+            "components": p.get("quant_components", {}),
+        }
+    return out
+
+
 def get_bot() -> Bot:
     global bot
     if bot is None:
@@ -734,7 +768,12 @@ def build_short_report(parts: dict, stars: str, pct: int, horizon: HorizonPack |
     now = datetime.now().strftime("%d.%m.%Y %H:%M")
     full = parts.get("full", "")
 
-    digest_ctx = build_digest_context(full)
+    # Квант-фильтр (BB+Donchian+RSI ансамбль + BTC gate) пост-обрабатывает
+    # LLM-вердикт: при сильном конфликте overall quant ↔ LLM, вердикт демоутится
+    # до NEUTRAL (см. core.digest_context.build_digest_context). Бэктест:
+    # 65.9% hit-rate vs 49.6% MA50/200 — docs/quant_research_v2.md.
+    quant_map = _quant_map_from_prices(prices)
+    digest_ctx = build_digest_context(full, quant_verdict_map=quant_map)
     verdict_label = digest_ctx.get("verdict_label", "Нейтральный")
     verdict_emoji = digest_ctx.get("verdict_emoji", "⚪️")
     verdict_reason = digest_ctx.get("verdict_reason", "")
@@ -1004,8 +1043,12 @@ async def send_daily_digest_bundle(
     # PR #34: кэшируем plans+prices для кнопки «📊 Показать таблицу плана».
     # plans берём из digest_context (он же используется в build_short_report
     # для рендера grouped-layout). Если plans пуст — кнопку не покажем,
-    # чтобы не клацать впустую и не путать юзера.
-    digest_ctx = build_digest_context(report or "")
+    # чтобы не клацать впустую и не путать юзера. Передаём quant_verdict_map
+    # для консистентности с основным digest-блоком (reconcile LLM↔quant).
+    digest_ctx = build_digest_context(
+        report or "",
+        quant_verdict_map=_quant_map_from_prices(prices_dict),
+    )
     plans_for_table = digest_ctx.get("plans") or []
     has_plan_table = bool(plans_for_table) and bool(prices_dict)
     if has_plan_table:
