@@ -1594,6 +1594,52 @@ def format_prices_minimal(
     return "\n\n".join(parts)
 
 
+# ─── /markets per-section full renderer ───────────────────────────────────────
+# Юзер: «было детальнее, верни всю инфу — но per-section». Идея: тот же
+# рич-формат, что и `format_prices_for_agents(for_user=True)`, только
+# фильтруем по секции (КРИПТОРЫНОК / МАКРОЭКОНОМИКА США / ФОНДОВЫЕ ИНДЕКСЫ /
+# СЫРЬЁ И ВАЛЮТЫ). Не дублирую логику — режу готовый текст по заголовкам.
+_SECTION_HEADER_RAW: dict[str, str] = {
+    "crypto":  "[КРИПТОРЫНОК]",
+    "macro":   "[МАКРОЭКОНОМИКА США]",
+    "indices": "[ФОНДОВЫЕ ИНДЕКСЫ]",
+    "commod":  "[СЫРЬЁ И ВАЛЮТЫ]",
+}
+
+
+def format_prices_section(prices: dict, *, section: str = "all") -> str:
+    """Per-секционный рендер цен с полной информацией (24ч/7д/30д, MA-триггеры,
+    SL/TP LONG/SHORT, Quant-вердикт, ТРЕНД+MA50/200, Random walk/Markov, объём).
+
+    `section`:
+      • ``crypto`` — BTC/ETH/SOL/BNB/XRP блок
+      • ``macro``  — ФРС / CPI / F&G
+      • ``indices``— SPX / NDX / VIX
+      • ``commod`` — Oil WTI / Gold / DXY
+      • ``all``    — всё подряд (то же что `format_prices_for_agents(for_user=True)`)
+    Возвращает текст с пустыми строками между активами и заголовком секции
+    (`[КРИПТОРЫНОК]` и т.д.) — совместимо со старым форматом /markets.
+    """
+    if not prices:
+        return "Рыночные данные временно недоступны."
+    full = format_prices_for_agents(prices, for_user=True)
+    if section == "all":
+        return full.lstrip("\n")
+    header = _SECTION_HEADER_RAW.get(section)
+    if not header:
+        return ""
+    marker = "\n" + header
+    idx = full.find(marker)
+    if idx < 0:
+        return ""
+    start = idx + 1  # пропускаем ведущий "\n", оставляем "[ЗАГОЛОВОК]"
+    # Конец секции — начало следующего заголовка (любой `\n[...]`).
+    rest = full[start + len(header):]
+    next_idx = rest.find("\n[")
+    end = start + len(header) + (next_idx if next_idx >= 0 else len(rest))
+    return full[start:end].rstrip()
+
+
 async def get_full_realtime_context(*, for_user: bool = False) -> tuple[dict, str]:
     """Тянет prices + рендерит. `for_user=True` использует читаемый формат
     для команды /markets (без AI-инструкций / дубль-заголовка, с пустыми
