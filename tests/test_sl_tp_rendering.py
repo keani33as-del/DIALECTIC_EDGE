@@ -7,7 +7,7 @@
   2. Graceful-degradation: нет σ̂ / нет цены / нулевая σ̂ → пусто.
   3. `format_prices_for_agents` пропускает блок через интеграционно —
      строка реально видна в выводе `/markets`.
-  4. Tick-size для XRP — 0.1 (Bybit Spot), для BTC — 0.01.
+  4. Tick-size для XRP — 0.0001 (Bybit Spot, 4 знака), для BTC — 0.01.
   5. R/R = 2:1 (TP_dist = 2·SL_dist в абсолюте).
   6. Помощь `/help markets` ссылается на новую SL/TP-строку.
 
@@ -113,24 +113,30 @@ class TestSlTpLines(unittest.TestCase):
         self.assertIn("(+2.5%)", short_line)
         self.assertIn("R/R 2:1", short_line)
 
-    def test_xrp_tick_rounding_to_one_decimal(self):
-        # XRP на Bybit Spot — 1 знак после точки. Без округления у нас
-        # вылетают ордера вида $1.4567 — Bybit reject.
-        # price=1.46, σ̂=2.5% → SL=3.75%, TP=7.5%
-        # LONG TP = 1.46 × 1.075 = 1.5695 → 1.6 (tick=0.1)
-        # LONG SL = 1.46 × 0.9625 = 1.4053 → 1.4
-        # SHORT TP = 1.46 × 0.925 = 1.3505 → 1.4
-        # SHORT SL = 1.46 × 1.0375 = 1.5148 → 1.5
+    def test_xrp_tick_rounding_to_4_decimals(self):
+        # XRP на Bybit Spot — 4 знака после точки (tick=0.0001).
+        # Раньше был 0.1 и это ломало превью: при σ̂≥3% все три
+        # уровня (entry/SL/TP) схлопывались в одно число → R/R=0.0x.
+        # Ныне при price=1.46, σ̂=2.5% → SL=3.75%, TP=7.5%:
+        # LONG TP = 1.46 × 1.075 = 1.5695   (tick=0.0001 → 1.5695)
+        # LONG SL = 1.46 × 0.9625 = 1.4052   (tick=0.0001 → 1.4052)
+        # SHORT TP = 1.46 × 0.925 = 1.3505   (tick=0.0001 → 1.3505)
+        # SHORT SL = 1.46 × 1.0375 = 1.5148  (tick=0.0001 → 1.5148)
+        # `_fmt_money_compact` сжимает цены 1 ≤ v < 100 до 2 знаков — это
+        # формат показа, не round (в ордер уходит полный 4-десятичный tick).
         lines = _sl_tp_lines({"price": 1.46, "vol_sigma_1d_pct": 2.5}, "XRP")
         self.assertEqual(len(lines), 2)
         long_line, short_line = lines
-        # Точные значения — кратные 0.1 (1.4 / 1.5 / 1.6) после tick-rounding.
-        # `_fmt_money` сохраняет 2 знака для цен ≤ $10 — это норм, главное,
-        # что вторая цифра — всегда `0`.
-        self.assertIn("$1.60", long_line)
-        self.assertIn("$1.40", long_line)
-        self.assertIn("$1.40", short_line)
-        self.assertIn("$1.50", short_line)
+        # 1.5695 → `1.57`, 1.4052 → `1.41` (2-десятичный показ).
+        self.assertIn("$1.57", long_line)
+        self.assertIn("$1.41", long_line)
+        # 1.3505 → `1.35`, 1.5148 → `1.51`.
+        self.assertIn("$1.35", short_line)
+        self.assertIn("$1.51", short_line)
+        # Самое главное: SL ≠ entry (раньше 1.46 → 1.5 → выбоина).
+        # И в выводе не должно быть равных уровней рядом.
+        self.assertNotIn("$1.4 ", long_line)  # 1-decimal artefact
+        self.assertNotIn("$1.5 ", long_line)
 
     def test_rr_ratio_is_two(self):
         # Геометрия: TP_dist = 2 × SL_dist для R/R = 2:1.
