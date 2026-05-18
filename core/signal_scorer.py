@@ -168,7 +168,13 @@ def _direction_from_trend(p: dict) -> str:
 
 
 def _score_trend(p: dict, direction: str) -> tuple[int, str]:
-    """30 pts за наличие тренда + 0/30 split."""
+    """30 pts за наличие тренда + 0/30 split.
+
+    Формат строки: «UPTREND ✓ (vs MA50 +5.3%, MA200 +13.2%)».
+    `{:+.1f}` всегда даёт знак — `+5.3` или `-15.0` — поэтому невозможна
+    деформированная строка вида «+-15.0%» (была раньше когда trend помечен
+    UPTREND, но цена фактически ниже MA50 — рассинхрон данных).
+    """
     if direction == "NONE":
         return 0, "SIDEWAYS / нет MA → trade-кандидата нет"
     ma50 = p.get("ma50")
@@ -176,14 +182,13 @@ def _score_trend(p: dict, direction: str) -> tuple[int, str]:
     price = p.get("price")
     if not all(isinstance(x, (int, float)) for x in (price, ma50, ma200)):
         return 0, "Нет MA50/MA200 для верификации тренда"
-    if direction == "LONG":
-        pct50 = (price - ma50) / ma50 * 100
-        pct200 = (price - ma200) / ma200 * 100
-        return 30, f"UPTREND ✓ (цена выше MA50 +{pct50:.1f}%, MA200 +{pct200:.1f}%)"
-    # SHORT
-    pct50 = (ma50 - price) / ma50 * 100
-    pct200 = (ma200 - price) / ma200 * 100
-    return 30, f"DOWNTREND ✓ (цена ниже MA50 -{pct50:.1f}%, MA200 -{pct200:.1f}%)"
+    # Знаковая дельта от MA: положительная = выше MA, отрицательная = ниже.
+    # Считаем одинаково для LONG и SHORT — заголовок UPTREND/DOWNTREND и так
+    # ясно показывает направление, а числа должны быть честные.
+    pct50 = (price - ma50) / ma50 * 100
+    pct200 = (price - ma200) / ma200 * 100
+    label = "UPTREND" if direction == "LONG" else "DOWNTREND"
+    return 30, f"{label} ✓ (vs MA50 {pct50:+.1f}%, MA200 {pct200:+.1f}%)"
 
 
 def _score_complexity(p: dict) -> tuple[int, str]:
@@ -370,10 +375,16 @@ def rank_signals(
 
     Returns dict:
       {
-        "top": Optional[SignalSetup],  # лучший setup ≥ min_score, или None
-        "scored": list[AssetScore],     # все активы, отсортированы по total ↓
-        "capital": float,
-        "min_score": int,
+        "top":          Optional[SignalSetup],  # setup ≥ min_score, или None.
+        "preview_top":  Optional[SignalSetup],  # лучший tradable ниже порога —
+                                                 # используется UI для preview-блока
+                                                 # «вот как выглядел бы вход, но
+                                                 # сегодня сидим». None если top
+                                                 # найден или нет ни одного
+                                                 # tradable кандидата с σ̂.
+        "scored":       list[AssetScore],       # все активы, по total ↓
+        "capital":      float,
+        "min_score":    int,
       }
     """
     scored: list[AssetScore] = []
@@ -397,8 +408,23 @@ def rank_signals(
             top = setup
             break
 
+    # preview_top: лучший tradable кандидат с σ̂, даже если score ниже порога.
+    # Нужен формату «Лучшая сделка» чтобы и в «сидим» режиме показывать
+    # уровни SL/TP/explain — иначе кнопка ощущается как «висим без причины».
+    # Если top уже найден — preview_top избыточен.
+    preview_top: Optional[SignalSetup] = None
+    if top is None:
+        for s in scored:
+            setup = make_setup(
+                s, prices[s.asset], capital, min_score=0, size_fraction=size_fraction,
+            )
+            if setup is not None:
+                preview_top = setup
+                break
+
     return {
         "top": top,
+        "preview_top": preview_top,
         "scored": scored,
         "capital": float(capital),
         "min_score": int(min_score),

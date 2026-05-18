@@ -3760,18 +3760,165 @@ async def cmd_signals_deprecated(message: Message):
 
 # ─── /signal — auto SL/TP recommender ─────────────────────────────────────────
 
+def _render_setup_block(
+    top,
+    scored: list,
+    capital: float,
+    min_score: int,
+    *,
+    is_preview: bool,
+) -> list[str]:
+    """Рендерит блок «Почему / Вход-Stop-Target / Риски» для готового setup'а.
+
+    Используется обеими ветками `_fmt_signal_message`:
+      • is_preview=False — score ≥ порога, торгуемая рекомендация.
+      • is_preview=True  — лучший tradable кандидат ниже порога; ставим
+        предупреждение «повышенный риск» и в «Почему» объясняем чего не
+        хватает (нулевые компоненты scoring'а).
+
+    Возвращает список строк — caller клеит их в общее сообщение.
+    """
+    lines: list[str] = []
+    emoji = "📈" if top.direction == "LONG" else "📉"
+    stars = "⭐" * min(5, max(1, top.score // 20))
+
+    # Заголовок: в preview ясно маркируем что это не торгуемая рекомендация.
+    if is_preview:
+        lines.append(
+            f"🟡 *ЛУЧШИЙ КАНДИДАТ:* {top.asset} *{top.direction}* {emoji}"
+        )
+        lines.append(
+            f"_(score {top.score}/{min_score} — ниже порога. Preview уровней; "
+            f"повышенный риск входа.)_"
+        )
+    else:
+        lines.append(f"🥇 *ТОП SETUP:* {top.asset} *{top.direction}* {emoji}")
+    lines.append("")
+
+    # ── Почему именно эта сделка ──
+    # Сравниваем с #2: если есть отрыв — подсвечиваем; если top единственный
+    # прошёл порог — говорим об этом. Это снимает вопрос «а почему не X?».
+    runner_up = next(
+        (s for s in scored if s.asset != top.asset and s.direction != "NONE"),
+        None,
+    )
+    # Если над нами в scored есть кандидат с БОЛЬШИМ score, но он
+    # отброшен make_setup (не tradable / нет σ̂) — нужно объяснить почему
+    # «лучший по очкам» не = «лучший trade».
+    higher_non_tradable = next(
+        (
+            s for s in scored
+            if s.total > top.score and s.direction != "NONE" and s.asset != top.asset
+        ),
+        None,
+    )
+
+    lines.append("*Почему эта сделка:*")
+    lines.append(
+        f"• Score *{top.score}/100* {stars} — "
+        f"{'лучший tradable среди' if is_preview else 'лучший среди'} "
+        f"{len(scored)} сканированных."
+    )
+    if higher_non_tradable is not None:
+        # VIX/GOLD/SPX и пр. — в топе по score, но не торгуются на споте Bybit.
+        lines.append(
+            f"• Выше по score: {higher_non_tradable.asset} "
+            f"{higher_non_tradable.total}/100 — но это индекс/сырьё, не торгуется "
+            f"на споте Bybit (TRADABLE_ASSETS = BTC/ETH/SOL/BNB/XRP)."
+        )
+    elif runner_up is not None:
+        gap = top.score - runner_up.total
+        if gap > 0:
+            lines.append(
+                f"• Отрыв от #2 ({runner_up.asset} {runner_up.total}/100): +{gap} pts."
+            )
+        else:
+            lines.append(
+                f"• #2 — {runner_up.asset} {runner_up.total}/100 (ничья, но "
+                f"{top.asset} торгуется на споте Bybit)."
+            )
+    lines.append(
+        f"• R/R = {top.rr_ratio}x: ловим в {top.rr_ratio:.1f} раза больше "
+        f"чем рискуем — это «+EV» при winrate ≥ {100/(1+top.rr_ratio):.0f}%."
+    )
+
+    # Ключевые «почему» — первые 3 наиболее содержательных reason'a.
+    # В preview-режиме это становится диагностикой «чего не хватает».
+    for r in top.reasons[:3]:
+        lines.append(f"• {r}")
+    lines.append("")
+
+    # ── Уровни SL/TP ──
+    lines.append("*Вход / Stop / Target:*")
+    lines.append("```")
+    lines.append(f"Entry:   ${top.entry}   (рыночный)")
+    sigma_pct = top.sigma_1d_pct or 1.0  # защита от деления на 0
+    lines.append(
+        f"Stop:    ${top.stop}   ({top.stop_pct:+.1f}% = "
+        f"{top.stop_pct / sigma_pct:+.1f}σ̂)   — если хит, выходим"
+    )
+    lines.append(
+        f"Target:  ${top.target}   ({top.target_pct:+.1f}% = "
+        f"{top.target_pct / sigma_pct:+.1f}σ̂)   — фиксируем профит"
+    )
+    lines.append(f"R/R:     {top.rr_ratio}x")
+    lines.append(
+        f"Size:    ${top.size_usd}   ({top.size_usd / capital * 100:.0f}% от ${capital:.0f})"
+    )
+    lines.append("```")
+
+    # ── Риски этой сделки ──
+    sl_loss_usd = top.size_usd * abs(top.stop_pct) / 100.0
+    tp_gain_usd = top.size_usd * abs(top.target_pct) / 100.0
+    sl_loss_pct = sl_loss_usd / capital * 100 if capital > 0 else 0.0
+    tp_gain_pct = tp_gain_usd / capital * 100 if capital > 0 else 0.0
+    lines.append("*Риски этой сделки:*")
+    lines.append(
+        f"• Если SL hit → потеря ≈ ${sl_loss_usd:.2f} "
+        f"({sl_loss_pct:.1f}% от капитала)."
+    )
+    lines.append(
+        f"• Если TP hit → прибыль ≈ ${tp_gain_usd:.2f} "
+        f"({tp_gain_pct:.1f}% от капитала)."
+    )
+    lines.append(
+        f"• Дневная σ̂ ≈ {top.sigma_1d_pct:.2f}%/день — "
+        f"стоп даёт {abs(top.stop_pct / sigma_pct):.1f}σ запаса от обычного шума."
+    )
+    # Слабое место: если какой-то reason явно «нулевой» — выносим в риски.
+    weak_marker = (
+        " 0 pts", "не отвергает", "против trade", "нет edge", "trade-кандидата нет",
+    )
+    weak_reasons = [r for r in top.reasons if any(m in r for m in weak_marker)]
+    if weak_reasons:
+        lines.append(f"• Слабое место: {weak_reasons[0]}")
+    if is_preview:
+        # В preview-режиме явно говорим «не торгуй» — это не торгуемая рекомендация.
+        lines.append(
+            f"• Score {top.score}/{min_score} — ниже порога. Если входишь "
+            f"всё равно, уменьши size минимум вдвое."
+        )
+    lines.append("")
+
+    lines.append("⚠️ _Это suggestion, не приказ. Подтверди вход в Bybit вручную._")
+    lines.append("⚠️ _SL — рыночный. Округлено до tick биржи (XRP=0.1, BTC=0.01 и т.д.)._")
+    return lines
+
+
 def _fmt_signal_message(result: dict) -> str:
     """Рендерит результат `rank_signals(...)` в Telegram-сообщение.
 
     Format:
       • Если top != None → один setup с уровнями SL/TP, R/R, size, score
         и списком обоснований.
-      • Если top == None → «сегодня сидим» + top-3 кандидатов по score
-        с короткими причинами почему недоторговываем.
+      • Если top == None И preview_top != None → preview-блок: те же
+        уровни но с пометкой «🟡 ниже порога — повышенный риск».
+      • Иначе → «сегодня сидим» + top-3 кандидатов по score
+        (нет tradable кандидата вообще — все SIDEWAYS или non-TRADABLE).
 
-    Это деёт пользователю либо одну конкретную рекомендацию (одно
-    нажатие в Bybit), либо понятный «не торгуй сегодня» — без
-    необходимости вручную скоррелировать `/markets` через 11 активов.
+    Это даёт пользователю либо одну конкретную рекомендацию (одно
+    нажатие в Bybit), либо preview лучшего варианта с уровнями, либо
+    честный «сегодня нечего».
     """
     from core.signal_scorer import SignalSetup
 
@@ -3779,6 +3926,7 @@ def _fmt_signal_message(result: dict) -> str:
     min_score = result.get("min_score", 60)
     scored = result.get("scored") or []
     top = result.get("top")
+    preview_top = result.get("preview_top")
 
     lines: list[str] = []
     lines.append("🎯 *АВТО-СИГНАЛ* (детерминированный scoring)")
@@ -3787,103 +3935,23 @@ def _fmt_signal_message(result: dict) -> str:
     lines.append("")
 
     if isinstance(top, SignalSetup):
-        # ── Setup найден ──
-        emoji = "📈" if top.direction == "LONG" else "📉"
-        stars = "⭐" * min(5, max(1, top.score // 20))
-        lines.append(f"🥇 *ТОП SETUP:* {top.asset} *{top.direction}* {emoji}")
+        # ── Полноценный setup найден (score ≥ порога) ──
+        lines.extend(
+            _render_setup_block(
+                top, scored, capital, min_score, is_preview=False,
+            )
+        )
+    elif isinstance(preview_top, SignalSetup):
+        # ── Preview: есть tradable кандидат с σ̂, но score ниже порога ──
+        lines.append("⚪ *Чистого setup нет — score ниже порога.* Сидим.")
         lines.append("")
-
-        # ── Почему именно эта сделка ──
-        # Сравниваем с #2: если есть отрыв — подсвечиваем; если top единственный
-        # прошёл порог — говорим об этом. Это снимает вопрос «а почему не X?».
-        runner_up = next(
-            (s for s in scored if s.asset != top.asset and s.direction != "NONE"),
-            None,
+        lines.extend(
+            _render_setup_block(
+                preview_top, scored, capital, min_score, is_preview=True,
+            )
         )
-        lines.append("*Почему эта сделка:*")
-        lines.append(
-            f"• Score *{top.score}/100* {stars} — лучший среди {len(scored)} сканированных."
-        )
-        if runner_up is not None:
-            gap = top.score - runner_up.total
-            if gap > 0:
-                lines.append(
-                    f"• Отрыв от #2 ({runner_up.asset} {runner_up.total}/100): +{gap} pts."
-                )
-            else:
-                lines.append(
-                    f"• #2 — {runner_up.asset} {runner_up.total}/100 (ничья, но "
-                    f"{top.asset} торгуется на споте Bybit)."
-                )
-        lines.append(
-            f"• R/R = {top.rr_ratio}x: ловим в {top.rr_ratio:.1f} раза больше "
-            f"чем рискуем — это «+EV» при winrate ≥ {100/(1+top.rr_ratio):.0f}%."
-        )
-
-        # Ключевые «почему» — берём первые 3 наиболее содержательных reason'a.
-        # `top.reasons` уже отфильтрованы scorer'ом и упорядочены по
-        # компонентам (trend → complexity → vrt → markov → raw). Первые
-        # три обычно покрывают «направление + структура».
-        for r in top.reasons[:3]:
-            lines.append(f"• {r}")
-        lines.append("")
-
-        # ── Уровни SL/TP ──
-        # Явно подписываем что Stop = «выходим если так и не пошло», Target =
-        # «фиксируем профит». σ̂-кратность даёт интуицию «сколько дневных
-        # волатильностей до уровня».
-        lines.append("*Вход / Stop / Target:*")
-        lines.append("```")
-        lines.append(f"Entry:   ${top.entry}   (рыночный)")
-        sigma_pct = top.sigma_1d_pct or 1.0  # защита от деления на 0
-        lines.append(
-            f"Stop:    ${top.stop}   ({top.stop_pct:+.1f}% = "
-            f"{top.stop_pct / sigma_pct:+.1f}σ̂)   — если хит, выходим"
-        )
-        lines.append(
-            f"Target:  ${top.target}   ({top.target_pct:+.1f}% = "
-            f"{top.target_pct / sigma_pct:+.1f}σ̂)   — фиксируем профит"
-        )
-        lines.append(f"R/R:     {top.rr_ratio}x")
-        lines.append(
-            f"Size:    ${top.size_usd}   ({top.size_usd / capital * 100:.0f}% от ${capital:.0f})"
-        )
-        lines.append("```")
-
-        # ── Риски этой сделки ──
-        # Считаем USD-потерю на стопе и потенциал на таргете — даём
-        # пользователю сразу абсолютные цифры, чтобы он мог сопоставить
-        # с дневным risk-budget'ом.
-        sl_loss_usd = top.size_usd * abs(top.stop_pct) / 100.0
-        tp_gain_usd = top.size_usd * abs(top.target_pct) / 100.0
-        sl_loss_pct = sl_loss_usd / capital * 100 if capital > 0 else 0.0
-        tp_gain_pct = tp_gain_usd / capital * 100 if capital > 0 else 0.0
-        lines.append("*Риски этой сделки:*")
-        lines.append(
-            f"• Если SL hit → потеря ≈ ${sl_loss_usd:.2f} "
-            f"({sl_loss_pct:.1f}% от капитала)."
-        )
-        lines.append(
-            f"• Если TP hit → прибыль ≈ ${tp_gain_usd:.2f} "
-            f"({tp_gain_pct:.1f}% от капитала)."
-        )
-        lines.append(
-            f"• Дневная σ̂ ≈ {top.sigma_1d_pct:.2f}%/день — "
-            f"стоп даёт {abs(top.stop_pct / sigma_pct):.1f}σ запаса от обычного шума."
-        )
-        # Слабое место: если какой-то reason явно «нулевой» — выносим в риски.
-        weak_marker = (
-            " 0 pts", "не отвергает", "против trade", "нет edge", "trade-кандидата нет",
-        )
-        weak_reasons = [r for r in top.reasons if any(m in r for m in weak_marker)]
-        if weak_reasons:
-            lines.append(f"• Слабое место: {weak_reasons[0]}")
-        lines.append("")
-
-        lines.append("⚠️ _Это suggestion, не приказ. Подтверди вход в Bybit вручную._")
-        lines.append("⚠️ _SL — рыночный. Округлено до tick биржи (XRP=0.1, BTC=0.01 и т.д.)._")
     else:
-        # ── Setup не найден ──
+        # ── Вообще нет tradable кандидата (все SIDEWAYS / не-TRADABLE) ──
         lines.append("⚪ *Сегодня чистого setup нет.* Сидим.")
         lines.append("")
         if scored:

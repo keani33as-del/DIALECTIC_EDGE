@@ -414,6 +414,134 @@ class TestRankSignals(unittest.TestCase):
         self.assertIn("SOL", assets)
         self.assertNotIn("BROKEN", assets)
 
+    def test_preview_top_filled_when_below_threshold(self):
+        """Score < min_score, но tradable + есть σ̂ → preview_top set."""
+        # SOL ослабленный: trend UP, но complexity_hint=RANDOM_WALK (0 pts),
+        # VRT random_walk=True (0 pts), Markov FLAT (5 pts), raw=0.30 → ~5 pts.
+        # Итого: 30 + 0 + 0 + 5 + 5 ≈ 40/100 — ниже 60-порога.
+        weak_sol = {
+            "price": 90.58,
+            "trend": "UPTREND",
+            "ma50": 86.0,
+            "ma200": 80.0,
+            "complexity_hint": "RANDOM_WALK",
+            "tradeable_score": 0.30,
+            "vrt_random_walk": True,
+            "markov_state": "FLAT",
+            "vol_sigma_1d_pct": 3.20,
+        }
+        result = rank_signals({"SOL": weak_sol})
+        self.assertIsNone(result["top"], "score должен быть ниже 60")
+        self.assertIsNotNone(
+            result["preview_top"],
+            "preview_top должен показать уровни SOL даже при score<60",
+        )
+        self.assertEqual(result["preview_top"].asset, "SOL")
+        self.assertEqual(result["preview_top"].direction, "LONG")
+        self.assertLess(result["preview_top"].score, 60)
+
+    def test_preview_top_none_when_top_found(self):
+        """Если top уже есть (score≥порога) — preview_top избыточен."""
+        result = rank_signals({"SOL": _strong_uptrend_sol()})
+        self.assertIsNotNone(result["top"])
+        self.assertIsNone(result["preview_top"])
+
+    def test_preview_top_none_when_all_sideways(self):
+        """SIDEWAYS direction='NONE' → make_setup всегда отказывает → preview_top=None."""
+        result = rank_signals({"XRP": _xrp_sideways_yesterday()})
+        self.assertIsNone(result["top"])
+        self.assertIsNone(result["preview_top"])
+
+    def test_preview_top_skips_non_tradable_even_if_higher_score(self):
+        """VIX score 71/100 > SOL_weak 40/100, но VIX не TRADABLE → preview = SOL."""
+        weak_sol = {
+            "price": 90.58,
+            "trend": "UPTREND",
+            "ma50": 86.0,
+            "ma200": 80.0,
+            "complexity_hint": "RANDOM_WALK",
+            "tradeable_score": 0.30,
+            "vrt_random_walk": True,
+            "markov_state": "FLAT",
+            "vol_sigma_1d_pct": 3.20,
+        }
+        # VIX — заведомо высокий score, но в TRADABLE_ASSETS его нет.
+        strong_vix = {
+            "price": 18.5,
+            "trend": "UPTREND",
+            "ma50": 17.0,
+            "ma200": 15.0,
+            "complexity_hint": "TRENDING",
+            "tradeable_score": 0.70,
+            "vrt_random_walk": False,
+            "markov_state": "UP",
+            "markov_next_probs": {"UP": 0.55, "FLAT": 0.25, "DOWN": 0.20},
+            "vol_sigma_1d_pct": 4.50,
+        }
+        result = rank_signals({"VIX": strong_vix, "SOL": weak_sol})
+        self.assertIsNone(result["top"])
+        # preview_top должен указывать на SOL, не VIX
+        self.assertIsNotNone(result["preview_top"])
+        self.assertEqual(result["preview_top"].asset, "SOL")
+
+
+# ────────────────────────── _score_trend format ───────────────────────────
+
+
+class TestScoreTrendFormat(unittest.TestCase):
+    """Регрессии форматирования `_score_trend` (баг `+-15.0%`).
+
+    Раньше формула `+{pct50:.1f}%` ломалась при отрицательном `pct50` —
+    давала `+-15.0%`. После фикса используем `{:+.1f}` который вставляет
+    знак автоматически, без двойного `+-`.
+    """
+
+    def test_long_uptrend_positive_delta(self):
+        """LONG, цена выше MA — обе дельты положительные, знак `+`."""
+        p = {
+            "price": 100.0, "ma50": 90.0, "ma200": 80.0,
+            "trend": "UPTREND",
+        }
+        s = score_asset("BTC", p)
+        text = " ".join(s.reasons)
+        self.assertIn("UPTREND ✓", text)
+        # +11.1% от MA50, +25.0% от MA200
+        self.assertIn("MA50 +11.1%", text)
+        self.assertIn("MA200 +25.0%", text)
+        self.assertNotIn("+-", text)
+
+    def test_long_uptrend_negative_delta_no_double_sign(self):
+        """LONG помечен trend=UPTREND, но цена ниже MA50 (рассинхрон данных).
+
+        Это и есть баг из live: VIX 71/100 показывал «MA50 +-15.0%».
+        Должно быть просто `-15.0%`.
+        """
+        p = {
+            "price": 17.0, "ma50": 20.0, "ma200": 16.95,  # цена НИЖЕ MA50
+            "trend": "UPTREND",
+        }
+        s = score_asset("BTC", p)
+        text = " ".join(s.reasons)
+        self.assertIn("MA50 -15.0%", text)
+        self.assertNotIn("+-", text, msg=f"двойной знак не должен появляться: {text}")
+        self.assertNotIn("--", text)
+
+    def test_short_downtrend_negative_delta(self):
+        """SHORT, цена ниже MA — обе дельты отрицательные."""
+        p = {
+            "price": 65000.0, "ma50": 68000.0, "ma200": 72000.0,
+            "trend": "DOWNTREND",
+        }
+        s = score_asset("BTC", p)
+        text = " ".join(s.reasons)
+        self.assertIn("DOWNTREND ✓", text)
+        # (65000-68000)/68000*100 = -4.41% (round to -4.4)
+        # (65000-72000)/72000*100 = -9.72% (round to -9.7)
+        self.assertIn("MA50 -4.4%", text)
+        self.assertIn("MA200 -9.7%", text)
+        self.assertNotIn("--", text)
+        self.assertNotIn("+-", text)
+
 
 # ────────────────────────── _round_to_tick ────────────────────────────────
 
