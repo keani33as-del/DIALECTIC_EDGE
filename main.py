@@ -3760,6 +3760,17 @@ async def cmd_signals_deprecated(message: Message):
 
 # ─── /signal — auto SL/TP recommender ─────────────────────────────────────────
 
+def _md_escape_underscores(s: str) -> str:
+    """Экранирует `_` в Telegram Markdown V1.
+
+    Неэкранированный `_` трактуется как italic-разметка — из-за этого
+    `MEAN_REVERTING` приходил юзеру как `MEANREVERTING` (пара `_` съела
+    всё между ними в italic). Лечится бэкслэшем — в MD V1 `\\_` рендерится
+    как литеральный `_`.
+    """
+    return s.replace("_", r"\_")
+
+
 def _render_setup_block(
     top,
     scored: list,
@@ -3821,10 +3832,12 @@ def _render_setup_block(
     )
     if higher_non_tradable is not None:
         # VIX/GOLD/SPX и пр. — в топе по score, но не торгуются на споте Bybit.
+        # `BTC/ETH/SOL/BNB/XRP` в backtick'ах — MD V1 внутри code-span'а не
+        # парсит разметку, так что слеши и прочее безопасны.
         lines.append(
             f"• Выше по score: {higher_non_tradable.asset} "
             f"{higher_non_tradable.total}/100 — но это индекс/сырьё, не торгуется "
-            f"на споте Bybit (TRADABLE_ASSETS = BTC/ETH/SOL/BNB/XRP)."
+            f"на споте Bybit (торгуем только `BTC/ETH/SOL/BNB/XRP`)."
         )
     elif runner_up is not None:
         gap = top.score - runner_up.total
@@ -3844,8 +3857,11 @@ def _render_setup_block(
 
     # Ключевые «почему» — первые 3 наиболее содержательных reason'a.
     # В preview-режиме это становится диагностикой «чего не хватает».
+    # Reasons приходят из scorer'а и могут содержать `MEAN_REVERTING`,
+    # `RANDOM_WALK` и т.п. — экранируем `_` чтобы Telegram MD V1
+    # не трактовал их как italic-разметку.
     for r in top.reasons[:3]:
-        lines.append(f"• {r}")
+        lines.append(f"• {_md_escape_underscores(r)}")
     lines.append("")
 
     # ── Уровни SL/TP ──
@@ -3891,7 +3907,9 @@ def _render_setup_block(
     )
     weak_reasons = [r for r in top.reasons if any(m in r for m in weak_marker)]
     if weak_reasons:
-        lines.append(f"• Слабое место: {weak_reasons[0]}")
+        lines.append(
+            f"• Слабое место: {_md_escape_underscores(weak_reasons[0])}"
+        )
     if is_preview:
         # В preview-режиме явно говорим «не торгуй» — это не торгуемая рекомендация.
         lines.append(
@@ -3901,7 +3919,7 @@ def _render_setup_block(
     lines.append("")
 
     lines.append("⚠️ _Это suggestion, не приказ. Подтверди вход в Bybit вручную._")
-    lines.append("⚠️ _SL — рыночный. Округлено до tick биржи (XRP=0.1, BTC=0.01 и т.д.)._")
+    lines.append("⚠️ _SL — рыночный. Округлено до tick биржи (XRP=0.0001, BTC=0.01 и т.д.)._")
     return lines
 
 
