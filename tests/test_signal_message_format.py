@@ -168,7 +168,7 @@ class TestFmtSignalMessageSetupFound(unittest.TestCase):
 
 @unittest.skipUnless(HAS_AIOGRAM, "aiogram not installed (unit-fast job)")
 class TestFmtSignalMessageNoSetup(unittest.TestCase):
-    """Когда top == None — старая «лишняя инфа» должна быть удалена."""
+    """Когда top == None И preview_top == None — старая «лишняя инфа» удалена."""
 
     @classmethod
     def setUpClass(cls):
@@ -186,6 +186,7 @@ class TestFmtSignalMessageNoSetup(unittest.TestCase):
         return self._fmt(
             {
                 "top": None,
+                "preview_top": None,
                 "scored": scored,
                 "capital": 123.0,
                 "min_score": 60,
@@ -214,6 +215,118 @@ class TestFmtSignalMessageNoSetup(unittest.TestCase):
     def test_markets_hint_present(self):
         msg = self._render()
         self.assertIn("/markets", msg)
+
+
+@unittest.skipUnless(HAS_AIOGRAM, "aiogram not installed (unit-fast job)")
+class TestFmtSignalMessagePreview(unittest.TestCase):
+    """Когда top is None НО preview_top != None — показываем preview-блок.
+
+    Это новый код-путь (PR-5): пользователь жмёт «Лучшая сделка», score
+    ниже порога — но мы всё равно показываем уровни SL/TP/«почему», чтобы
+    кнопка не висела бесполезно.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        from main import _fmt_signal_message  # noqa: PLC0415
+
+        cls._fmt = staticmethod(_fmt_signal_message)
+
+    def _make_preview(self, score: int = 48, asset: str = "XRP") -> SignalSetup:
+        return SignalSetup(
+            asset=asset,
+            direction="SHORT",
+            entry=1.40,
+            stop=1.47,
+            target=1.26,
+            stop_pct=5.00,
+            target_pct=-10.00,
+            rr_ratio=2.0,
+            sigma_1d_pct=3.33,
+            size_usd=30.75,
+            score=score,
+            reasons=[
+                "DOWNTREND ✓ (vs MA50 -0.2%, MA200 -18.6%)",
+                "MEAN_REVERTING — counter-trend, weak (5 pts)",
+                "VRT не отвергает H0 (ряд похож на random walk)",
+                "Markov FLAT (нейтрально 5 pts)",
+                "raw score=0.31 → 5 pts",
+            ],
+        )
+
+    def _render(self, **kwargs) -> str:
+        preview = kwargs.get("preview_top", self._make_preview())
+        scored = kwargs.get(
+            "scored",
+            [
+                _make_score("VIX", 71, direction="LONG"),       # non-tradable выше
+                _make_score("GOLD", 53, direction="SHORT"),     # non-tradable
+                _make_score("XRP", 48, direction="SHORT"),      # tradable preview
+                _make_score("BTC", 30, direction="NONE"),
+            ],
+        )
+        return self._fmt(
+            {
+                "top": None,
+                "preview_top": preview,
+                "scored": scored,
+                "capital": 123.0,
+                "min_score": 60,
+            }
+        )
+
+    def test_preview_header_present(self):
+        """Должен быть жёлтый заголовок «ЛУЧШИЙ КАНДИДАТ», не «ТОП SETUP»."""
+        msg = self._render()
+        self.assertIn("ЛУЧШИЙ КАНДИДАТ", msg)
+        self.assertIn("XRP", msg)
+        self.assertIn("SHORT", msg)
+        self.assertNotIn("ТОП SETUP", msg)
+
+    def test_preview_marks_score_below_threshold(self):
+        msg = self._render()
+        # «(score 48/60 — ниже порога ...)»
+        self.assertIn("48/60", msg)
+        self.assertIn("ниже порога", msg)
+
+    def test_preview_shows_sl_tp_levels(self):
+        """Главное требование пользователя — SL/TP в «сидим»-режиме тоже видны."""
+        msg = self._render()
+        self.assertIn("Вход / Stop / Target", msg)
+        self.assertIn("Entry:", msg)
+        self.assertIn("$1.4", msg)            # entry / stop / target — округлены
+        self.assertIn("Stop:", msg)
+        self.assertIn("Target:", msg)
+
+    def test_preview_shows_risks_in_usd(self):
+        msg = self._render()
+        self.assertIn("Риски этой сделки", msg)
+        # SL loss = 30.75 * 5.00 / 100 = $1.5375 → $1.54
+        self.assertIn("$1.54", msg)
+        # TP gain = 30.75 * 10.00 / 100 = $3.075 → $3.07 or $3.08 (rounding)
+        self.assertTrue("$3.07" in msg or "$3.08" in msg, msg=f"missing TP gain ≈$3.08: {msg}")
+
+    def test_preview_warns_to_reduce_size(self):
+        """В preview-режиме явное предупреждение «уменьши size»."""
+        msg = self._render()
+        self.assertIn("уменьши size", msg)
+
+    def test_preview_explains_higher_non_tradable(self):
+        """VIX 71 выше XRP 48 — но VIX не на споте Bybit, явно объясняем."""
+        msg = self._render()
+        self.assertIn("Выше по score", msg)
+        self.assertIn("VIX", msg)
+        self.assertIn("71/100", msg)
+        self.assertIn("не торгуется", msg)
+
+    def test_preview_keeps_disclaimer(self):
+        msg = self._render()
+        self.assertIn("suggestion, не приказ", msg)
+
+    def test_preview_no_legacy_90_percent(self):
+        msg = self._render()
+        self.assertNotIn("90% дней", msg)
+        self.assertNotIn("слив комиссий", msg)
 
 
 if __name__ == "__main__":
