@@ -1,0 +1,96 @@
+# Dialectic Edge — project configuration.
+#
+# Это первый шаг к статическому анализу. Конфиг намеренно мягкий:
+#   * ruff проверяет реальные баги (E, F) и игнорирует косметику (E501).
+#   * mypy включён в "soft" режиме, чтобы не флудить ошибками на 250 KB
+#     untyped-кода. Постепенно подкручивать секциями.
+#   * pytest используется как раннер тестов локально. CI пока остаётся на
+#     `python -m unittest discover` (252 теста зелёные), миграция в pytest —
+#     отдельный PR, после фикса state-pollution в test_autotrade_whiplash.
+
+[project]
+name = "dialectic-edge"
+version = "0.0.0"
+description = "Multi-agent debate trading bot (Bull/Bear/Verifier/Synth)."
+requires-python = ">=3.12"
+
+# ─── ruff ────────────────────────────────────────────────────────────────────
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+extend-exclude = [
+    "DIGEST_CACHE.md",
+    "FORECASTS.md",
+    "BACKTEST.md",
+    "AUTO_TRACK.md",
+    "AUDIT_REPORT.md",
+    "MARKET_CACHE.md",
+    "build",
+    "dist",
+    ".venv",
+    "venv",
+]
+
+[tool.ruff.lint]
+# Минимальный безопасный набор. Расширять по одному правилу за PR.
+#   E  — pycodestyle errors
+#   F  — pyflakes (unused vars/imports, undefined names — реальные баги)
+select = ["E", "F"]
+# E501 (line too long) — 1200+ нарушений на текущем коде, выключаем до
+# отдельного форматирующего PR. То же для пары косметических `l`-имён.
+ignore = [
+    "E501",  # line-too-long
+    "E701",  # multiple-statements-on-one-line-colon (часто в коротких if'ах)
+    "E702",  # multiple-statements-on-one-line-semicolon
+    "E741",  # ambiguous-variable-name (l/I/O)
+    "F541",  # f-string-missing-placeholders
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Тесты могут иметь неиспользуемые импорты (фикстуры/проверки доступности).
+"tests/*" = ["F401"]
+# В __init__.py типично переэкспорт через `from .x import Y`.
+"**/__init__.py" = ["F401"]
+
+[tool.ruff.format]
+# Не запускаем массовое форматирование сейчас — только проверка.
+quote-style = "preserve"
+indent-style = "space"
+
+# ─── mypy ────────────────────────────────────────────────────────────────────
+
+[tool.mypy]
+python_version = "3.12"
+# Soft-режим: проверяем только то, что уже типизировано. Не требуем
+# аннотаций на untyped функции — иначе получим тысячи ошибок.
+ignore_missing_imports = true
+follow_imports = "silent"
+check_untyped_defs = false
+disallow_untyped_defs = false
+warn_unused_ignores = false
+warn_redundant_casts = true
+strict_optional = true
+# Не падаем, если попался файл с syntax-only ошибкой типов.
+show_error_codes = true
+
+# Игнорируем кэш-маркдауны и legacy-эксперименты.
+exclude = [
+    "build/",
+    "dist/",
+    "\\.venv/",
+    "venv/",
+]
+
+# ─── pytest ──────────────────────────────────────────────────────────────────
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+# Async-тесты помечать @pytest.mark.asyncio. Strict, чтобы не было
+# случайных не-async fixtures.
+asyncio_mode = "strict"
+# Минимальный verbosity, такой же стиль как у unittest discover -v.
+addopts = "-ra"

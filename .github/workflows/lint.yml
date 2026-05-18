@@ -1,0 +1,68 @@
+name: lint
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Линт-джоба идёт параллельно с tests.yml. На старте — НЕ-блокирующая
+# (continue-on-error: true), чтобы PR не валился из-за legacy-нарушений.
+# Когда основной долг разгребём (отдельные PR'ы с массовыми фиксами), можно
+# будет убрать continue-on-error и сделать линт обязательным.
+jobs:
+  ruff:
+    name: ruff
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install ruff
+        run: pip install ruff==0.7.4
+
+      - name: ruff check
+        # Сейчас не блокирует CI — отчёт уходит в job logs. Постепенно
+        # расширяем `select` в pyproject.toml и тогда убираем эту строку.
+        continue-on-error: true
+        run: ruff check --output-format=github .
+
+      - name: ruff format check
+        continue-on-error: true
+        run: ruff format --check --diff .
+
+  mypy:
+    name: mypy (soft)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install mypy + minimal stubs
+        run: |
+          pip install --upgrade pip
+          pip install \
+            mypy==1.13.0 \
+            types-requests \
+            types-python-dateutil
+
+      - name: mypy (refactor/ only)
+        # На первом этапе типизация интересна только для свежей декомпозиции
+        # в `refactor/`. Старый код подключим позже — отдельным PR.
+        continue-on-error: true
+        run: mypy refactor/

@@ -1,0 +1,35 @@
+# Pre-commit конфиг — запускается на staged-файлах перед каждым коммитом.
+#
+# Установка для нового клона (один раз):
+#   pip install pre-commit
+#   pre-commit install
+#
+# Запуск вручную:
+#   pre-commit run --all-files        # на всём репо
+#   pre-commit run --files path/...   # на конкретных файлах
+#
+# Намеренно без авто-фиксов старого кода — только проверка изменений в PR.
+
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.7.4
+    hooks:
+      # Линт-проверка staged-файлов. Не фиксит автоматически — пусть автор PR
+      # сам видит, что было исправлено.
+      - id: ruff
+        name: ruff (lint, no-fix)
+        args: ["--no-fix"]
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      # Базовая гигиена: trailing whitespace, EOF newline, merge-конфликты.
+      - id: trailing-whitespace
+        exclude: '\.md$'  # DIGEST_CACHE.md и пр. — это машинный output.
+      - id: end-of-file-fixer
+        exclude: '\.md$'
+      - id: check-merge-conflict
+      - id: check-yaml
+      - id: check-toml
+      - id: check-added-large-files
+        args: ["--maxkb=200"]  # DIGEST_CACHE.md уже 500K, новые такие — стоп.
