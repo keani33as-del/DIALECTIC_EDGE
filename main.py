@@ -539,19 +539,19 @@ def _format_smart_money_card(prices: dict | None) -> str | None:
     """Делает короткую карточку институциональных сигналов для пользователя.
     Использует SM_* ключи которые уже есть в prices_dict (заполняются
     `enrich_prices_with_scores` в market_indicators/aggregator.py).
-    
+
     Возвращает None если данные недоступны (карточка не показывается).
     """
     if not prices:
         return None
-    
+
     ls = prices.get("SM_TOP_TRADER_LS")
     ls_per_symbol = prices.get("SM_TOP_TRADER_LS_PER_SYMBOL") or {}
     cb_prem = prices.get("SM_COINBASE_PREMIUM")
     cme_basis = prices.get("SM_CME_BASIS")
     funding_avg = prices.get("SM_FUNDING_AVG")
     funding_align = prices.get("SM_FUNDING_ALIGN")
-    
+
     bullets: list[str] = []
 
     # Top-trader L/S — компактный per-symbol блок по 5 основным парам.
@@ -570,7 +570,7 @@ def _format_smart_money_card(prices: dict | None) -> str | None:
     elif isinstance(ls, (int, float)):
         emoji, tag = _sm_ls_tag(float(ls))
         bullets.append(f"{emoji} *Top-trader L/S (BTC):* {ls:.2f} → {tag}")
-    
+
     if isinstance(cb_prem, (int, float)):
         if cb_prem >= 0.20:
             tag = "🇺🇸 US-биды (бычий)"
@@ -583,7 +583,7 @@ def _format_smart_money_card(prices: dict | None) -> str | None:
         else:
             tag = "нейтрал"
         bullets.append(f"  *Coinbase Premium:* {cb_prem:+.2f}% — {tag}")
-    
+
     if isinstance(cme_basis, (int, float)):
         if cme_basis >= 0.30:
             tag = "📜 contango (бычий)"
@@ -592,7 +592,7 @@ def _format_smart_money_card(prices: dict | None) -> str | None:
         else:
             tag = "📜 нейтрал"
         bullets.append(f"  *CME Basis:* {cme_basis:+.2f}% — {tag}")
-    
+
     if isinstance(funding_avg, (int, float)) and funding_align:
         align = str(funding_align).upper()
         if align == "ALL_LONG" and funding_avg > 0.05:
@@ -608,10 +608,10 @@ def _format_smart_money_card(prices: dict | None) -> str | None:
         else:
             tag = align.lower()
         bullets.append(f"  *Funding:* {funding_avg:+.4f}% [{align}] — {tag}")
-    
+
     if not bullets:
         return None
-    
+
     return "\n".join(["🏛 *Институциональные сигналы (Smart-money):*", *bullets])
 
 
@@ -1287,7 +1287,7 @@ def _money_format_price(value) -> str:
 
 def _eli5_for_actionable_trade(plan: dict) -> str:
     """Объясняет одну actionable-сделку «как пятилетнему».
-    
+
     Rule-based, никаких LLM-вызовов — кнопка должна отвечать мгновенно.
     Берёт direction/entry/stop/target/size и собирает понятную фразу.
     """
@@ -1297,7 +1297,7 @@ def _eli5_for_actionable_trade(plan: dict) -> str:
     stop = plan.get("stop")
     target = plan.get("target")
     size = str(plan.get("size") or "").strip()
-    
+
     # Имена в винительном падеже (объект действия) для разговорной речи.
     # «Покупаем биткоин», «шортим эфир» — звучит естественно.
     asset_accusative = {
@@ -1310,11 +1310,11 @@ def _eli5_for_actionable_trade(plan: dict) -> str:
         "ADA": "кардано",
         "TON": "тон",
     }.get(sym, sym)
-    
+
     verb = "Покупаем" if direction == "LONG" else "Шортим"
-    
+
     parts = [f"{verb} {asset_accusative} по {_money_format_price(entry)}."]
-    
+
     if stop:
         if direction == "LONG":
             parts.append(
@@ -1326,7 +1326,7 @@ def _eli5_for_actionable_trade(plan: dict) -> str:
                 f"Если вырастет до {_money_format_price(stop)} — выходим "
                 f"(страховка от убытка)."
             )
-    
+
     if target:
         if direction == "LONG":
             parts.append(
@@ -1338,16 +1338,16 @@ def _eli5_for_actionable_trade(plan: dict) -> str:
                 f"Если упадёт до {_money_format_price(target)} — "
                 f"забираем профит."
             )
-    
+
     if size:
         parts.append(f"Кладём {size} депозита, не больше.")
-    
+
     return " ".join(parts)
 
 
 def _eli5_for_watch_only(watch_levels: list[dict]) -> str:
     """Объясняет «торговать не надо + ждём триггер» как пятилетнему.
-    
+
     Берёт первые 3 watch-уровня и собирает фразу «сидим, ждём, если X — то Y»."""
     asset_name = {
         "BTC": "биткоин",
@@ -1359,7 +1359,7 @@ def _eli5_for_watch_only(watch_levels: list[dict]) -> str:
         "ADA": "кардано",
         "TON": "тон",
     }
-    
+
     parts = ["Сейчас ничего не делаем — рынок без явного направления."]
     triggers_described = []
     for w in (watch_levels or [])[:3]:
@@ -1400,7 +1400,7 @@ def _eli5_for_watch_only(watch_levels: list[dict]) -> str:
                 price_str = f" ${p_val:,.0f}" if p_val >= 100 else f" ${p_val:.2f}"
             except (ValueError, TypeError):
                 pass
-        
+
         if is_long_signal and price_str:
             triggers_described.append(
                 f"если {name} закроет 4h-свечу выше{price_str} — "
@@ -1414,10 +1414,10 @@ def _eli5_for_watch_only(watch_levels: list[dict]) -> str:
             triggers_described.append(
                 f"следим за {name}{price_str}"
             )
-    
+
     if triggers_described:
         parts.append("Условия для входа: " + "; ".join(triggers_described) + ".")
-    
+
     parts.append("До этого — сидим и не дёргаемся. «Не торговать» — это тоже решение.")
     return " ".join(parts)
 
@@ -1793,18 +1793,18 @@ def _format_autotrade_status_embed(risk_summary: dict, status: dict) -> str:
     capital = risk_summary.get("current_capital", 0)
     peak = risk_summary.get("peak_capital", 0)
     total_pnl = risk_summary.get("total_pnl", 0)
-    
+
     # R-ratio: avg_win / avg_loss
     rr = (avg_win / avg_loss) if avg_loss else 0
     # Expectancy в процентах: p*W - (1-p)*L
     p = win_rate / 100
     expectancy = (p * avg_win - (1 - p) * avg_loss) if total else 0
-    
+
     # Sharpe-эквивалент (упрощённо: avg_pnl / std). На малых выборках ничего не считаем.
-    
+
     msg = "🎯 *AUTOTRADE — STATUS*\n"
     msg += "═" * 28 + "\n\n"
-    
+
     # Capital
     msg += "💰 *Капитал*\n"
     msg += f"  Текущий: ${capital:,.2f}\n"
@@ -1815,7 +1815,7 @@ def _format_autotrade_status_embed(risk_summary: dict, status: dict) -> str:
     else:
         msg += f"  🟢 Drawdown: {drawdown:.1f}%\n"
     msg += f"  Cumulative PnL: {total_pnl:+.2f}%\n\n"
-    
+
     # Performance
     msg += "📊 *Performance*\n"
     if total == 0:
@@ -1826,7 +1826,7 @@ def _format_autotrade_status_embed(risk_summary: dict, status: dict) -> str:
         msg += f"  {emoji} Win-rate: {win_rate:.1f}% ({wins}W / {losses}L)\n"
         msg += f"  Avg win: +{avg_win:.2f}%  |  Avg loss: -{avg_loss:.2f}%\n"
         msg += f"  R-ratio: {rr:.2f}  |  Expectancy: {expectancy:+.2f}%\n\n"
-    
+
     # Risk Engine
     msg += "⚙️ *Risk Engine*\n"
     if using_history:
@@ -1835,7 +1835,7 @@ def _format_autotrade_status_embed(risk_summary: dict, status: dict) -> str:
         msg += f"  🟡 Kelly: bootstrap-режим (база {kelly:.2f}%)\n"
         msg += f"  _Нужно ≥10 закрытых сделок для динамического Kelly._\n"
     msg += f"  Target vol (vol-targeting): {target_vol:.1f}%\n\n"
-    
+
     # Active positions
     active = status.get("active_positions", []) or []
     if active:
@@ -1844,7 +1844,7 @@ def _format_autotrade_status_embed(risk_summary: dict, status: dict) -> str:
             msg += f"  • {pos['symbol']} {pos['direction']} @ ${pos.get('entry_price', 0):,.2f}\n"
     else:
         msg += "📭 Открытых позиций нет\n"
-    
+
     return msg
 
 
@@ -1853,7 +1853,7 @@ async def cmd_autotrade_status(message: Message):
     """Performance summary с Kelly, vol-targeting, drawdown, win-rate."""
     try:
         from signal_trader import get_signal_trader_status, _risk_manager
-        
+
         status = await get_signal_trader_status()
         risk_summary = _risk_manager.get_risk_summary()
         msg = _format_autotrade_status_embed(risk_summary, status)
@@ -1874,7 +1874,7 @@ async def cmd_audit(message: Message):
         )
         from signal_trader import _risk_manager
         from ai_provider import AgentProvider
-        
+
         # Парсим параметры: /audit или /audit 14
         parts = (message.text or "").split()
         days = 7
@@ -1884,10 +1884,10 @@ async def cmd_audit(message: Message):
             except ValueError:
                 pass
         period_str = f"{days} дней" if days != 7 else "неделю"
-        
+
         backtest_path = Path(__file__).parent / "BACKTEST.md"
         trades = parse_recent_trades_from_md(str(backtest_path), days=days)
-        
+
         if not trades:
             await message.answer(
                 f"📊 *AI Self-Audit ({period_str})*\n\n"
@@ -1896,12 +1896,12 @@ async def cmd_audit(message: Message):
                 parse_mode="Markdown",
             )
             return
-        
+
         await message.answer(f"🔍 Анализирую {len(trades)} закрытых сделок за {period_str}…")
-        
+
         risk_summary = _risk_manager.get_risk_summary()
         prompt = build_audit_prompt(trades, risk_summary=risk_summary, period=period_str)
-        
+
         # Используем verifier-роль (gpt-oss 120B по дефолту) — для аудита нужен
         # точный, не bullish/bearish-агент.
         provider = AgentProvider()
@@ -1911,7 +1911,7 @@ async def cmd_audit(message: Message):
         except Exception as agent_err:
             logger.warning(f"audit: verifier agent failed, fallback to synth: {agent_err}")
             audit_text = await provider.synth(prompt=prompt, system=sys_msg, temperature=0.4)
-        
+
         msg = format_audit_for_telegram(audit_text, len(trades), period_str)
         await message.answer(msg, parse_mode="Markdown")
     except Exception as e:
@@ -1924,24 +1924,24 @@ async def cmd_usage(message: Message):
     """Token usage по провайдерам с момента последнего рестарта."""
     try:
         from ai_provider import get_usage_stats
-        
+
         stats = get_usage_stats()
         if not stats:
             await message.answer(
                 "📊 *Token Usage*\n\nПока нет вызовов AI с момента старта."
             )
             return
-        
+
         msg = "📊 *AI Token Usage* (с последнего рестарта)\n"
         msg += "═" * 28 + "\n\n"
-        
+
         # Сортируем по total_tokens DESC
         providers_sorted = sorted(
             stats.items(),
             key=lambda kv: kv[1].get("total_tokens", 0),
             reverse=True,
         )
-        
+
         grand_total_calls = 0
         grand_total_tokens = 0
         for provider, data in providers_sorted:
@@ -1951,10 +1951,10 @@ async def cmd_usage(message: Message):
             ct = data.get("completion_tokens", 0)
             grand_total_calls += calls
             grand_total_tokens += tt
-            
+
             msg += f"*{provider}*: {calls} вызовов, {tt:,} tokens\n"
             msg += f"  └ in: {pt:,} | out: {ct:,}\n"
-            
+
             by_model = data.get("by_model", {})
             if by_model and len(by_model) > 1:
                 # Несколько моделей — покажем их разбивку
@@ -1962,10 +1962,10 @@ async def cmd_usage(message: Message):
                                             key=lambda kv: kv[1].get("total_tokens", 0),
                                             reverse=True)[:3]:
                     msg += f"    • `{model}`: {mdata.get('calls', 0)} calls, {mdata.get('total_tokens', 0):,} tok\n"
-        
+
         msg += "\n" + "─" * 25 + "\n"
         msg += f"*Итого:* {grand_total_calls} вызовов, {grand_total_tokens:,} tokens\n"
-        
+
         await message.answer(msg, parse_mode="Markdown")
     except Exception as e:
         logger.exception("usage error")
@@ -2154,7 +2154,7 @@ async def cmd_screener(message: Message):
         screener = MarketScreener(top_n=15)
         await message.answer("📡 Сканирую рынок на аномалии...")
         results = await screener.scan()
-        
+
         if not results:
             await message.answer("📡 Сканер: Аномалий не обнаружено. Рынок спокоен.")
             return
@@ -3411,12 +3411,12 @@ async def cmd_russia(message: Message):
             pass  # сообщение уже удалено — не критично
 
         await send_russia_chart_photo(message.chat.id, report)
-        
+
         # Парсим секции для навигации (пробуем разные разделители)
         opportunities = ""
         risks = ""
         synthesis = ""
-        
+
         # Пробуем разные разделители
         for sep in ["─" * 30, "---", "___"]:
             sections = report.split(sep)
@@ -3425,20 +3425,20 @@ async def cmd_russia(message: Message):
                 risks = sections[2].strip() if len(sections) > 2 else ""
                 synthesis = sections[3].strip() if len(sections) > 3 else ""
                 break
-        
+
         # Если не получилось парсить — сохраняем весь отчёт
         if not opportunities and not risks:
             opportunities = "Раздел возможностей"
             risks = "Раздел рисков"
             synthesis = synthesis if synthesis else "Раздел итогов"
-        
+
         # Сохраняем секции в кэш для навигации
         russia_cache["sections"] = {
             "opportunities": opportunities,
             "risks": risks,
             "synthesis": synthesis
         }
-        
+
         # Клавиатура навигации
         nav_keyboard = InlineKeyboardMarkup(inline_keyboard=[
             [
@@ -3450,7 +3450,7 @@ async def cmd_russia(message: Message):
                 InlineKeyboardButton(text="📊 Полный", callback_data="russia_nav:full"),
             ]
         ])
-        
+
         for chunk in split_message(report):
             await message.answer(clean_markdown(chunk), parse_mode="Markdown")
 
@@ -3459,7 +3459,7 @@ async def cmd_russia(message: Message):
             parse_mode="Markdown",
             reply_markup=feedback_keyboard("russia")
         )
-        
+
         await message.answer(
             "📍 *Навигация по разделам:*",
             parse_mode="Markdown",
@@ -3487,7 +3487,7 @@ async def handle_russia_nav(callback: CallbackQuery):
     await callback.answer()
     data = callback.data.split(":")
     section = data[1] if len(data) > 1 else "full"
-    
+
     # Проверяем есть ли кэш
     if not russia_cache.get("report"):
         await callback.message.answer(
@@ -3495,10 +3495,10 @@ async def handle_russia_nav(callback: CallbackQuery):
             parse_mode="Markdown"
         )
         return
-    
+
     sections = russia_cache.get("sections", {})
     full_report = russia_cache.get("report", "")
-    
+
     text = ""
     if section == "opp":
         text = sections.get("opportunities", "Раздел не найден. Запусти /russia заново.")
@@ -3510,7 +3510,7 @@ async def handle_russia_nav(callback: CallbackQuery):
         text = full_report[:3500] if full_report else "Отчёт не найден. Запусти /russia заново."
     else:
         text = "Выбери раздел:"
-    
+
     nav_keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="🟢 Возможности", callback_data="russia_nav:opp"),
@@ -3521,7 +3521,7 @@ async def handle_russia_nav(callback: CallbackQuery):
             InlineKeyboardButton(text="📊 Полный", callback_data="russia_nav:full"),
         ]
     ])
-    
+
     await callback.message.answer(
         f"📍 *Раздел:* {section.upper()}\n\n{text[:3500]}",
         parse_mode="Markdown",
@@ -3791,20 +3791,95 @@ def _fmt_signal_message(result: dict) -> str:
         emoji = "📈" if top.direction == "LONG" else "📉"
         stars = "⭐" * min(5, max(1, top.score // 20))
         lines.append(f"🥇 *ТОП SETUP:* {top.asset} *{top.direction}* {emoji}")
-        lines.append("```")
-        lines.append(f"Entry:   ${top.entry}")
-        lines.append(f"Stop:    ${top.stop}  ({top.stop_pct:+.1f}% = "
-                     f"{top.stop_pct / top.sigma_1d_pct:+.1f}σ̂)")
-        lines.append(f"Target:  ${top.target}  ({top.target_pct:+.1f}% = "
-                     f"{top.target_pct / top.sigma_1d_pct:+.1f}σ̂)")
-        lines.append(f"R/R:     {top.rr_ratio}x")
-        lines.append(f"Size:    ${top.size_usd}  ({top.size_usd / capital * 100:.0f}% "
-                     f"от ${capital:.0f})")
-        lines.append("```")
-        lines.append(f"*Score: {top.score}/100* {stars}")
-        for r in top.reasons:
+        lines.append("")
+
+        # ── Почему именно эта сделка ──
+        # Сравниваем с #2: если есть отрыв — подсвечиваем; если top единственный
+        # прошёл порог — говорим об этом. Это снимает вопрос «а почему не X?».
+        runner_up = next(
+            (s for s in scored if s.asset != top.asset and s.direction != "NONE"),
+            None,
+        )
+        lines.append("*Почему эта сделка:*")
+        lines.append(
+            f"• Score *{top.score}/100* {stars} — лучший среди {len(scored)} сканированных."
+        )
+        if runner_up is not None:
+            gap = top.score - runner_up.total
+            if gap > 0:
+                lines.append(
+                    f"• Отрыв от #2 ({runner_up.asset} {runner_up.total}/100): +{gap} pts."
+                )
+            else:
+                lines.append(
+                    f"• #2 — {runner_up.asset} {runner_up.total}/100 (ничья, но "
+                    f"{top.asset} торгуется на споте Bybit)."
+                )
+        lines.append(
+            f"• R/R = {top.rr_ratio}x: ловим в {top.rr_ratio:.1f} раза больше "
+            f"чем рискуем — это «+EV» при winrate ≥ {100/(1+top.rr_ratio):.0f}%."
+        )
+
+        # Ключевые «почему» — берём первые 3 наиболее содержательных reason'a.
+        # `top.reasons` уже отфильтрованы scorer'ом и упорядочены по
+        # компонентам (trend → complexity → vrt → markov → raw). Первые
+        # три обычно покрывают «направление + структура».
+        for r in top.reasons[:3]:
             lines.append(f"• {r}")
         lines.append("")
+
+        # ── Уровни SL/TP ──
+        # Явно подписываем что Stop = «выходим если так и не пошло», Target =
+        # «фиксируем профит». σ̂-кратность даёт интуицию «сколько дневных
+        # волатильностей до уровня».
+        lines.append("*Вход / Stop / Target:*")
+        lines.append("```")
+        lines.append(f"Entry:   ${top.entry}   (рыночный)")
+        sigma_pct = top.sigma_1d_pct or 1.0  # защита от деления на 0
+        lines.append(
+            f"Stop:    ${top.stop}   ({top.stop_pct:+.1f}% = "
+            f"{top.stop_pct / sigma_pct:+.1f}σ̂)   — если хит, выходим"
+        )
+        lines.append(
+            f"Target:  ${top.target}   ({top.target_pct:+.1f}% = "
+            f"{top.target_pct / sigma_pct:+.1f}σ̂)   — фиксируем профит"
+        )
+        lines.append(f"R/R:     {top.rr_ratio}x")
+        lines.append(
+            f"Size:    ${top.size_usd}   ({top.size_usd / capital * 100:.0f}% от ${capital:.0f})"
+        )
+        lines.append("```")
+
+        # ── Риски этой сделки ──
+        # Считаем USD-потерю на стопе и потенциал на таргете — даём
+        # пользователю сразу абсолютные цифры, чтобы он мог сопоставить
+        # с дневным risk-budget'ом.
+        sl_loss_usd = top.size_usd * abs(top.stop_pct) / 100.0
+        tp_gain_usd = top.size_usd * abs(top.target_pct) / 100.0
+        sl_loss_pct = sl_loss_usd / capital * 100 if capital > 0 else 0.0
+        tp_gain_pct = tp_gain_usd / capital * 100 if capital > 0 else 0.0
+        lines.append("*Риски этой сделки:*")
+        lines.append(
+            f"• Если SL hit → потеря ≈ ${sl_loss_usd:.2f} "
+            f"({sl_loss_pct:.1f}% от капитала)."
+        )
+        lines.append(
+            f"• Если TP hit → прибыль ≈ ${tp_gain_usd:.2f} "
+            f"({tp_gain_pct:.1f}% от капитала)."
+        )
+        lines.append(
+            f"• Дневная σ̂ ≈ {top.sigma_1d_pct:.2f}%/день — "
+            f"стоп даёт {abs(top.stop_pct / sigma_pct):.1f}σ запаса от обычного шума."
+        )
+        # Слабое место: если какой-то reason явно «нулевой» — выносим в риски.
+        weak_marker = (
+            " 0 pts", "не отвергает", "против trade", "нет edge", "trade-кандидата нет",
+        )
+        weak_reasons = [r for r in top.reasons if any(m in r for m in weak_marker)]
+        if weak_reasons:
+            lines.append(f"• Слабое место: {weak_reasons[0]}")
+        lines.append("")
+
         lines.append("⚠️ _Это suggestion, не приказ. Подтверди вход в Bybit вручную._")
         lines.append("⚠️ _SL — рыночный. Округлено до tick биржи (XRP=0.1, BTC=0.01 и т.д.)._")
     else:
@@ -3819,11 +3894,6 @@ def _fmt_signal_message(result: dict) -> str:
                     f"• *{s.asset}* {s.total}/100 — {top_reason}"
                 )
             lines.append("")
-        lines.append(
-            "Это нормально — наша модель велит сидеть в ~90% дней. "
-            "Сетап без edge = слив комиссий."
-        )
-        lines.append("")
         lines.append("Запусти `/markets` чтобы посмотреть полную картину.")
 
     return "\n".join(lines)
@@ -3890,15 +3960,15 @@ async def cmd_status(message: Message):
     try:
         prices, _ = await get_full_realtime_context()
         cbr_data = await fetch_cbr_data()
-        
+
         now = datetime.now().strftime("%d.%m %H:%M UTC")
-        
+
         lines = [
             f"📊 СТАТУС РЫНКОВ",
             f"_{now}_",
             ""
         ]
-        
+
         # Крипта
         lines.append("💰 КРИПТА")
         for k, label, icon in [
@@ -3911,7 +3981,7 @@ async def cmd_status(message: Message):
                 change = p.get("change_24h", 0)
                 emoji = "🟢" if change >= 0 else "🔴"
                 lines.append(f"{icon} {label}: ${price:,.0f} {emoji}{change:+.1f}%")
-        
+
         # Валюты
         if cbr_data:
             lines.append("")
@@ -3919,7 +3989,7 @@ async def cmd_status(message: Message):
             for line in cbr_data.strip().split('\n')[:3]:
                 if line.strip():
                     lines.append(line)
-        
+
         # Фондовые
         lines.append("")
         lines.append("📈 ИНДЕКСЫ")
@@ -3930,7 +4000,7 @@ async def cmd_status(message: Message):
                 change = p.get("change_24h", 0)
                 emoji = "🟢" if change >= 0 else "🔴"
                 lines.append(f"{label}: {price:,.0f} {emoji}{change:+.1f}%")
-        
+
         # Макро
         if "MACRO" in prices:
             m = prices["MACRO"]
@@ -3939,10 +4009,10 @@ async def cmd_status(message: Message):
             fs = fng.get("status", "")
             lines.append("")
             lines.append(f"F&Greed: {fv}/100 ({fs})")
-        
+
         lines.append("")
         lines.append("⚠️ Не финансовый совет")
-        
+
         await bot.edit_message_text(
             "\n".join(lines),
             chat_id=message.chat.id,
@@ -4098,7 +4168,7 @@ async def _cmd_trackrecord(message: Message, report_type: str = None, title: str
                         content = await resp.text()
         except Exception as e:
             logger.warning(f"Failed to fetch FORECASTS.md: {e}")
-        
+
         if not content:
             await message.answer("📊 Не удалось загрузить FORECASTS.md")
             return
@@ -4120,31 +4190,31 @@ async def _cmd_trackrecord(message: Message, report_type: str = None, title: str
         total_match = re.search(r'Всего прогнозов.*?\|.*?(\d+)', content)
         if total_match:
             total = int(total_match.group(1))
-        
+
         wins_match = re.search(r'✅ Верно.*?\|.*?(\d+)', content)
         if wins_match:
             wins = int(wins_match.group(1))
-        
+
         cautions_match = re.search(r'⚠️ Правильная осторожность.*?\|.*?(\d+)', content)
         if cautions_match:
             cautions = int(cautions_match.group(1))
-        
+
         losses_match = re.search(r'❌ Неверно.*?\|.*?(\d+)', content)
         if losses_match:
             losses = int(losses_match.group(1))
-        
+
         winrate_match = re.search(r'Точность \(с осторожностью\).*?\*\*(\d+\.?\d*)%', content)
         if winrate_match:
             winrate = float(winrate_match.group(1))
-        
+
         winrate_conservative_match = re.search(r'Точность \(только направление\).*?\*\*(\d+\.?\d*)%', content)
         if winrate_conservative_match:
             winrate_conservative = float(winrate_conservative_match.group(1))
-        
+
         protection_match = re.search(r'Защита капитала.*?\*\*(\d+\.?\d*)%', content)
         if protection_match:
             protection = float(protection_match.group(1))
-        
+
         period_match = re.search(r'Период.*?(\d{2}\.\d{2}\.\d{4}.*\d{2}\.\d{2}\.\d{4})', content)
         if period_match:
             period = period_match.group(1)
@@ -4164,9 +4234,9 @@ async def _cmd_trackrecord(message: Message, report_type: str = None, title: str
                     break
 
         predictions = []
-        
+
         russia_keywords = ["руб", "рф", "россия", "сбер", "газпром", "лукойл", "роснефть", "мосбирж", "офз", "нефть", "росси"]
-        
+
         in_forecasts = False
         for line in content.split('\n'):
             if '## 📝 Все прогнозы' in line:
@@ -4184,15 +4254,15 @@ async def _cmd_trackrecord(message: Message, report_type: str = None, title: str
                         forecast = parts[4] if len(parts) > 4 else ""
                         fact = parts[5] if len(parts) > 5 else ""
                         result = parts[6] if len(parts) > 6 else ""
-                        
+
                         is_russia = "Russia" in pred_type or any(kw in asset.lower() for kw in russia_keywords)
-                        
+
                         # Фильтрация по типу
                         if report_type == "global" and is_russia:
                             continue
                         if report_type == "russia" and not is_russia:
                             continue
-                        
+
                         predictions.append({
                             "date": date,
                             "type": pred_type,
@@ -4206,20 +4276,20 @@ async def _cmd_trackrecord(message: Message, report_type: str = None, title: str
                         pass
             if in_forecasts and line.strip().startswith('##') and 'Все прогнозы' not in line:
                 break
-        
+
         # Парсим статы из таблицы
         total_match = re.search(r'Всего прогнозов.*?(\d+)', content)
         if total_match:
             total = int(total_match.group(1))
-        
+
         wins_match = re.search(r'Прибыльных.*?(\d+)', content)
         if wins_match:
             wins = int(wins_match.group(1))
-        
+
         losses_match = re.search(r'Убыточных.*?(\d+)', content)
         if losses_match:
             losses = int(losses_match.group(1))
-        
+
         # Фильтрация по типу
         if filter_type and filter_type != "all":
             filtered = []
@@ -4247,11 +4317,11 @@ async def _cmd_trackrecord(message: Message, report_type: str = None, title: str
             return
 
         icon = "🌍" if report_type == "global" else "🇷🇺" if report_type == "russia" else "📊"
-        
+
         filter_label = ""
         if filter_type and filter_type != "all":
             filter_label = f" [{filter_type.upper()}]"
-        
+
         def make_bar(value: int, total: int, length: int = 10) -> str:
             if total == 0:
                 return "░" * length
@@ -4294,14 +4364,14 @@ async def _cmd_trackrecord(message: Message, report_type: str = None, title: str
 
         lines.append("")
         lines.append("📝 ПРОГНОЗЫ")
-        
+
         for p in predictions:
             date = p.get("date", "")[:8]
             asset = p.get("asset", "")[:15]
             forecast = p.get("forecast", "")[:30]
             result = p.get("result", "")
             fact = p.get("fact", "")[:30]
-            
+
             if "Верно" in result:
                 res_emoji = "✅"
             elif "Неверно" in result:
@@ -4310,7 +4380,7 @@ async def _cmd_trackrecord(message: Message, report_type: str = None, title: str
                 res_emoji = "⚠️"
             else:
                 res_emoji = "⏳"
-            
+
             # Для LOSS/CAUTION показываем больше инфы
             if filter_type and filter_type != "all" and fact:
                 lines.append(f"{res_emoji} {date} {asset}")
@@ -4323,15 +4393,15 @@ async def _cmd_trackrecord(message: Message, report_type: str = None, title: str
         lines.append("⚠️ Прошлые результаты не гарантируют будущих.")
 
         keyboard_buttons = []
-        
+
         type_label = {"global": "GLOBAL", "russia": "РОССИЯ", None: "ВСЕ"}.get(report_type, "ВСЕ")
-        
+
         keyboard_buttons.append([
             InlineKeyboardButton(text="🌍 Global", callback_data=f"tr_type:global"),
             InlineKeyboardButton(text="🇷🇺 Россия", callback_data=f"tr_type:russia"),
             InlineKeyboardButton(text="📊 Все", callback_data=f"tr_type:all"),
         ])
-        
+
         keyboard_buttons.append([
             InlineKeyboardButton(text="✅ WIN", callback_data=f"tr_filter:win:{type_label}"),
             InlineKeyboardButton(text="❌ LOSS", callback_data=f"tr_filter:loss:{type_label}"),
@@ -4340,9 +4410,9 @@ async def _cmd_trackrecord(message: Message, report_type: str = None, title: str
         ])
 
         keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
-        
+
         full_text = "\n".join(lines)
-        
+
         if len(full_text) > 4000:
             part1 = "\n".join(lines[:40])
             part2 = "\n".join(lines[40:])
@@ -4371,12 +4441,12 @@ async def cb_tr_filter(callback: CallbackQuery):
     data = callback.data.split(":")
     if len(data) < 3:
         return
-    
+
     filter_type = data[1]
     type_label = data[2]
-    
+
     report_type = "global" if type_label == "GLOBAL" else "russia" if type_label == "РОССИЯ" else None
-    
+
     await _cmd_trackrecord(callback.message, report_type=report_type, title=f"{type_label} ({filter_type.upper()})", filter_type=filter_type)
 
 
@@ -4464,12 +4534,12 @@ async def cb_subscribe(callback: CallbackQuery):
     await callback.answer()
     user_id = callback.from_user.id
     data = callback.data.split(":")
-    
+
     if len(data) < 2:
         return
-    
+
     action = data[1]
-    
+
     if action == "off":
         await set_daily_sub(user_id, False)
         await callback.message.edit_text(
@@ -4477,7 +4547,7 @@ async def cb_subscribe(callback: CallbackQuery):
             parse_mode="Markdown"
         )
         return
-    
+
     if action == "custom":
         await callback.message.edit_text(
             "💬 *Введи время в формате HH:MM*\n\n"
@@ -4486,10 +4556,10 @@ async def cb_subscribe(callback: CallbackQuery):
             parse_mode="Markdown"
         )
         return
-    
+
     time_str = action
     await set_daily_sub(user_id, True, time_str)
-    
+
     await callback.message.edit_text(
         f"✅ *Подписка активана*\n\n"
         f"📬 Ежедневно в *{time_str} UTC*\n\n"
@@ -4508,7 +4578,7 @@ async def handle_text_input(message: Message):
     text = message.text.strip()
     if await handle_portfolio_input(message):
         return
-    
+
     # Check portfolio state first
     state = user_portfolio_state.get(user_id)
     if state:
@@ -4534,12 +4604,12 @@ async def handle_text_input(message: Message):
             except:
                 await message.answer("Введи цену, например 65000")
             return
-    
+
     # Check time input (for subscription)
     user = await get_user(user_id)
     if not user:
         return
-    
+
     if ":" in text and len(text) == 5:
         try:
             h, m = text.split(":")
@@ -4551,20 +4621,20 @@ async def handle_text_input(message: Message):
             return
         except:
             pass
-    
+
     # If not portfolio and not time, do nothing
     user_id = message.from_user.id
     user = await get_user(user_id)
-    
+
     if not user:
         return
-    
+
     text = message.text.strip()
-    
+
     if ":" not in text or len(text) != 5:
         await message.answer("❌ Формат: HH:MM (например 09:30)")
         return
-    
+
     try:
         h, m = text.split(":")
         h, m = int(h), int(m)
@@ -4572,10 +4642,10 @@ async def handle_text_input(message: Message):
     except:
         await message.answer("❌ Некорректное время. Пример: 09:30")
         return
-    
+
     time_str = f"{h:02d}:{m:02d}"
     await set_daily_sub(user_id, True, time_str)
-    
+
     await message.answer(
         f"✅ *Подписка активана*\n\n"
         f"📬 Ежедневно в *{time_str} UTC*",
@@ -4773,7 +4843,7 @@ async def cmd_help(message: Message):
 
 def _format_pitch_message() -> str:
     """1-message overview системы для инвестора. Читается за 30 сек.
-    
+
     Структура: tagline → что делаем → отличия → live KPI → CTA.
     Все KPI собираются из реального state'а (session_manager + risk_manager).
     """
@@ -4787,7 +4857,7 @@ def _format_pitch_message() -> str:
     try:
         from session_manager import session_manager, SESSION_START_CAPITAL
         from signal_trader import _risk_manager
-        
+
         cur = session_manager.current_session
         if cur:
             capital = cur.current_capital or SESSION_START_CAPITAL
@@ -4803,28 +4873,28 @@ def _format_pitch_message() -> str:
                 trades_str = f"{total} ({wins}W / {losses}L)"
             else:
                 trades_str = "0 (новая сессия)"
-        
+
         rs = _risk_manager.get_risk_summary()
         if rs.get("kelly_using_history"):
             kelly_status = f"активен ({rs.get('kelly_pct', 0):.2f}%)"
         else:
             kelly_status = f"bootstrap (база {rs.get('kelly_pct', 2):.2f}%)"
-        
+
         past = session_manager.past_sessions or []
         sessions_str = f"{len(past) + 1} (текущая)"
     except Exception as e:
         logger.debug("pitch KPI fetch error: %s", e)
-    
+
     msg = (
         "💎 *Dialectic Edge — investor pitch (30 sec)*\n"
         "═════════════════════════════\n\n"
-        
+
         "🎯 *Что мы строим*\n"
         "Автономную AI-систему которая торгует крипто-активами на принципах "
         "_систематического фонда_, а не retail-трейдера. Pipeline: "
         "smart-money signals → 4-агентный AI debate → vol-targeted adaptive Kelly "
         "→ self-audit раз в неделю.\n\n"
-        
+
         "🏆 *Чем отличаемся от 99% retail-ботов*\n"
         "1️⃣ *Smart-money first.* Top-trader L/S, Coinbase Premium, "
         "CME Basis, Funding dispersion — институциональные индикаторы _до_ "
@@ -4837,7 +4907,7 @@ def _format_pitch_message() -> str:
         "следующую неделю. AI которая учится на своих ошибках.\n"
         "4️⃣ *Multi-provider AI router.* 6 провайдеров, per-role routing, "
         "fallback цепочка. Никогда не падает целиком.\n\n"
-        
+
         "📊 *Live KPI*\n"
         f"  • Капитал: *{capital_str}*\n"
         f"  • PnL текущей сессии: *{pnl_pct_str}*\n"
@@ -4845,7 +4915,7 @@ def _format_pitch_message() -> str:
         f"  • Закрытых сделок: *{trades_str}*\n"
         f"  • Kelly engine: *{kelly_status}*\n"
         f"  • Прошедших сессий: *{sessions_str}*\n\n"
-        
+
         "🚀 *Попробуй сам*\n"
         "  • `/daily` — полный AI-анализ + торговый план\n"
         "  • `/autotrade_status` — performance dashboard\n"
@@ -4954,7 +5024,7 @@ async def main():
     global scheduler
     global bot
     bot = get_bot()
-    
+
     await set_bot_commands(bot)
 
     await init_db()
@@ -5049,26 +5119,26 @@ def select_crypto_keyboard() -> InlineKeyboardMarkup:
 async def show_portfolio(event):
     """Show portfolio - works with both Message and CallbackQuery."""
     user_id = event.from_user.id
-    
+
     positions = await get_portfolio(user_id)
     print(f"DEBUG: user_id={user_id}, positions={positions}")
-    
+
     prices, _ = await get_full_realtime_context()
-    
+
     symbol_map = {"BTC": "BTC", "ETH": "ETH", "SOL": "SOL", "GOLD": "GOLD"}
-    
+
     lines = ["📊 ТВОЙ ПОРТФЕЛЬ", ""]
     total_pnl = 0
     total_value = 0
-    
+
     for pos in positions:
         symbol = pos["symbol"]
         amount = pos["amount"]
         entry = pos["entry_price"]
-        
+
         price_key = symbol_map.get(symbol, symbol)
         current_price = prices.get(price_key, {}).get("price", 0)
-        
+
         if current_price:
             value = amount * current_price
             cost = amount * entry
@@ -5083,16 +5153,16 @@ async def show_portfolio(event):
             cost = amount * entry
             total_value += cost
             lines.append(f"{symbol}: {amount} x $??? | Вход: ${entry:,.0f}")
-    
+
     if not positions:
         lines.append("Портфель пуст")
-    
+
     if total_value > 0:
         total_cost = total_value - total_pnl if total_pnl > 0 else total_value
         total_pnl_pct = (total_pnl / total_cost * 100) if total_cost > 0 else 0
         emoji = "🟢" if total_pnl >= 0 else "🔴"
         lines.extend(["", f"📈 Итого: ${total_value:,.0f} | {emoji} {total_pnl:+,.0f} ({total_pnl_pct:+.1f}%)"])
-    
+
     if hasattr(event, 'message'):
         await event.message.answer("\n".join(lines), reply_markup=portfolio_keyboard(bool(positions)))
     else:
@@ -5148,18 +5218,18 @@ async def cmd_backtest(message: Message):
     signals = await get_backtest_signals()
     stats = await get_backtest_stats()
     config = await get_backtest_config()
-    
+
     total = stats.get("total", 0) or 0
     wins = stats.get("wins", 0) or 0
     losses = stats.get("losses", 0) or 0
     total_pnl = stats.get("total_pnl", 0) or 0
     avg_pnl = stats.get("avg_pnl_pct", 0) or 0
-    
+
     win_rate = (wins / total * 100) if total > 0 else 0
-    
+
     capital = config.get("capital", 100.0)
     enabled = config.get("enabled", 1)
-    
+
     msg = "🤖 *ТЕСТОВЫЙ ТРЕЙДЕР*\n"
     msg += "═" * 25 + "\n"
     msg += f"Это бот который торгует по сигналам анализа.\n"
@@ -5170,7 +5240,7 @@ async def cmd_backtest(message: Message):
     msg += f"💰 *Total PnL:* `${total_pnl:+,.2f}`\n"
     msg += f"📈 *Avg PnL:* {avg_pnl:+.2f}%\n"
     msg += "═" * 25 + "\n"
-    
+
     open_positions = [s for s in signals if s.get("status") == "open"]
     if open_positions:
         msg += "\n🔵 *Открытые позиции:*\n"
@@ -5183,7 +5253,7 @@ async def cmd_backtest(message: Message):
             msg += f"  {emoji} {symbol} {dir_text} @ ${entry:,.2f}\n"
     else:
         msg += "\n📭 *Нет открытых позиций*\n"
-    
+
     closed = [s for s in signals if s.get("status") == "closed"]
     if closed:
         msg += "\n📋 *Последние сделки:*\n"
@@ -5195,17 +5265,17 @@ async def cmd_backtest(message: Message):
             emoji = "🟢" if pnl > 0 else "🔴"
             dir_text = "📈" if direction == "BUY" else "📉"
             msg += f"  {emoji} {symbol} {dir_text} ${pnl:+,.2f} ({pnl_pct:+.1f}%)\n"
-    
+
     status_text = "✅ Работает" if enabled else "❌ Остановлен"
     msg += "═" * 25 + "\n"
     msg += f"Статус: {status_text}"
-    
+
     await message.answer(
-        msg, 
+        msg,
         parse_mode="Markdown",
         reply_markup=backtest_keyboard(bool(enabled))
     )
-    
+
     # Also export to GitHub
     try:
         from github_export import export_backtest_to_github
@@ -5229,7 +5299,7 @@ async def cb_backtest(callback: CallbackQuery):
     """Handle backtest keyboard buttons."""
     action = callback.data.split(":")[1]
     user_id = callback.from_user.id
-    
+
     if action == "toggle":
         config = await get_backtest_config()
         enabled = not bool(config.get("enabled", 1))
@@ -5241,18 +5311,18 @@ async def cb_backtest(callback: CallbackQuery):
             reply_markup=backtest_keyboard(bool(enabled))
         )
         await callback.answer(f"Бэктест {status}")
-    
+
     elif action == "history":
         signals = await get_backtest_signals()
         closed = [s for s in signals if s.get("status") == "closed"]
-        
+
         if not closed:
             await callback.answer("Нет закрытых сделок", show_alert=True)
             return
-        
+
         msg = "📋 *История сделок*\n"
         msg += "═" * 25 + "\n"
-        
+
         wins = 0
         losses = 0
         for s in closed:
@@ -5268,13 +5338,13 @@ async def cb_backtest(callback: CallbackQuery):
                 losses += 1
             dir_text = "📈" if direction == "BUY" else "📉"
             msg += f"{date} {emoji} {symbol} {dir_text} ${pnl:+,.2f} ({pnl_pct:+.1f}%)\n"
-        
+
         msg += "═" * 25 + "\n"
         msg += f"Всего: {len(closed)} | 🟢 {wins} | 🔴 {losses}"
-        
+
         await callback.message.answer(msg, parse_mode="Markdown")
         await callback.answer()
-    
+
     elif action == "capital":
         await callback.message.answer(
             "💰 *Изменить баланс*\n\n"
@@ -5284,7 +5354,7 @@ async def cb_backtest(callback: CallbackQuery):
             parse_mode="Markdown"
         )
         await callback.answer()
-    
+
     else:
         await callback.answer()
 
