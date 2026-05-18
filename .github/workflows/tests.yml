@@ -9,8 +9,52 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# ─── ВАЖНО ────────────────────────────────────────────────────────────────────
+# Раньше CI ставил только 5 deps из 11 (aiohttp/aiosqlite/feedparser/numpy/certifi)
+# для скорости, но это давало ложно-зелёный CI: handler-логика, AI-провайдеры,
+# чарты, Redis и aiogram-gated тесты (`tests/test_markets_sections.py`) в CI
+# **не запускались**. Один баг в handler'е = бот мёртв в проде.
+#
+# Решение — два параллельных job'а:
+#   * `unit-fast` — старая минимальная установка, быстрый сигнал (~30s).
+#   * `unit-full` — полный requirements.txt, активирует все тесты включая
+#                   aiogram-gated. Чуть медленнее (~1.5–2 мин), но честно.
+# ──────────────────────────────────────────────────────────────────────────────
+
 jobs:
-  unittest:
+  unit-fast:
+    name: unit-fast (minimal deps)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install minimal runtime dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # Минимальный набор для импорт-цепочки `tests/test_market_complexity.py`:
+          #   tests → core.market_complexity → core/__init__.py
+          #   → decision_engine → analysis_service → database (aiosqlite)
+          #   → news_fetcher (feedparser) → core/correlation (numpy).
+          pip install \
+            aiohttp==3.10.5 \
+            aiosqlite==0.20.0 \
+            feedparser==6.0.11 \
+            numpy \
+            certifi
+
+      - name: Run unit tests (fast subset)
+        run: |
+          python -m unittest discover -s tests -p "test_*.py" -v
+
+  unit-full:
+    name: unit-full (all deps + aiogram-gated tests)
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -22,24 +66,52 @@ jobs:
           python-version: "3.12"
           cache: pip
 
-      - name: Install runtime dependencies
+      - name: Install full requirements.txt
         run: |
           python -m pip install --upgrade pip
-          # Minimal set required by the import chain triggered by
-          # `tests/test_market_complexity.py`:
-          #   tests → core.market_complexity → core/__init__.py
-          #   → decision_engine → analysis_service → database (aiosqlite)
-          #   → news_fetcher (feedparser) → core/correlation (numpy).
-          # Network / AI / charting / FinBERT deps are NOT pulled in by the
-          # import chain (matplotlib, streamlit, google-generativeai, redis,
-          # torch/transformers, aiogram), so we skip them and save 30-60s.
-          pip install \
-            aiohttp==3.10.5 \
-            aiosqlite==0.20.0 \
-            feedparser==6.0.11 \
-            numpy \
-            certifi
+          # Полная установка из requirements.txt. Активирует:
+          #   * aiogram → tests/test_markets_sections.py::TestMarketsSectionKeyboard
+          #     (раньше skip'ались с "_HAS_AIOGRAM = False").
+          #   * matplotlib → chart_generator (smoke-импорты ниже).
+          #   * google-generativeai, redis, streamlit, pandas → AI-провайдеры,
+          #     кэш, опциональные модули.
+          pip install -r requirements.txt
 
-      - name: Run unit tests
+      - name: Smoke-import handlers + providers (CI honesty check)
+        # Если кто-то сломает handler-модуль (опечатка импорта, кривое
+        # переименование) — раньше это в CI не ловилось, потому что aiogram
+        # не ставился. Теперь падает сразу.
+        run: |
+          python - <<'PY'
+          import importlib, sys
+          modules = [
+              "refactor.handlers.admin_handler",
+              "refactor.handlers.debate_handler",
+              "refactor.handlers.market_handler",
+              "refactor.handlers.portfolio_handler",
+              "refactor.handlers.profile_handler",
+              "refactor.handlers.utils",
+              "refactor.providers.ai_providers",
+              "refactor.providers.cache_providers",
+              "refactor.providers.database_providers",
+              "refactor.providers.market_providers",
+              "refactor.providers.news_providers",
+              "refactor.providers.storage_providers",
+              "chart_generator",
+          ]
+          failed = []
+          for m in modules:
+              try:
+                  importlib.import_module(m)
+                  print(f"  ok    {m}")
+              except Exception as exc:
+                  failed.append((m, repr(exc)))
+                  print(f"  FAIL  {m}: {exc!r}")
+          if failed:
+              print(f"\n{len(failed)} module(s) failed to import. CI red.", file=sys.stderr)
+              sys.exit(1)
+          PY
+
+      - name: Run unit tests (full suite incl. aiogram-gated)
         run: |
           python -m unittest discover -s tests -p "test_*.py" -v
