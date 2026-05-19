@@ -45,6 +45,17 @@ try:
 except ImportError:
     SMART_MONEY_ALERT_ENABLED = False
 
+# Post-mortem loop (24h-later анализ дайджеста).  Импорт через try/except,
+# чтобы старый код, без `core/post_mortem.py`, продолжал стартовать.
+try:
+    from config import FEATURE_POST_MORTEM, POST_MORTEM_RUN_TIME_UTC
+    from core.post_mortem import run_post_mortem as _run_post_mortem
+    POST_MORTEM_ENABLED = True
+except ImportError:
+    POST_MORTEM_ENABLED = False
+    FEATURE_POST_MORTEM = False
+    POST_MORTEM_RUN_TIME_UTC = "23:50"
+
 logger = logging.getLogger(__name__)
 
 
@@ -112,6 +123,13 @@ class Scheduler:
 
         if SMART_MONEY_ALERT_ENABLED and self._smart_money_alert:
             tasks.append(self._smart_money_alert_loop())
+
+        if POST_MORTEM_ENABLED and FEATURE_POST_MORTEM:
+            tasks.append(self._post_mortem_loop())
+            logger.info(
+                "🔬 Post-mortem loop включён (запуск в %s UTC ежедневно)",
+                POST_MORTEM_RUN_TIME_UTC,
+            )
 
         await asyncio.gather(*tasks)
 
@@ -288,6 +306,51 @@ class Scheduler:
                 logger.error(f"Auto tracker error: {e}")
 
             # Проверяем каждую минуту
+            await asyncio.sleep(60)
+
+    async def _post_mortem_loop(self):
+        """Каждый день в POST_MORTEM_RUN_TIME_UTC (дефолт 23:50) — анализ
+        вчерашнего дайджеста.  Цикл проверяет минуту, запускает один раз,
+        логирует hit-rate и пишет labels в predictions.
+
+        Дайджест публикуется по подписке в произвольный sub_time, поэтому мы
+        не привязываемся к нему, а используем «самый свежий дайджест ≥24ч
+        назад» (логика в `core.post_mortem.pick_target_digest`).
+        """
+        await asyncio.sleep(240)  # ждём 4 минуты при старте, не толкаемся с auto_tracker
+
+        while self._running:
+            try:
+                now = datetime.now()
+                current_time = now.strftime("%H:%M")
+
+                if current_time == POST_MORTEM_RUN_TIME_UTC:
+                    logger.info("🔬 Запускаю пост-мортем дайджеста (24h post-mortem)...")
+
+                    report = await _run_post_mortem()
+                    if report is None:
+                        logger.info("post_mortem: нет подходящего дайджеста — пропускаю")
+                    else:
+                        stats = report.stats
+                        hr = stats.get("hit_rate")
+                        hr_str = f"{hr * 100:.1f}%" if hr is not None else "—"
+                        logger.info(
+                            "✅ Post-mortem дайджеста %s: hit-rate=%s "
+                            "(wins=%d / resolved=%d, flat=%d, no_data=%d)",
+                            report.digest_date,
+                            hr_str,
+                            stats["wins"],
+                            stats["resolved"],
+                            stats["flat"],
+                            stats["no_data"],
+                        )
+
+                    # Ждём минуту чтобы не запустить дважды.
+                    await asyncio.sleep(60)
+
+            except Exception as e:
+                logger.error(f"Post-mortem loop error: {e}")
+
             await asyncio.sleep(60)
 
     async def export_now(self):

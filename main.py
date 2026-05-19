@@ -2175,6 +2175,55 @@ async def cmd_wfbacktest(message: Message):
         await message.answer(f"Ошибка wfbacktest: {e}")
 
 
+@dp.message(Command("postmortem"))
+async def cmd_postmortem(message: Message):
+    """Post-mortem дайджеста: что мы сказали vs что произошло через 24ч.
+
+    Usage:
+      /postmortem                — анализ последнего дайджеста (≥24ч назад)
+      /postmortem 18.05.2026     — анализ конкретного дня (DD.MM.YYYY)
+
+    Зачем: до этого PR `/daily` выдавал вердикт и забывал. Калибровка
+    (PR #24/#25) видела только `/signal` и `/markets`, не daily. Теперь
+    каждый дайджест проверяется ровно через 24ч (или вручную), классифи-
+    цируется как hit/miss/flat/no_data и попадает в `predictions` →
+    `/calibration` начинает учитывать ещё и daily-direction-calls.
+
+    Источник правды: парсер `auto_tracker.DigestParser` (тот же, что
+    наполняет AUTO_TRACK.md, чтобы не плодить regex) + Yahoo entry/eval.
+
+    Feature-flag: `FEATURE_POST_MORTEM=1` (включает scheduler-job, но не
+    отключает эту команду — она всегда доступна).
+    """
+    try:
+        from core.post_mortem import format_telegram, run_post_mortem
+
+        parts = (message.text or "").split()
+        target_date: Optional[str] = None
+        if len(parts) > 1:
+            arg = parts[1].strip()
+            # Формат DD.MM.YYYY  (HH:MM — опционально, парсер режет по пробелу)
+            if re.fullmatch(r"\d{2}\.\d{2}\.\d{4}", arg):
+                target_date = arg
+
+        await message.answer("🔬 Запускаю post-mortem... (тяну цены)")
+        report = await run_post_mortem(target_date=target_date)
+        if report is None:
+            await message.answer(
+                "📭 Не нашёл подходящего дайджеста.\n\n"
+                "Возможные причины:\n"
+                "• Дайджест публикуется реже 24ч (или DIGEST_CACHE.md пуст).\n"
+                "• Дата `DD.MM.YYYY` не совпадает ни с одной строкой `## 📊`.\n"
+                "• PriceFetcher (Yahoo) недоступен — попробуй позже."
+            )
+            return
+
+        await message.answer(format_telegram(report), parse_mode="Markdown")
+    except Exception as e:
+        logger.exception("postmortem error")
+        await message.answer(f"Ошибка postmortem: {e}")
+
+
 @dp.message(Command("usage"))
 async def cmd_usage(message: Message):
     """Token usage по провайдерам с момента последнего рестарта."""
