@@ -880,14 +880,11 @@ async def build_markets_section_message(
     body_parts: list[str] = []
 
     if section == "summary":
-        # Сводка = крипта (рич-формат, без S/R) + сигналы. S/R-строки
-        # (~360 chars × 5 крипт = ~1800) пушили summary за 4096 и рвали
-        # сообщение на 2 куска → клавиатура уезжала на второе сообщение.
-        # При клике «💲 Крипта» S/R показываются полностью (skip_sr=False).
-        body_parts.append(format_prices_section(prices, section="crypto", skip_sr=True) or "Нет данных")
-        body_parts.append("")
-        body_parts.append("📡 *Сигналы*")
-        body_parts.append(md_bundle.get("signals_message", "Нет данных"))
+        # Сводка = крипта с S/R. Сигналы убраны — они живут в отдельной
+        # вкладке «📡 Сигналы» (section="signals") и в /signal. Дублировать
+        # их в summary перегружало текст и пушило за 4096 → клавиатура
+        # уезжала на второе сообщение.
+        body_parts.append(format_prices_section(prices, section="crypto") or "Нет данных")
 
     elif section == "crypto":
         body_parts.append(format_prices_section(prices, section="crypto") or "Нет данных")

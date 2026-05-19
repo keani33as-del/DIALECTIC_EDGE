@@ -4051,10 +4051,11 @@ async def cmd_markets(message: Message):
     await upsert_user(user_id, message.from_user.username or "")
     wait_msg = await message.answer("⏳ Загружаю рынки...")
     try:
+        # Первый клик → крипта с S/R. Сигналы — отдельная вкладка «📡».
         await _render_markets_section(
             chat_id=message.chat.id,
             user_id=user_id,
-            section="summary",
+            section="crypto",
             wait_message_id=wait_msg.message_id,
         )
     except Exception as e:

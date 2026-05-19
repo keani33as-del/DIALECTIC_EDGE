@@ -246,7 +246,8 @@ class TestBuildMarketsSectionMessage(unittest.TestCase):
 
         return fake_prices, fake_bundle
 
-    def test_summary_has_crypto_and_signals(self):
+    def test_summary_has_crypto_no_signals(self):
+        """Summary = крипта с S/R, БЕЗ сигналов (сигналы в отдельной вкладке)."""
         fake_prices, fake_bundle = self._mock_fetchers(signals_msg="🔔 SIGNAL TEST")
         from signals import build_markets_section_message
 
@@ -256,12 +257,12 @@ class TestBuildMarketsSectionMessage(unittest.TestCase):
 
         self.assertEqual(bundle["section"], "summary")
         text = "\n\n".join(msgs)
-        # Summary = крипта (рич-формат) + сигналы. В рич-формате — заголовок
-        # секции `[КРИПТОРЫНОК]` и "Bitcoin (BTC)" вместо иконки `₿`.
+        # Summary = крипта (рич-формат). Сигналы убраны — живут во вкладке
+        # «📡 Сигналы» (section="signals"). Дублировать их перегружало
+        # текст и ломало layout менюшки.
         self.assertIn("КРИПТОРЫНОК", text)
         self.assertIn("Bitcoin (BTC)", text)
-        self.assertIn("Сигналы", text)
-        self.assertIn("SIGNAL TEST", text)
+        self.assertNotIn("SIGNAL TEST", text)
 
     def test_crypto_section_has_only_crypto(self):
         fake_prices, fake_bundle = self._mock_fetchers(signals_msg="DO_NOT_SHOW")
