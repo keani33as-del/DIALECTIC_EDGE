@@ -566,6 +566,29 @@ class TestSupportResistanceRendering(unittest.TestCase):
             else:
                 _os.environ["FEATURE_SR_LEVELS"] = prev
 
+    def test_skip_sr_hides_levels(self):
+        """skip_sr=True → S/R не рендерится (используется в summary view)."""
+        out = format_prices_for_agents(
+            self._prices_with_ohlc(), for_user=True, skip_sr=True
+        )
+        self.assertNotIn("🎯 R:", out)
+
+    def test_skip_sr_via_section(self):
+        """format_prices_section(skip_sr=True) — S/R скрыты в секции."""
+        from web_search import format_prices_section  # noqa: PLC0415
+        out = format_prices_section(
+            self._prices_with_ohlc(), section="crypto", skip_sr=True
+        )
+        self.assertNotIn("🎯 R:", out)
+
+    def test_section_without_skip_sr_shows_levels(self):
+        """format_prices_section(skip_sr=False) — S/R показаны (дефолт)."""
+        from web_search import format_prices_section  # noqa: PLC0415
+        out = format_prices_section(
+            self._prices_with_ohlc(), section="crypto", skip_sr=False
+        )
+        self.assertIn("🎯 R:", out)
+
 
 if __name__ == "__main__":
     unittest.main()

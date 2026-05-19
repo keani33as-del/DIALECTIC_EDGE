@@ -1328,7 +1328,9 @@ def _sr_lines(
     return out
 
 
-def format_prices_for_agents(prices: dict, *, for_user: bool = False) -> str:
+def format_prices_for_agents(
+    prices: dict, *, for_user: bool = False, skip_sr: bool = False,
+) -> str:
     """Рендерит prices dict в текст для агентов или пользователя.
 
     Параметры:
@@ -1338,6 +1340,9 @@ def format_prices_for_agents(prices: dict, *, for_user: bool = False) -> str:
         ─ без пустых строк между активами (компактно для LLM context)
       for_user=True — формат для команды /markets (Telegram-юзер):
         ─ без дубль-заголовка (уже есть в обёртке `📊 РЫНКИ И СИГНАЛЫ`)
+      skip_sr=True — не рендерить S/R-строки (🎯 R: / S:). Используется
+        в summary-экране /markets, чтобы текст влезал в одно сообщение;
+        при клике на «💲 Крипта» S/R появляются полностью.
         ─ без AI-инструкции снизу
         ─ пустая строка между активами (для читаемости)
     """
@@ -1389,12 +1394,7 @@ def format_prices_for_agents(prices: dict, *, for_user: bool = False) -> str:
                 lines.append(t)
 
             # S/R-уровни: 2 сопротивления выше цены + 2 поддержки ниже.
-            # Считаются `core.support_resistance` по wicks за ~250 D1
-            # баров. Появляются ПОСЛЕ MA-триггеров (которые задают LONG/
-            # SHORT bias) и ПЕРЕД SL/TP-расчётом — горизонтальные уровни
-            # информируют куда ставить стоп / тейк. Feature-flagged через
-            # FEATURE_SR_LEVELS, default ON.
-            if os.getenv("FEATURE_SR_LEVELS", "1") != "0":
+            if os.getenv("FEATURE_SR_LEVELS", "1") != "0" and not skip_sr:
                 for t in _sr_lines(p):
                     lines.append(t)
 
@@ -1493,7 +1493,7 @@ def format_prices_for_agents(prices: dict, *, for_user: bool = False) -> str:
             # SPX/NDX/VIX рендерим без $-префикса — это индексы, не доллары.
             for t in _trigger_lines(p, prefix=""):
                 lines.append(t)
-            if os.getenv("FEATURE_SR_LEVELS", "1") != "0":
+            if os.getenv("FEATURE_SR_LEVELS", "1") != "0" and not skip_sr:
                 for t in _sr_lines(p, prefix=""):
                     lines.append(t)
             tl = _macro_trend_line(p)
@@ -1518,7 +1518,7 @@ def format_prices_for_agents(prices: dict, *, for_user: bool = False) -> str:
             trig_prefix = "$" if k in ("OIL_WTI", "GOLD") else ""
             for t in _trigger_lines(p, prefix=trig_prefix):
                 lines.append(t)
-            if os.getenv("FEATURE_SR_LEVELS", "1") != "0":
+            if os.getenv("FEATURE_SR_LEVELS", "1") != "0" and not skip_sr:
                 for t in _sr_lines(p, prefix=trig_prefix):
                     lines.append(t)
             tl = _macro_trend_line(p, unit=u if k == "OIL_WTI" or k == "GOLD" else "")
@@ -1706,7 +1706,9 @@ _SECTION_HEADER_RAW: dict[str, str] = {
 }
 
 
-def format_prices_section(prices: dict, *, section: str = "all") -> str:
+def format_prices_section(
+    prices: dict, *, section: str = "all", skip_sr: bool = False,
+) -> str:
     """Per-секционный рендер цен с полной информацией (24ч/7д/30д, MA-триггеры,
     SL/TP LONG/SHORT, Quant-вердикт, ТРЕНД+MA50/200, Random walk/Markov, объём).
 
@@ -1716,12 +1718,14 @@ def format_prices_section(prices: dict, *, section: str = "all") -> str:
       • ``indices``— SPX / NDX / VIX
       • ``commod`` — Oil WTI / Gold / DXY
       • ``all``    — всё подряд (то же что `format_prices_for_agents(for_user=True)`)
+    `skip_sr`: пропустить S/R-строки (для summary-экрана, где текст должен
+    влезать в одно сообщение).
     Возвращает текст с пустыми строками между активами и заголовком секции
     (`[КРИПТОРЫНОК]` и т.д.) — совместимо со старым форматом /markets.
     """
     if not prices:
         return "Рыночные данные временно недоступны."
-    full = format_prices_for_agents(prices, for_user=True)
+    full = format_prices_for_agents(prices, for_user=True, skip_sr=skip_sr)
     if section == "all":
         return full.lstrip("\n")
     header = _SECTION_HEADER_RAW.get(section)
