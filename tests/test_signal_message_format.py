@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import os
+import re
 import sys
 import unittest
 
@@ -380,6 +381,69 @@ class TestMdEscapeUnderscores(unittest.TestCase):
 
     def test_empty_string(self):
         self.assertEqual(self._escape(""), "")
+
+
+@unittest.skipUnless(HAS_AIOGRAM, "aiogram not installed (unit-fast job)")
+class TestSignalGlossaryText(unittest.TestCase):
+    """`_signal_glossary_text` — текст под кнопкой «📖 Что значат эти слова?».
+
+    Regression-тесты против `TelegramBadRequest: can't parse entities`,
+    который ловили на проде когда в тексте оставались некэскейпленные
+    markdown-метасимволы.  Telegram parse_mode=Markdown (V1) тривиально
+    падает на нечётном количестве `_` / `*` / backtick — здесь
+    проверяем, что текст структурно валиден.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        from main import _signal_glossary_text  # noqa: PLC0415
+
+        cls._text = _signal_glossary_text()
+
+    def test_within_telegram_size_limit(self):
+        # Telegram hard limit — 4096 chars per message.  Глоссарий
+        # должен помещаться без splitting'а.
+        self.assertLess(len(self._text), 4096)
+
+    def test_non_empty(self):
+        self.assertGreater(len(self._text), 100)
+
+    def test_stars_are_balanced(self):
+        # `*bold*` — парное кол-во `*`, иначе MD V1 не закроет entity.
+        self.assertEqual(self._text.count("*") % 2, 0)
+
+    def test_backticks_are_balanced(self):
+        # `code` — парное кол-во `` ` ``.
+        self.assertEqual(self._text.count("`") % 2, 0)
+
+    def test_no_unescaped_underscores_outside_code_spans(self):
+        """Главный regression-тест.
+
+        Прод падал на байте 4360 из-за неэкранированного `_` в
+        `stop_pct`.  Парсер открыл italic, не нашёл закрывающий `_`
+        → `Can't find end of the entity`.  Тут проверяем что вне
+        backtick-code-span'ов ВСЕ `_` экранированы.
+        """
+        # Вырезаем содержимое всех `code` блоков (внутри MD V1 ничего
+        # не парсит, там `_` безопасны).
+        no_code = re.sub(r"`[^`]*`", "", self._text)
+        # Считаем «голые» `_` — не предварённые `\`.
+        bare = [
+            i
+            for i, ch in enumerate(no_code)
+            if ch == "_" and (i == 0 or no_code[i - 1] != "\\")
+        ]
+        self.assertEqual(
+            bare,
+            [],
+            f"Found {len(bare)} unescaped '_' outside code spans at chars "
+            f"{bare[:5]} — Telegram MD V1 will fail to parse.",
+        )
+
+    def test_glossary_keyword_terms_present(self):
+        # Минимальный smoke: основные термины упомянуты.
+        for kw in ("LONG", "SHORT", "Entry", "Stop", "Target", "R/R"):
+            self.assertIn(kw, self._text, f"Missing keyword: {kw}")
 
 
 if __name__ == "__main__":
