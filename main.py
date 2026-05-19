@@ -3926,7 +3926,7 @@ def _section_label(key: str, label: str, current: str) -> str:
 
 
 def _markets_section_keyboard(
-    is_enabled: bool, current: str = "summary"
+    is_enabled: bool, current: str = "summary", user_id: int | None = None
 ) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
     # 4 ряда по 2 кнопки — выбор секции.
@@ -3954,6 +3954,17 @@ def _markets_section_keyboard(
             callback_data="markets:disable" if is_enabled else "markets:enable",
         ),
     ])
+    # Глоссарий «📖 Что значат эти слова?» — stateless, открывает разбор
+    # терминов /markets (S/R, MA-триггеры, σ̂, Hurst, Markov, quant-метрики).
+    # UID в callback_data чтоб чужой клик в групповом чате не выдавал ответ
+    # (тот же паттерн что у `sigexplain:` в `_signal_explain_keyboard`).
+    if user_id is not None:
+        rows.append([
+            InlineKeyboardButton(
+                text="📖 Что значат эти слова?",
+                callback_data=f"mktexplain:{user_id}",
+            ),
+        ])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -3989,7 +4000,7 @@ async def _render_markets_section(
 
     if not messages:
         text = "❌ Нет данных."
-        kb = _markets_section_keyboard(is_enabled, current=section)
+        kb = _markets_section_keyboard(is_enabled, current=section, user_id=user_id)
         if wait_message_id is not None:
             await bot.edit_message_text(
                 text, chat_id=chat_id, message_id=wait_message_id, reply_markup=kb
@@ -4001,7 +4012,7 @@ async def _render_markets_section(
     # Первое сообщение — edit (если есть placeholder), иначе send.
     first = clean_markdown(messages[0])
     is_single = len(messages) == 1
-    first_kb = _markets_section_keyboard(is_enabled, current=section) if is_single else None
+    first_kb = _markets_section_keyboard(is_enabled, current=section, user_id=user_id) if is_single else None
     first_text = first + (status_text if is_single else "")
     if wait_message_id is not None:
         await bot.edit_message_text(
@@ -4028,7 +4039,7 @@ async def _render_markets_section(
             chat_id,
             body,
             parse_mode="Markdown",
-            reply_markup=_markets_section_keyboard(is_enabled, current=section)
+            reply_markup=_markets_section_keyboard(is_enabled, current=section, user_id=user_id)
             if is_last
             else None,
         )
@@ -4536,6 +4547,137 @@ async def handle_signal_explain_callback(callback: CallbackQuery):
     await bot.send_message(
         callback.message.chat.id,
         _signal_glossary_text(),
+        parse_mode="Markdown",
+        disable_web_page_preview=True,
+    )
+
+
+def _markets_glossary_text() -> str:
+    """Глоссарий /markets — что значат строки в выводе.
+
+    Покрывает терминологию ВСЕХ блоков на актив:
+      • MA-триггеры (▲/▼ выше/ниже MA200/MA50)
+      • S/R-уровни (🎯 R: / S:) — сопротивление/поддержка
+      • SL/TP-план (🎯 LONG/SHORT TP/SL)
+      • Quant-вердикт (LONG/SHORT/NEUTRAL по BB+Donchian+RSI ансамблю)
+      • Тренд (UPTREND/DOWNTREND/SIDEWAYS) и confluence MA50/MA200
+      • Hurst (H), Permutation Entropy (PE), score, VR — стат-тесты
+      • σ̂ — EWMA-прогноз волатильности (RiskMetrics)
+      • Markov-режим — статистика дискретизованных состояний
+
+    Формат MD V1. Все `_` вне backtick-code-span'ов экранированы.
+    Длина < 4096 chars (одна Telegram-message).
+    """
+    return (
+        "*📖 Глоссарий /markets — что значат эти слова*\n"
+        "\n"
+        "*🟢/🔴 24ч / 7д / 30д.*  Цвет = знак изменения цены. Зелёный — вырос, "
+        "красный — упал. Числа в процентах от цены на начало периода.\n"
+        "\n"
+        "*▲ / ▼ MA-триггеры.*  Скользящие средние MA50 (последние 50 дней) и "
+        "MA200 (200 дней) — базовые уровни тренда.\n"
+        "• `▲ выше $X (MA200) → LONG` — если закрытие выше MA200, тренд "
+        "восходящий, идея на покупку.\n"
+        "• `▼ ниже $Y (MA50) → SHORT` — если закрытие ниже MA50, тренд "
+        "падающий, идея на продажу.\n"
+        "\n"
+        "*🎯 R / S — Сопротивление и Поддержка.*  Горизонтальные уровни "
+        "цены где рынок исторически разворачивался.\n"
+        "• *R₁/R₂ (Resistance)* — уровни *выше* цены. Цена «упирается», "
+        "продавцы активны. Часто = разворот вниз или хорошее место для TP.\n"
+        "• *S₁/S₂ (Support)* — уровни *ниже* цены. Цена «отбивается», "
+        "покупатели активны. Часто = разворот вверх или хорошее место для SL.\n"
+        "• Метка `MA200` / `MA50` означает что уровень совпадает со "
+        "скользящей средней (*confluence* — двойное подтверждение).\n"
+        "• Метка `свинг-Nд` — последнее касание этого уровня было N дней "
+        "назад. Чем меньше N, тем «свежее» уровень.\n"
+        "• `+X.X% / −X.X%` — расстояние от текущей цены до уровня.\n"
+        "\n"
+        "*🎯 LONG / SHORT — план сделки.*  Готовая идея с расчётом риска.\n"
+        "• `TP` (Target Profit) — цель прибыли. Закрытие позиции в плюс.\n"
+        "• `SL` (Stop Loss) — цена закрытия в убыток если идея не сработала.\n"
+        "• `R/R 2:1` — Reward/Risk: рискуем $1, цель $2. Безубыточно при "
+        "winrate ≥ 33%.\n"
+        "• SL/TP рассчитаны от σ̂ (см. ниже), а не фиксированный % — "
+        "узкие стопы для спокойных активов, широкие для волатильных.\n"
+        "\n"
+        "*🟢/🔴/⚪️ Quant.*  Ансамбль из 3 фильтров (Bollinger Bands + Donchian + "
+        "RSI) с BTC-regime-gate. На бэктесте 65.9% hit-rate vs 49.6% у "
+        "простых MA-сигналов.\n"
+        "• `LONG (70%)` — 7 из 10 dimensions говорят «покупай».\n"
+        "• `NEUTRAL (0%)` — нет конфлюэнции, сидим вне рынка.\n"
+        "\n"
+        "*📈/📉/↔️ ТРЕНД.*  UPTREND / DOWNTREND / SIDEWAYS — итоговая метка по "
+        "HH/HL count + MA + изменению цены за 7д.\n"
+        "\n"
+        "*🔄 MEAN-REVERTING / 📈 TRENDING / 🪙 RANDOM WALK.*  Структура ряда:\n"
+        "• *TRENDING* — цена держит направление, тренд-стратегии работают.\n"
+        "• *MEAN-REVERTING* — рынок «дышит» вокруг средней, скальп возле S/R.\n"
+        "• *RANDOM WALK* — направление непредсказуемо, как монетка. Не "
+        "торгуем.\n"
+        "\n"
+        "*H — Hurst Exponent.*  Мера «памяти» ряда [0..1]:\n"
+        "• `H > 0.55` — трендовый (память есть, инерция).\n"
+        "• `H ≈ 0.50` — random walk (нет памяти).\n"
+        "• `H < 0.45` — mean-reverting (антипамять, откаты).\n"
+        "\n"
+        "*PE — Permutation Entropy.*  Энтропия порядка соседних значений "
+        "[0..1]. `PE ≈ 1.0` = шум; `PE < 0.85` = есть структура.\n"
+        "\n"
+        "*score.*  Композитный рейтинг 0..1 — насколько актив торгуется. "
+        "0 = шум; 1 = идеальный сетап. Порог 0.6 в нашей системе.\n"
+        "\n"
+        "*VR (Variance Ratio Test).*  Стат-тест Lo-MacKinlay: «правда ли "
+        "цена движется направленно?»\n"
+        "• `H0 не отвергнут` = математически не отличимо от случайного "
+        "блуждания → не торгуем.\n"
+        "• `H0 отвергнут` = есть статистически значимая структура → "
+        "сигнал валиден.\n"
+        "\n"
+        "*σ̂ (сигма-форкаст).*  Прогноз дневной волатильности по EWMA с "
+        "λ=0.94 (модель RiskMetrics). Грубо — «насколько актив "
+        "обычно колеблется за день». BTC ≈ 1.5%, XRP ≈ 2.0%. Цифра "
+        "`год.XX%` — annualized (σ̂ × √252).\n"
+        "\n"
+        "*🎲 Markov state.*  Дискретизуем дневные returns в 3 состояния "
+        "(DOWN / FLAT / UP) и считаем матрицу переходов:\n"
+        "• Текущее состояние + dwell-time (сколько баров в нём сидим).\n"
+        "• `UP 35% / FLAT 22% / DOWN 43%` — вероятности следующего бара.\n"
+        "• Если P(желаемое направление) > 50% — Markov даёт +pts в score.\n"
+        "\n"
+        "*Объём 24ч.*  Сумма USD-объёма сделок за последние 24 часа. Высокий "
+        "объём = ликвидно, спред маленький. Низкий = осторожно (slippage).\n"
+        "\n"
+        "*Главное правило.*  Все цифры — *математика*, не приказ. "
+        "Используй для рамки риска, не как «гарантированный сигнал».\n"
+    )
+
+
+@dp.callback_query(F.data.startswith("mktexplain:"))
+async def handle_markets_explain_callback(callback: CallbackQuery):
+    """Кнопка «📖 Что значат эти слова?» под /markets.
+
+    Отправляет НОВОЕ сообщение с глоссарием — не редактирует исходный
+    /markets-выкат (чтобы юзер мог видеть и данные, и пояснение рядом).
+    UID проверяется чтоб чужой клик в групповом чате не выдавал ответ.
+    Тот же паттерн что и `handle_signal_explain_callback` для /signal.
+    """
+    parts = (callback.data or "").split(":")
+    if len(parts) != 2:
+        await callback.answer()
+        return
+    try:
+        kb_uid = int(parts[1])
+    except ValueError:
+        await callback.answer()
+        return
+    if kb_uid != callback.from_user.id:
+        await callback.answer("Кнопка не с твоего аккаунта", show_alert=True)
+        return
+    await callback.answer()
+    await bot.send_message(
+        callback.message.chat.id,
+        _markets_glossary_text(),
         parse_mode="Markdown",
         disable_web_page_preview=True,
     )

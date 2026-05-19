@@ -490,6 +490,11 @@ async def _fetch_trend_data(session, symbol_binance: str, key: str) -> dict:
         # ансамбля с BTC-regime gate. Не отдаём агентам/юзеру — служебное поле
         # с подчёркиванием. ~250 закрытий → ~2KB на актив, безопасно.
         result["_closes_daily"] = closes[-250:]
+        # Дополнительно тянем highs/lows для S/R-детекции (core.support_resistance).
+        # Свинг-пивоты считаются по wicks, не по closes — иначе пропускаем
+        # intraday-разворот.
+        result["_highs_daily"] = [float(k[2]) for k in klines][-250:]
+        result["_lows_daily"]  = [float(k[3]) for k in klines][-250:]
 
     except Exception as e:
         logger.debug(f"Trend data {symbol_binance}: {e}")
@@ -577,6 +582,12 @@ async def _fetch_yahoo_trend(session, ticker: str, key: str) -> dict:
             # Binance падает), и для макро. Yahoo `range=1y` гарантирует
             # ~250 баров что выше MIN_BARS_FOR_HURST=64.
             result.update(_compute_complexity_fields(closes))
+
+            # Highs/lows для S/R-детекции (core.support_resistance).
+            # Yahoo иногда даёт None в high/low массивах (полу-выходные дни) —
+            # фильтруем как для closes выше.
+            result["_highs_daily"] = highs[-250:]
+            result["_lows_daily"]  = lows[-250:]
 
             # Простой trend label (как в _fetch_trend_data, но без HH/HL)
             ch_7d = result.get("change_7d", 0) or 0
@@ -1245,6 +1256,78 @@ def _trigger_lines(
     ]
 
 
+def _sr_lines(
+    p: dict,
+    indent: str = "    ",
+    prefix: str = "$",
+) -> list[str]:
+    """Две строки с уровнями сопротивления (R) и поддержки (S) для одного актива.
+
+    Формат::
+
+        🎯 R: $81,956 MA200 +3.6%  │  $82,500 свинг-15д +4.3%
+           S: $74,968 MA50 −5.2%   │  $73,200 свинг-22д −7.5%
+
+    Выбор уровней:
+      • R₁/R₂ — ближайшие к текущей цене сверху (после strength-ранжирования)
+      • S₁/S₂ — ближайшие снизу
+      • метка `MA200` / `MA50` если уровень в пределах 0.5% от MA (confluence)
+      • иначе «свинг-Nд» где N — баров назад был последний пивот
+
+    Возвращает [] если данных мало (нет `_highs_daily`/`_lows_daily`).
+    Это сохраняет graceful-degradation для активов без OHLC (например
+    F&G, MACRO-агрегаторы).
+    """
+    highs = p.get("_highs_daily")
+    lows  = p.get("_lows_daily")
+    price = p.get("price")
+    if not isinstance(highs, list) or not isinstance(lows, list):
+        return []
+    if not isinstance(price, (int, float)) or price <= 0:
+        return []
+    # Минимум 2*lookback+1 = 11 баров для lookback=5. На практике хотим
+    # хотя бы ~30 чтобы было где появиться пивотам с обоих сторон.
+    if len(highs) < 30 or len(lows) < 30:
+        return []
+
+    # Импорт внутри функции — избегаем кругового импорта core/* ⇄ web_search
+    # в случае если core.support_resistance в будущем подтянет что-то отсюда.
+    from core.support_resistance import compute_sr_levels, label_level_source
+
+    sr = compute_sr_levels(
+        highs, lows,
+        current_price=float(price),
+        lookback=5,
+        tolerance_pct=0.5,
+        recency_halflife=30.0,
+        num_each_side=2,
+    )
+    if not sr.resistances and not sr.supports:
+        return []
+
+    ma50 = p.get("ma50") if isinstance(p.get("ma50"), (int, float)) else None
+    ma200 = p.get("ma200") if isinstance(p.get("ma200"), (int, float)) else None
+
+    def _fmt_level(lv) -> str:
+        """`$81,956 MA200 +3.6%` / `$74,968 свинг-15д −5.2%`."""
+        src = label_level_source(lv, ma50=ma50, ma200=ma200)
+        pct = (lv.price - float(price)) / float(price) * 100
+        sign = "+" if pct >= 0 else "−"
+        return f"{_fmt_money(lv.price, prefix=prefix)} {src} {sign}{abs(pct):.1f}%"
+
+    out: list[str] = []
+    # R-строка
+    if sr.resistances:
+        r_strs = [_fmt_level(lv) for lv in sr.resistances]
+        out.append(f"{indent}🎯 R: " + "  │  ".join(r_strs))
+    # S-строка — выравниваем «S:» под «R:» (на месте 🎯 — пробелы).
+    if sr.supports:
+        s_strs = [_fmt_level(lv) for lv in sr.supports]
+        # 4 пробела чтобы выровнять под «🎯 R:» (эмодзи занимает ~2 знакоместа).
+        out.append(f"{indent}   S: " + "  │  ".join(s_strs))
+    return out
+
+
 def format_prices_for_agents(prices: dict, *, for_user: bool = False) -> str:
     """Рендерит prices dict в текст для агентов или пользователя.
 
@@ -1304,6 +1387,16 @@ def format_prices_for_agents(prices: dict, *, for_user: bool = False) -> str:
             # форматом, который генерит Synth-агент в `plans[].trigger`.
             for t in _trigger_lines(p):
                 lines.append(t)
+
+            # S/R-уровни: 2 сопротивления выше цены + 2 поддержки ниже.
+            # Считаются `core.support_resistance` по wicks за ~250 D1
+            # баров. Появляются ПОСЛЕ MA-триггеров (которые задают LONG/
+            # SHORT bias) и ПЕРЕД SL/TP-расчётом — горизонтальные уровни
+            # информируют куда ставить стоп / тейк. Feature-flagged через
+            # FEATURE_SR_LEVELS, default ON.
+            if os.getenv("FEATURE_SR_LEVELS", "1") != "0":
+                for t in _sr_lines(p):
+                    lines.append(t)
 
             # SL/TP-уровни от текущей цены для LONG и SHORT — чтобы юзер
             # сразу видел, куда ставить стоп и тейк, без ручного счёта
@@ -1400,6 +1493,9 @@ def format_prices_for_agents(prices: dict, *, for_user: bool = False) -> str:
             # SPX/NDX/VIX рендерим без $-префикса — это индексы, не доллары.
             for t in _trigger_lines(p, prefix=""):
                 lines.append(t)
+            if os.getenv("FEATURE_SR_LEVELS", "1") != "0":
+                for t in _sr_lines(p, prefix=""):
+                    lines.append(t)
             tl = _macro_trend_line(p)
             if tl:
                 lines.append(f"    {tl}")
@@ -1422,6 +1518,9 @@ def format_prices_for_agents(prices: dict, *, for_user: bool = False) -> str:
             trig_prefix = "$" if k in ("OIL_WTI", "GOLD") else ""
             for t in _trigger_lines(p, prefix=trig_prefix):
                 lines.append(t)
+            if os.getenv("FEATURE_SR_LEVELS", "1") != "0":
+                for t in _sr_lines(p, prefix=trig_prefix):
+                    lines.append(t)
             tl = _macro_trend_line(p, unit=u if k == "OIL_WTI" or k == "GOLD" else "")
             if tl:
                 lines.append(f"    {tl}")
