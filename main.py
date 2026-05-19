@@ -1980,6 +1980,125 @@ async def cmd_provenance(message: Message):
         await message.answer(f"Ошибка provenance: {e}")
 
 
+@dp.message(Command("calibration"))
+async def cmd_calibration(message: Message):
+    """Per-signal калибровка — отвечает на вопрос «какие сигналы реально работают».
+
+    Usage:
+      /calibration                — общая сводка за 30 дней
+      /calibration 7              — за 7 дней
+      /calibration drift          — concept drift (recent 14д vs baseline 60д)
+      /calibration BTC            — фильтр по активу
+      /calibration BTC 14         — BTC за 14 дней
+
+    Источник данных: `decision_provenance` (PR #1) ⨝ `predictions` через
+    prediction_id или fuzzy-join по asset+direction+time. Метрики:
+      • Hit-rate (wins / wins+losses)
+      • Brier score (≤ 0.20 = реально калиброван)
+      • Reliability bins (10 бинов confidence vs realized hit-rate)
+      • Signal attribution (какой компонент score breakdown'а лучше
+        разделяет wins/losses)
+    """
+    try:
+        from core.calibration import (
+            breakdown_by_asset,
+            breakdown_by_decision_type,
+            breakdown_by_direction,
+            breakdown_by_regime,
+            compute_overall_stats,
+            compute_reliability_diagram,
+            compute_signal_attribution,
+            detect_concept_drift,
+            format_attribution_telegram,
+            format_breakdown_telegram,
+            format_drift_telegram,
+            format_overall_telegram,
+            format_reliability_telegram,
+            link_provenance_outcomes,
+        )
+
+        parts = (message.text or "").split()
+        args = [p.strip() for p in parts[1:]]
+
+        # ─── /calibration drift ─────────────────────────────────────────
+        if args and args[0].lower() == "drift":
+            drift = await detect_concept_drift(
+                recent_days=14, baseline_days=60
+            )
+            await message.answer(format_drift_telegram(drift), parse_mode="Markdown")
+            return
+
+        # ─── Parsing аргументов: actor (asset) + window_days ────────────
+        asset_filter: Optional[str] = None
+        window_days = 30
+        for a in args:
+            if a.isdigit():
+                window_days = max(1, min(365, int(a)))
+            else:
+                # ASSET-фильтр: только UPPERCASE токены.
+                asset_filter = a.upper()
+
+        linked = await link_provenance_outcomes(
+            window_days=window_days, asset=asset_filter
+        )
+        overall = compute_overall_stats(linked)
+
+        if overall["n_total"] == 0:
+            scope = f" по {asset_filter}" if asset_filter else ""
+            await message.answer(
+                f"📭 Provenance{scope} пуста за {window_days}д. Запусти /signal или "
+                f"/markets — и решения начнут писаться, после закрытия prediction'ов "
+                f"калибровка появится.",
+                parse_mode="Markdown",
+            )
+            return
+
+        blocks: list[str] = []
+        blocks.append(format_overall_telegram(overall, window_days))
+
+        if overall["is_reliable"]:
+            blocks.append(
+                format_breakdown_telegram(
+                    breakdown_by_direction(linked),
+                    title="По направлению (LONG vs SHORT)",
+                )
+            )
+            blocks.append(
+                format_breakdown_telegram(
+                    breakdown_by_asset(linked), title="По активам"
+                )
+            )
+            blocks.append(
+                format_breakdown_telegram(
+                    breakdown_by_decision_type(linked),
+                    title="По типу решения",
+                )
+            )
+            blocks.append(
+                format_breakdown_telegram(
+                    breakdown_by_regime(linked),
+                    title="По режиму (тренд)",
+                )
+            )
+            blocks.append(
+                format_reliability_telegram(
+                    compute_reliability_diagram(linked, n_bins=10)
+                )
+            )
+            blocks.append(
+                format_attribution_telegram(compute_signal_attribution(linked))
+            )
+            blocks.append(
+                "💡 Команды: `/calibration drift` для concept-drift verdict."
+            )
+
+        text = "\n\n".join(b for b in blocks if b)
+        await message.answer(text, parse_mode="Markdown")
+    except Exception as e:
+        logger.exception("calibration error")
+        await message.answer(f"Ошибка calibration: {e}")
+
+
 @dp.message(Command("usage"))
 async def cmd_usage(message: Message):
     """Token usage по провайдерам с момента последнего рестарта."""
