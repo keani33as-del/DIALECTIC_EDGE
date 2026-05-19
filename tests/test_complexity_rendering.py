@@ -19,6 +19,7 @@ import unittest
 from web_search import (
     _compute_complexity_fields,
     _complexity_line,
+    _sr_lines,
     _trigger_lines,
     format_prices_for_agents,
 )
@@ -475,6 +476,95 @@ class TestForUserFormat(unittest.TestCase):
         out = format_prices_for_agents(self._prices(), for_user=True)
         # Хвост не должен быть пустыми строками
         self.assertFalse(out.endswith("\n\n"))
+
+
+class TestSupportResistanceRendering(unittest.TestCase):
+    """`_sr_lines(...)` + integration в `format_prices_for_agents`.
+
+    Проверяем:
+      • без `_highs_daily`/`_lows_daily` → пустой результат (graceful)
+      • с синтетическим OHLC → формат как в дизайне
+      • в полном /markets-выводе: строка `🎯 R:` появляется для крипты
+        у которой есть highs/lows
+      • FEATURE_SR_LEVELS=0 → S/R-строки скрыты
+    """
+
+    def _synth_ohlc(self, n: int = 80, base: float = 100.0):
+        """Шумная синусоида: высокий уровень сопротивления около base+15,
+        поддержка около base-15. Гарантирует наличие пивотов."""
+        import math as _math
+        highs: list[float] = []
+        lows: list[float] = []
+        for i in range(n):
+            mid = base + 12.0 * _math.sin(2 * _math.pi * i / 18)
+            highs.append(mid + 1.0)
+            lows.append(mid - 1.0)
+        return highs, lows
+
+    def _prices_with_ohlc(self) -> dict:
+        highs, lows = self._synth_ohlc(n=80, base=100.0)
+        return {
+            "BTC": {
+                "price": 100.0,
+                "change_24h": 0.5,
+                "source": "Binance",
+                "trend": "SIDEWAYS",
+                "trend_emoji": "↔️",
+                "ma50": 99.5,
+                "ma200": 100.2,
+                "above_ma50": True,
+                "above_ma200": False,
+                "_highs_daily": highs,
+                "_lows_daily": lows,
+            },
+        }
+
+    def test_sr_lines_empty_when_no_ohlc(self):
+        """Без `_highs_daily`/`_lows_daily` функция должна вернуть []
+        вместо падения."""
+        p = {"price": 100.0, "ma50": 95.0, "ma200": 105.0}
+        self.assertEqual(_sr_lines(p), [])
+
+    def test_sr_lines_empty_when_too_few_bars(self):
+        """Меньше 30 баров — пустой результат (нужны pivots с обоих сторон)."""
+        p = {
+            "price": 100.0,
+            "_highs_daily": [101.0] * 10,
+            "_lows_daily": [99.0] * 10,
+        }
+        self.assertEqual(_sr_lines(p), [])
+
+    def test_sr_lines_format_has_r_and_s(self):
+        """С синтетической синусоидой — должны быть и R, и S строки."""
+        highs, lows = self._synth_ohlc(n=80, base=100.0)
+        p = {"price": 100.0, "_highs_daily": highs, "_lows_daily": lows}
+        out = _sr_lines(p)
+        joined = "\n".join(out)
+        self.assertIn("🎯 R:", joined)
+        self.assertIn("S:", joined)
+        # Формат пунктов: `$112.0 свинг-Nд +12.0%`
+        # Проверим что есть хотя бы одна процентовка с плюсом и одна с минусом.
+        self.assertRegex(joined, r"\+\d+\.\d+%")
+        self.assertRegex(joined, r"−\d+\.\d+%")
+
+    def test_format_prices_includes_sr_when_ohlc_present(self):
+        """End-to-end: `_sr_lines` подключается в /markets рендере."""
+        out = format_prices_for_agents(self._prices_with_ohlc(), for_user=True)
+        self.assertIn("🎯 R:", out)
+
+    def test_feature_flag_disables_sr(self):
+        """FEATURE_SR_LEVELS=0 → строки скрыты."""
+        import os as _os
+        prev = _os.environ.get("FEATURE_SR_LEVELS")
+        _os.environ["FEATURE_SR_LEVELS"] = "0"
+        try:
+            out = format_prices_for_agents(self._prices_with_ohlc(), for_user=True)
+            self.assertNotIn("🎯 R:", out)
+        finally:
+            if prev is None:
+                _os.environ.pop("FEATURE_SR_LEVELS", None)
+            else:
+                _os.environ["FEATURE_SR_LEVELS"] = prev
 
 
 if __name__ == "__main__":
