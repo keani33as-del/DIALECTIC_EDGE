@@ -151,3 +151,15 @@ AUTOTRADE_CONTRARIAN_RSI_OVERSOLD = float(os.getenv("AUTOTRADE_CONTRARIAN_RSI_OV
 AUTOTRADE_CONTRARIAN_RSI_OVERBOUGHT = float(os.getenv("AUTOTRADE_CONTRARIAN_RSI_OVERBOUGHT", "65"))
 # Ограничить размер JSON-снимка контекста модели в БД (символов)
 DIGEST_SNAPSHOT_MAX_CHARS = int(os.getenv("DIGEST_SNAPSHOT_MAX_CHARS", "12000"))
+
+# ─── POST-MORTEM (24h после дайджеста) ────────────────────────────────────────
+# Через сутки после публикации /daily — сверяем вердикт с реальным движением.
+# Пишет labels в `predictions` для /calibration (см. core/post_mortem.py).
+# По дефолту 1: это feature-flag для аварийного выключения, не для постепенного
+# rollout — модуль безопасный, чистая запись новых строк в таблицу predictions.
+FEATURE_POST_MORTEM = os.getenv("FEATURE_POST_MORTEM", "1").strip().lower() in (
+    "1", "true", "yes", "on",
+)
+# UTC-время дневного запуска post-mortem.  По дефолту 23:50 — за 10 минут до
+# нового дайджеста, когда вчерашний имеет реальный 24h-горизонт.
+POST_MORTEM_RUN_TIME_UTC = os.getenv("POST_MORTEM_RUN_TIME_UTC", "23:50").strip()
