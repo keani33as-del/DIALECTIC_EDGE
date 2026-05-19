@@ -4085,8 +4085,12 @@ def _signal_explain_keyboard(user_id: int) -> InlineKeyboardMarkup:
 def _signal_glossary_text() -> str:
     """Человечий перевод всех терминов из `_fmt_signal_message`.
 
-    Формат — Markdown V1.  `_` нигде не используется в литералах ради
-    стабильного рендера (Telegram V1 трактует пары `_` как italic).
+    Формат — Markdown V1.  Все `_` вне backtick-code-span'ов экранированы
+    бэкслэшем (`\\_`) — иначе Telegram parser трактует пару `_` как italic
+    и при нечётном их количестве падает с «Can't find end of the entity».
+    Внутри `\u200b\u200b`...`\u200b\u200b` (code-span) `_` можно оставлять как есть — внутри
+    code'а MD V1 ничего не парсит.
+
     Текст stateless: одинаков для любого setup'а, потому что объясняет
     *слова*, а не *числа*.  Размер < 4096 для одной телеги-message.
     """
@@ -4125,7 +4129,7 @@ def _signal_glossary_text() -> str:
         "• *Target 3.0σ̂* — цель в 2 раза дальше стопа = R/R 2:1.\n"
         "\n"
         "*Size 25%.*  Размер позиции — четверть свободного капитала.  При "
-        "$500 → $125 в позицию.  Risk-per-trade = stop_pct × size ≈ "
+        "$500 → $125 в позицию.  `Risk-per-trade = stop_pct × size` ≈ "
         "1% капитала (классическое Kelly-conservative).\n"
         "\n"
         "*Score breakdown (0-100):*\n"
@@ -4133,8 +4137,8 @@ def _signal_glossary_text() -> str:
         "DOWNTREND если ниже обеих; SIDEWAYS если в коридоре (тогда "
         "trade-кандидата нет).\n"
         "• *Complexity* (0-20 pts) — `TRENDING` (max 20) если ряд держит "
-        "направление; `MEAN\\_REVERTING` (5) — рынок «дышит» вокруг "
-        "средней цены; `RANDOM\\_WALK` / `CHAOTIC` (0) — высокая "
+        "направление; `MEAN_REVERTING` (5) — рынок «дышит» вокруг "
+        "средней цены; `RANDOM_WALK` / `CHAOTIC` (0) — высокая "
         "неопределённость.\n"
         "• *VRT (Variance Ratio Test, 0-15 pts).*  Статтест: «правда ли "
         "цена движется направленно?»  *Не отвергает H0* = математически "
@@ -4146,7 +4150,7 @@ def _signal_glossary_text() -> str:
         "\n"
         "*Слабое место.*  Если score хороший (60+), но один из "
         "компонентов = 0 — выносим в риски.  Пример: high score за "
-        "тренд, но `RANDOM\\_WALK` за complexity = «тренд есть, но шум "
+        "тренд, но `RANDOM_WALK` за complexity = «тренд есть, но шум "
         "доминирует, не входи на full size».\n"
         "\n"
         "*Что НЕ торгуется.*  VIX / GOLD / SPX часто в топе по score, "

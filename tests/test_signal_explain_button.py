@@ -163,16 +163,36 @@ class TestSignalGlossaryText(unittest.TestCase):
             any(s in text.lower() for s in ("suggestion", "не приказ", "подтверд"))
         )
 
-    def test_underscores_escaped_for_md_v1(self):
+    def test_underscores_safe_for_md_v1(self):
+        """`_` в Telegram MD V1 трактуется как italic.
+
+        Два валидных способа сделать `_` безопасным:
+          1) Экранировать как `\\_` (parser игнорит markdown).
+          2) Завернуть в `` `code` `` (внутри code-span'а MD V1
+             ничего не парсит).
+
+        Тут проверяем, что вне code-span'ов НЕТ голых `_`.  Это
+        regression-guard против `TelegramBadRequest: can't parse
+        entities` (баг словили на проде на байте 4360 — `stop_pct`
+        стоял без бэктиков и без эскейпа).
+        """
+        import re  # noqa: PLC0415
+
         text = self._txt()
-        # MEAN_REVERTING / RANDOM_WALK содержат `_` — должны быть escape'нуты
-        # как `\_` чтобы Telegram MD V1 не превратил их в italic.
-        if "MEAN" in text:
-            self.assertNotIn("MEAN_REVERTING", text)
-            self.assertIn("MEAN\\_REVERTING", text)
-        if "RANDOM" in text:
-            self.assertNotIn("RANDOM_WALK", text)
-            self.assertIn("RANDOM\\_WALK", text)
+        # Вырезаем содержимое всех code-span'ов — внутри них `_`
+        # безопасны и проверять их не нужно.
+        no_code = re.sub(r"`[^`]*`", "", text)
+        bare = [
+            i
+            for i, ch in enumerate(no_code)
+            if ch == "_" and (i == 0 or no_code[i - 1] != "\\")
+        ]
+        self.assertEqual(
+            bare,
+            [],
+            f"Found {len(bare)} bare '_' outside code spans at chars "
+            f"{bare[:5]} — Telegram MD V1 will fail to parse.",
+        )
 
 
 @unittest.skipUnless(HAS_AIOGRAM, "aiogram not installed (unit-fast job)")
