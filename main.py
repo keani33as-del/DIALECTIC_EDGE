@@ -2099,6 +2099,82 @@ async def cmd_calibration(message: Message):
         await message.answer(f"Ошибка calibration: {e}")
 
 
+@dp.message(Command("wfbacktest"))
+async def cmd_wfbacktest(message: Message):
+    """Walk-forward backtest изотонической калибровки — честная OOS оценка.
+
+    Usage:
+      /wfbacktest                  — окно 30д, train 14д / test 7д / step 7д
+      /wfbacktest 60               — окно 60 дней, дефолтные train/test/step
+      /wfbacktest BTC              — фильтр по активу
+      /wfbacktest 60 14 7          — окно 60д, train 14д, test 7д (step=test)
+
+    Зачем: `/calibration` показывает калибровку **in-sample** (на всех закрытых
+    сделках). Это переоценка — модель не училась исторически, она просто
+    видела все точки сразу.
+
+    `/backtest` делает rolling walk-forward: фитит isotonic на train-окне,
+    применяет к следующему test-окну, считает out-of-sample Brier для raw vs
+    calibrated. Затем агрегирует через все фолды.
+
+    Verdict:
+      * `CALIBRATION_HELPS` — средний OOS Brier с калибровкой < без + больше
+        половины фолдов улучшились → можно включать в продакшен.
+      * `RAW_BETTER` — калибровка не улучшает (рано включать).
+      * `INSUFFICIENT_DATA` — мало resolved-сделок в окне.
+
+    Источник данных: `decision_provenance` (PR #1) ⨝ `predictions`.
+    """
+    try:
+        from core.walk_forward import (
+            DEFAULT_TEST_DAYS,
+            DEFAULT_TOTAL_DAYS,
+            DEFAULT_TRAIN_DAYS,
+            format_backtest_folds_telegram,
+            format_backtest_telegram,
+            walk_forward_backtest,
+        )
+
+        parts = (message.text or "").split()
+        args = [p.strip() for p in parts[1:]]
+
+        # Parsing: каждый аргумент либо число (день), либо актив (UPPERCASE).
+        nums: list[int] = []
+        asset_filter: Optional[str] = None
+        for a in args:
+            if a.isdigit():
+                nums.append(max(1, min(365, int(a))))
+            else:
+                asset_filter = a.upper()
+
+        # Распакуем числа: [total], [total, train], [total, train, test], ...
+        window_days = nums[0] if len(nums) >= 1 else DEFAULT_TOTAL_DAYS
+        train_days = nums[1] if len(nums) >= 2 else DEFAULT_TRAIN_DAYS
+        test_days = nums[2] if len(nums) >= 3 else DEFAULT_TEST_DAYS
+        step_days = nums[3] if len(nums) >= 4 else test_days
+
+        result = await walk_forward_backtest(
+            window_days=window_days,
+            train_days=train_days,
+            test_days=test_days,
+            step_days=step_days,
+            asset=asset_filter,
+        )
+
+        blocks = [format_backtest_telegram(result)]
+        if result["folds"]:
+            blocks.append(format_backtest_folds_telegram(result, limit=5))
+        blocks.append(
+            "💡 Когда verdict станет `CALIBRATION_HELPS` — можно поднять "
+            "`FEATURE_RECALIBRATE=1` и применять калибровку к live-score."
+        )
+
+        await message.answer("\n\n".join(blocks), parse_mode="Markdown")
+    except Exception as e:
+        logger.exception("wfbacktest error")
+        await message.answer(f"Ошибка wfbacktest: {e}")
+
+
 @dp.message(Command("usage"))
 async def cmd_usage(message: Message):
     """Token usage по провайдерам с момента последнего рестарта."""
