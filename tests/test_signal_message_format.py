@@ -328,6 +328,59 @@ class TestFmtSignalMessagePreview(unittest.TestCase):
         self.assertNotIn("90% дней", msg)
         self.assertNotIn("слив комиссий", msg)
 
+    def test_preview_escapes_underscores_in_reasons(self):
+        """Reason 'MEAN_REVERTING …' должен прийти как 'MEAN\\_REVERTING …'.
+
+        Сырой `_` в Telegram MD V1 трактуется как italic — пара `_` съедала
+        всё между ними. Юзер видел `MEANREVERTING` вместо `MEAN_REVERTING`.
+        """
+        msg = self._render()
+        # Reason содержит MEAN_REVERTING — должно быть экранировано.
+        self.assertIn(r"MEAN\_REVERTING", msg)
+        # Старая (сломанная) форма не должна появляться нигде в выводе.
+        self.assertNotIn(
+            "MEAN_REVERTING — counter-trend",
+            msg,
+            msg=(
+                "raw `MEAN_REVERTING` без бэкслэша ломает Telegram MD parsing "
+                "(пара `_` съест всё в italic)"
+            ),
+        )
+
+    def test_preview_no_raw_tradable_assets_constant(self):
+        """`TRADABLE_ASSETS = ...` ломал MD V1 двумя `_`. Должно быть в backticks."""
+        msg = self._render()
+        self.assertNotIn("TRADABLE_ASSETS =", msg)
+        # Новая форма — список активов в backtick-code-span'е.
+        self.assertIn("`BTC/ETH/SOL/BNB/XRP`", msg)
+
+
+@unittest.skipUnless(HAS_AIOGRAM, "aiogram not installed (unit-fast job)")
+class TestMdEscapeUnderscores(unittest.TestCase):
+    """`_md_escape_underscores` — экранирование `_` для Telegram MD V1."""
+
+    @classmethod
+    def setUpClass(cls):
+        from main import _md_escape_underscores  # noqa: PLC0415
+
+        cls._escape = staticmethod(_md_escape_underscores)
+
+    def test_replaces_underscores_with_backslash_underscore(self):
+        self.assertEqual(self._escape("MEAN_REVERTING"), r"MEAN\_REVERTING")
+        self.assertEqual(self._escape("RANDOM_WALK"), r"RANDOM\_WALK")
+
+    def test_no_underscore_no_change(self):
+        self.assertEqual(self._escape("UPTREND ✓ (vs MA50 +5.3%)"), "UPTREND ✓ (vs MA50 +5.3%)")
+
+    def test_multiple_underscores(self):
+        self.assertEqual(
+            self._escape("FOO_BAR_BAZ"),
+            r"FOO\_BAR\_BAZ",
+        )
+
+    def test_empty_string(self):
+        self.assertEqual(self._escape(""), "")
+
 
 if __name__ == "__main__":
     unittest.main()

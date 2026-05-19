@@ -305,9 +305,9 @@ class TestMakeSetup(unittest.TestCase):
         self.assertIsNone(setup)
 
     def test_xrp_tick_rounding(self):
-        # XRP на Bybit Spot: tick=0.1 (1 знак после точки).
+        # XRP на Bybit Spot: tick=0.0001 (4 знака после точки).
         # Если entry=1.4643, σ̂=2%, то SL = 1.4643 * (1 - 1.5×0.02) = 1.4204
-        # — округляется до 1.4 (tick=0.1).
+        # — округляется до 1.4204 (tick=0.0001).
         p = _strong_uptrend_sol()
         p["price"] = 1.4643
         p["ma50"] = 1.40
@@ -316,9 +316,13 @@ class TestMakeSetup(unittest.TestCase):
         s = score_asset("XRP", p)
         setup = make_setup(s, p)
         self.assertIsNotNone(setup)
-        # tick=0.1 → одна цифра после точки
+        # tick=0.0001 → до 4 знаков после точки
         for price in (setup.entry, setup.stop, setup.target):
-            self.assertAlmostEqual(price * 10, round(price * 10), places=4)
+            self.assertAlmostEqual(price * 10000, round(price * 10000), places=4)
+        # Дефенсивный guard: stop != entry (раньше tick=0.1 равнял их).
+        self.assertNotEqual(setup.entry, setup.stop)
+        self.assertGreater(setup.rr_ratio, 0.5,
+                           "R/R должен быть близок к 2.0х при 4-десятичном tickе")
 
     def test_indices_not_tradable(self):
         # SPX/NDX/VIX — не в TRADABLE_ASSETS, setup не строим.
@@ -573,9 +577,11 @@ class TestConstants(unittest.TestCase):
         # SL_MULT=1.5, TP_MULT=3.0 → R/R = 2.0
         self.assertAlmostEqual(TP_SIGMA_MULT / SL_SIGMA_MULT, 2.0, places=2)
 
-    def test_xrp_tick_is_one_decimal(self):
-        # Bybit Spot constraint — XRP price принимается с 1 знаком после точки.
-        self.assertEqual(ASSET_TICK_SIZE["XRP"], 0.1)
+    def test_xrp_tick_is_4_decimals(self):
+        # Bybit Spot constraint — XRP price принимается с 4 знаками после
+        # точки. Был 0.1 и это ломало превью: entry=$1.4, stop=$1.4 → risk=0.
+        # См комментарий в core/signal_scorer.py рядом с ASSET_TICK_SIZE.
+        self.assertEqual(ASSET_TICK_SIZE["XRP"], 0.0001)
 
     def test_tradable_assets_are_crypto_only(self):
         self.assertEqual(TRADABLE_ASSETS, frozenset({"BTC", "ETH", "SOL", "BNB", "XRP"}))

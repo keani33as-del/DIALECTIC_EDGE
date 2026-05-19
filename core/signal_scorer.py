@@ -69,12 +69,17 @@ DEFAULT_SIZE_FRACTION = 0.25
 # Это HARDCODE на основе наших активов; реальные tick'и можно тянуть из
 # биржи, но для v1 хватит. Если актива нет в таблице — fallback на
 # 4 знака после точки.
+# Реальные тики Bybit Spot (USDT-pair). Аудитировано 18.05.2026 после live-репорта
+# что XRP setup имел entry=$1.4 и stop=$1.4 (tick 0.1 проглатывал σ̂≈3%/день).
+# XRP/USDT на Bybit Spot имеет шаг 0.0001 USDT (4 знака после запятой) —
+# смотри цену entry $1.3933 в открытой позиции у юзера. Остальные тики не
+# трогаем, для них σ̂ × цена ≫ tick'a и округление не критично.
 ASSET_TICK_SIZE: dict[str, float] = {
     "BTC": 0.01,
     "ETH": 0.01,
     "SOL": 0.001,
     "BNB": 0.01,
-    "XRP": 0.1,        # Bybit Spot XRP/USDT — 1 знак после точки!
+    "XRP": 0.0001,    # Bybit Spot XRP/USDT — 4 знака после точки.
     "SPX": 0.01,
     "NDX": 0.01,
     "VIX": 0.01,
@@ -306,6 +311,8 @@ def make_setup(
       - vol_sigma_1d_pct отсутствует
       - asset не в TRADABLE_ASSETS (индексы/сырьё пропускаем — нет
         прямого доступа к спот-торговле для большинства юзеров)
+      - после округления до tick'a stop_r == entry_r или target_r == entry_r
+        (σ̂ × цена < tick — например слабоволатильный alt с грубым tick'ом).
     """
     if score.total < min_score:
         return None
@@ -342,10 +349,16 @@ def make_setup(
     target_r = _round_to_tick(target_price, tick)
 
     # R/R после округления (для крупных активов как BTC округление почти
-    # не влияет; для XRP до $0.1 — заметно, поэтому пересчитываем).
+    # не влияет; для XRP/SOL — заметно, поэтому пересчитываем).
     risk = abs(entry_r - stop_r)
     reward = abs(target_r - entry_r)
-    rr = (reward / risk) if risk > 0 else 0.0
+    # Defensive: если tick проглотил σ̂ (бывает на дешёвых монетах с грубым
+    # tick'ом и низкой волой), то после округления stop_r == entry_r → risk=0.
+    # Возвращать «R/R = 0.0x: ловим в 0.0 раза…» нельзя — это junk-сигнал.
+    # Сетап нерабочий, лучше тихо отбросить и пусть caller возьмёт следующий.
+    if risk <= 0 or reward <= 0:
+        return None
+    rr = reward / risk
 
     size_usd = round(capital * size_fraction, 2)
 
