@@ -4065,6 +4065,101 @@ async def cmd_signals_deprecated(message: Message):
 
 # ─── /signal — auto SL/TP recommender ─────────────────────────────────────────
 
+def _signal_explain_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    """Кнопка под `/signal`: «📖 Что значат эти слова?».
+
+    Открывает stateless-глоссарий (всё содержится в `_signal_glossary_text`)
+    — поэтому не нужен in-memory кэш SignalSetup'а, как `_plan_table_cache`.
+    UID в callback_data чтоб чужой не нажал.
+    """
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(
+                text="📖 Что значат эти слова?",
+                callback_data=f"sigexplain:{user_id}",
+            )
+        ],
+    ])
+
+
+def _signal_glossary_text() -> str:
+    """Человечий перевод всех терминов из `_fmt_signal_message`.
+
+    Формат — Markdown V1.  `_` нигде не используется в литералах ради
+    стабильного рендера (Telegram V1 трактует пары `_` как italic).
+    Текст stateless: одинаков для любого setup'а, потому что объясняет
+    *слова*, а не *числа*.  Размер < 4096 для одной телеги-message.
+    """
+    return (
+        "*📖 Глоссарий /signal — что значат эти слова*\n"
+        "\n"
+        "*🎯 АВТО-СИГНАЛ.* Бот посчитал по формулам score 0-100 для каждого "
+        "актива.  Это *не* LLM-гадание — чистая математика по ценам.\n"
+        "\n"
+        "*Порог 60/100.*  Входим только если ≥60 — это «достаточно уверенно "
+        "чтобы рисковать живыми деньгами».  Если порог не пройден — пишем "
+        "*ЛУЧШИЙ КАНДИДАТ* и явно говорим «повышенный риск».\n"
+        "\n"
+        "*LONG / SHORT.*\n"
+        "• *LONG 📈* — ставим что цена *вырастет*.  Покупаем дёшево, продаём дороже.\n"
+        "• *SHORT 📉* — ставим что цена *упадёт*.  Зарабатываем на падении.\n"
+        "\n"
+        "*R/R 2:1 (Reward/Risk).*  Соотношение «сколько хочу заработать / "
+        "сколько готов потерять».  R/R 2:1 = рискуешь $1, целишься в $2.\n"
+        "• Математически выгодно если выигрываешь *хотя бы 1 из 3 сделок* "
+        "(33% winrate).  У нас исторически 55-62% → плюсовая стратегия.\n"
+        "\n"
+        "*Entry / Stop / Target.*\n"
+        "• *Entry* — цена входа (открытие позиции на рынке).\n"
+        "• *Stop (SL)* — цена автоматического закрытия с убытком.  Если "
+        "рынок дошёл до SL — мы ошиблись, выходим, лосс фиксированный.\n"
+        "• *Target (TP)* — цена автоматического закрытия с прибылью.  "
+        "Если рынок дошёл до TP — забираем профит.\n"
+        "\n"
+        "*σ̂ (сигма).*  Стандартное отклонение дневного движения.  Грубо — "
+        "«насколько актив обычно колеблется за день».  BTC ≈ 1.5%, XRP ≈ "
+        "2.0%, мелочь до 5%.\n"
+        "• *Stop 1.5σ̂* — стоп поставлен на 1.5 обычных дневных движения "
+        "выше шума.  Достаточно близко чтобы лосс был маленький, "
+        "достаточно далеко чтобы случайная свеча не выбила.\n"
+        "• *Target 3.0σ̂* — цель в 2 раза дальше стопа = R/R 2:1.\n"
+        "\n"
+        "*Size 25%.*  Размер позиции — четверть свободного капитала.  При "
+        "$500 → $125 в позицию.  Risk-per-trade = stop_pct × size ≈ "
+        "1% капитала (классическое Kelly-conservative).\n"
+        "\n"
+        "*Score breakdown (0-100):*\n"
+        "• *Trend* (30 pts) — UPTREND ✓ если выше MA50 и MA200; "
+        "DOWNTREND если ниже обеих; SIDEWAYS если в коридоре (тогда "
+        "trade-кандидата нет).\n"
+        "• *Complexity* (0-20 pts) — `TRENDING` (max 20) если ряд держит "
+        "направление; `MEAN\\_REVERTING` (5) — рынок «дышит» вокруг "
+        "средней цены; `RANDOM\\_WALK` / `CHAOTIC` (0) — высокая "
+        "неопределённость.\n"
+        "• *VRT (Variance Ratio Test, 0-15 pts).*  Статтест: «правда ли "
+        "цена движется направленно?»  *Не отвергает H0* = математически "
+        "не отличимо от случайного блуждания → слабый сигнал.\n"
+        "• *Markov (0-15 pts).*  Сколько раз исторически дневное "
+        "направление сохранялось на следующий день.\n"
+        "• *Tradeable (0-20 pts).*  Объём, ликвидность, спред — "
+        "торгуется ли вообще нормально.\n"
+        "\n"
+        "*Слабое место.*  Если score хороший (60+), но один из "
+        "компонентов = 0 — выносим в риски.  Пример: high score за "
+        "тренд, но `RANDOM\\_WALK` за complexity = «тренд есть, но шум "
+        "доминирует, не входи на full size».\n"
+        "\n"
+        "*Что НЕ торгуется.*  VIX / GOLD / SPX часто в топе по score, "
+        "но это индексы/сырьё — не торгуются на споте Bybit.  Бот "
+        "пропускает их, ищет лучший среди `BTC/ETH/SOL/BNB/XRP`.\n"
+        "\n"
+        "*Главное правило.*  *⚠️ Это suggestion, не приказ.*  "
+        "Подтверждай вход в Bybit вручную.  Если score < 60 — лучше "
+        "пропустить чем входить «потому что хочется».  «Сегодня "
+        "сидим» — это нормальный исход, не баг."
+    )
+
+
 def _md_escape_underscores(s: str) -> str:
     """Экранирует `_` в Telegram Markdown V1.
 
@@ -4337,11 +4432,15 @@ async def cmd_signal(message: Message):
         # score ниже порога. Без exception bubble — UI не должен падать.
         await _freeze_signal_decision(result)
 
+        # Кнопка-глоссарий показывается всегда — даже на «сегодня сидим»,
+        # т.к. термины (порог, score, σ̂, R/R) видны в шапке независимо
+        # от того прошёл ли актив порог.
         await bot.edit_message_text(
             text,
             chat_id=message.chat.id,
             message_id=wait_msg.message_id,
             parse_mode="Markdown",
+            reply_markup=_signal_explain_keyboard(user_id),
         )
     except Exception as e:
         await bot.edit_message_text(
@@ -4407,6 +4506,35 @@ async def _freeze_signal_decision(result: dict) -> None:
         logging.getLogger(__name__).warning(
             f"provenance freeze (signal_scorer) skipped: {exc}"
         )
+
+
+@dp.callback_query(F.data.startswith("sigexplain:"))
+async def handle_signal_explain_callback(callback: CallbackQuery):
+    """Кнопка «📖 Что значат эти слова?» под `/signal`.
+
+    Отправляет НОВОЕ сообщение с глоссарием (не редактирует исходный
+    сигнал — чтоб юзер мог видеть и сетап, и пояснение рядом).
+    UID проверяется чтоб чужой клик в групповом чате не выдавал ответ.
+    """
+    parts = (callback.data or "").split(":")
+    if len(parts) != 2:
+        await callback.answer()
+        return
+    try:
+        kb_uid = int(parts[1])
+    except ValueError:
+        await callback.answer()
+        return
+    if kb_uid != callback.from_user.id:
+        await callback.answer("Кнопка не с твоего аккаунта", show_alert=True)
+        return
+    await callback.answer()
+    await bot.send_message(
+        callback.message.chat.id,
+        _signal_glossary_text(),
+        parse_mode="Markdown",
+        disable_web_page_preview=True,
+    )
 
 
 @dp.message(Command("status"))
