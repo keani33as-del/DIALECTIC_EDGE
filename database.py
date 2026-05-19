@@ -180,6 +180,45 @@ async def init_db():
             )
         """)
 
+        # ── Decision provenance (см. core/provenance.py) ──
+        # Замораживает каждое торговое решение (signal_scorer + pick_best) с
+        # feature-snapshot, score breakdown и git SHA. Источник правды для
+        # "почему бот выбрал SHORT по SOL 18 мая 14:30". См. core/provenance.py.
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS decision_provenance (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at      TEXT    NOT NULL DEFAULT (datetime('now')),
+                decision_type   TEXT    NOT NULL,
+                asset           TEXT    NOT NULL,
+                direction       TEXT    NOT NULL,
+                score           INTEGER,
+                entry_price     REAL,
+                stop_loss       REAL,
+                take_profit     REAL,
+                sigma_1d_pct    REAL,
+                features_json   TEXT    NOT NULL,
+                weights_json    TEXT    NOT NULL,
+                signals_json    TEXT,
+                regime_json     TEXT,
+                code_version    TEXT,
+                schema_version  TEXT    NOT NULL DEFAULT '1.0',
+                prediction_id   INTEGER,
+                trade_log_id    INTEGER
+            )
+        """)
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_prov_asset    ON decision_provenance (asset)"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_prov_created  ON decision_provenance (created_at)"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_prov_direction ON decision_provenance (direction)"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_prov_type     ON decision_provenance (decision_type)"
+        )
+
         await db.commit()
 
     logger.info("✅ База данных инициализирована")
