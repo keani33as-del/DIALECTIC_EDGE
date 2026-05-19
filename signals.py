@@ -714,12 +714,31 @@ async def fetch_markets_bundle(github_repo: str | None = None) -> dict:
     """Один набор данных: Binance/Bybit + вердикт из DIGEST_CACHE + текст сигналов.
 
     Используется в /markets, рассылке подписчикам и автотрейдере (тот же контур, что у UI).
+
+    Provenance: после вычисления best-signal через R-систему мы замораживаем
+    решение в decision_provenance (см. core/provenance.py). Это асинхронная,
+    fire-and-forget запись — если БД недоступна, фоновое сообщение не падает.
     """
     repo = github_repo or os.getenv("GITHUB_REPO", "ANAEHY/dialectic_edge")
     binance_data = await fetch_binance_signals()
     verdict = await fetch_verdict(repo)
     sigs = analyze_signals(binance_data, verdict)
     msg = build_signals_message(sigs, binance_data, verdict)
+
+    # ── Provenance: замораживаем best-signal (если есть) для последующего replay ──
+    # Мы повторно вызываем pick_best_signal/build_signal_bias_map потому что
+    # build_signals_message их инкапсулирует. Стоимость минимальна (чистые
+    # функции, ~0.1мс), а профит — полный snapshot input'ов + R-score
+    # компонентов на момент решения. Без exception bubble: если provenance
+    # сломается, рассылка сигналов не должна падать.
+    try:
+        bias_map = build_signal_bias_map(binance_data, verdict)
+        best = pick_best_signal(sigs, binance_data, verdict)
+        from core.provenance import freeze_pick_best_decision  # local import: avoid CI smoke
+        await freeze_pick_best_decision(best, sigs, binance_data, verdict, bias_map)
+    except Exception as exc:
+        logger.warning(f"provenance freeze (pick_best) skipped: {exc}")
+
     return {
         "binance_data": binance_data,
         "verdict": verdict,

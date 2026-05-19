@@ -1919,6 +1919,67 @@ async def cmd_audit(message: Message):
         await message.answer(f"Ошибка self-audit: {e}")
 
 
+@dp.message(Command("provenance"))
+async def cmd_provenance(message: Message):
+    """Декодирует «почему бот выбрал этот сигнал» — replay сохранённых решений.
+
+    Usage:
+      /provenance          — последние 5 решений по всем активам
+      /provenance BTC      — последние 5 решений по BTC
+      /provenance 42       — детально одно решение по ID
+
+    Источник правды: таблица `decision_provenance` (см. core/provenance.py).
+    Каждый /signal и /markets морозит свой snapshot — features, score
+    breakdown, git SHA, σ̂, SL/TP. Без provenance вопрос «почему мы вошли
+    в шорт SOL вчера» не имеет ответа.
+    """
+    try:
+        from core.provenance import (
+            format_provenance_telegram,
+            get_provenance,
+            get_recent_provenances,
+        )
+
+        parts = (message.text or "").split()
+        arg = parts[1].strip().upper() if len(parts) > 1 else ""
+
+        # Если аргумент — число, это ID конкретной записи.
+        if arg.isdigit():
+            prov_id = int(arg)
+            prov = await get_provenance(prov_id)
+            if not prov:
+                await message.answer(f"⚠️ Provenance #{prov_id} не найдена.")
+                return
+            await message.answer(format_provenance_telegram(prov))
+            return
+
+        # Иначе — последние N (фильтр по asset если передан).
+        asset_filter = arg if arg else None
+        records = await get_recent_provenances(asset=asset_filter, limit=5)
+        if not records:
+            asset_str = f" для {asset_filter}" if asset_filter else ""
+            await message.answer(
+                f"📭 Provenance{asset_str} пуста. Запусти /signal или /markets — "
+                f"и решения начнут писаться."
+            )
+            return
+
+        lines = ["🔍 *Последние решения движка*", ""]
+        for r in records:
+            direction_emoji = "📈" if "LONG" in r["direction"] else "📉" if "SHORT" in r["direction"] else "⚪"
+            lines.append(
+                f"#{r['id']} {r['created_at'][:16]} "
+                f"{direction_emoji} *{r['asset']}* → *{r['direction']}* "
+                f"(score {r.get('score', 0)}, {r['decision_type']})"
+            )
+        lines.append("")
+        lines.append("Чтобы посмотреть детали: `/provenance <ID>`")
+        await message.answer("\n".join(lines), parse_mode="Markdown")
+    except Exception as e:
+        logger.exception("provenance error")
+        await message.answer(f"Ошибка provenance: {e}")
+
+
 @dp.message(Command("usage"))
 async def cmd_usage(message: Message):
     """Token usage по провайдерам с момента последнего рестарта."""
@@ -4007,6 +4068,13 @@ async def cmd_signal(message: Message):
 
         result = rank_signals(prices, capital=capital)
         text = _fmt_signal_message(result)
+
+        # ── Provenance: морозим решение signal_scorer для replay ──
+        # Если top setup найден — пишем полный snapshot (features + breakdown
+        # + SL/TP/σ̂). Если только preview_top — тоже пишем, помечаем что
+        # score ниже порога. Без exception bubble — UI не должен падать.
+        await _freeze_signal_decision(result)
+
         await bot.edit_message_text(
             text,
             chat_id=message.chat.id,
@@ -4018,6 +4086,64 @@ async def cmd_signal(message: Message):
             f"❌ Ошибка: {e}",
             chat_id=message.chat.id,
             message_id=wait_msg.message_id,
+        )
+
+
+async def _freeze_signal_decision(result: dict) -> None:
+    """Замораживает решение rank_signals в decision_provenance.
+
+    Берёт `result["top"]` (или `preview_top` если top=None) и
+    соответствующий AssetScore из `scored`, чтобы записать полный
+    snapshot input'ов + score breakdown + SL/TP/σ̂. Никогда не падает —
+    при любой ошибке логирует и возвращается (UI не должен страдать
+    от проблемы с provenance).
+    """
+    try:
+        from dataclasses import asdict
+
+        from core.provenance import freeze_scorer_decision
+        from core.signal_scorer import SignalSetup
+        from web_search import fetch_realtime_prices  # noqa: F401
+
+        top = result.get("top")
+        preview_top = result.get("preview_top")
+        setup = top if isinstance(top, SignalSetup) else preview_top
+        scored = result.get("scored", [])
+
+        if not isinstance(setup, SignalSetup):
+            return  # Нечего замораживать — все SIDEWAYS / нет tradable.
+
+        # Найдём соответствующий AssetScore (для breakdown).
+        asset_score = next(
+            (s for s in scored if s.asset == setup.asset), None
+        )
+        if asset_score is None:
+            return
+
+        # prices хранится в результате? Нет — поэтому повторно тянем.
+        # Это OK: cache в web_search свежий (~10c), стоимость нулевая.
+        prices = await fetch_realtime_prices()
+        features = prices.get(setup.asset, {}) if isinstance(prices, dict) else {}
+
+        weights = asdict(asset_score.breakdown)
+        weights["total"] = setup.score
+
+        direction = setup.direction if top else f"{setup.direction}_preview"
+
+        await freeze_scorer_decision(
+            asset=setup.asset,
+            direction=direction,
+            score=setup.score,
+            entry_price=setup.entry,
+            stop_loss=setup.stop,
+            take_profit=setup.target,
+            sigma_1d_pct=setup.sigma_1d_pct,
+            features=features,
+            weights=weights,
+        )
+    except Exception as exc:
+        logging.getLogger(__name__).warning(
+            f"provenance freeze (signal_scorer) skipped: {exc}"
         )
 
 
