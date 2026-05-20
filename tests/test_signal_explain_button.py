@@ -32,7 +32,7 @@ os.environ.setdefault("BOT_TOKEN", "test:test")
 
 @unittest.skipUnless(HAS_AIOGRAM, "aiogram not installed (unit-fast job)")
 class TestSignalExplainKeyboard(unittest.TestCase):
-    """Структура клавиатуры — одна кнопка с UID в callback_data."""
+    """Структура клавиатуры — глоссарий + снайпинг с UID в callback_data."""
 
     @classmethod
     def setUpClass(cls):
@@ -46,10 +46,10 @@ class TestSignalExplainKeyboard(unittest.TestCase):
         kb = self._kb(42)
         self.assertIsInstance(kb, InlineKeyboardMarkup)
 
-    def test_single_row_single_button(self):
+    def test_single_row_two_buttons(self):
         kb = self._kb(42)
         self.assertEqual(len(kb.inline_keyboard), 1)
-        self.assertEqual(len(kb.inline_keyboard[0]), 1)
+        self.assertEqual(len(kb.inline_keyboard[0]), 2)
 
     def test_button_text_human_readable(self):
         kb = self._kb(42)
@@ -66,6 +66,12 @@ class TestSignalExplainKeyboard(unittest.TestCase):
         kb = self._kb(42)
         btn = kb.inline_keyboard[0][0]
         self.assertEqual(btn.callback_data, "sigexplain:42")
+
+    def test_sniping_callback_data_carries_user_id_and_capital(self):
+        kb = self._kb(42, 250)
+        btn = kb.inline_keyboard[0][1]
+        self.assertIn("Снайпинг", btn.text)
+        self.assertEqual(btn.callback_data, "sniping:42:250.00")
 
     def test_callback_data_uid_isolation(self):
         # Разные UID → разные callback_data → бот сможет отделить чужой клик.

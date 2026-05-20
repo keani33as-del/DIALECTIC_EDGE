@@ -116,6 +116,10 @@ from refactor.handlers import (
     handle_health_command,
     handle_logs_command,
     handle_sysinfo_command,
+    handle_funding_command,
+    register_funding_handlers,
+    register_sniping_handlers,
+    sniping_callback_data,
 )
 
 # Phase 4 Provider Imports — AI, Cache, Database, Market Data, News, Storage
@@ -2896,6 +2900,7 @@ async def handle_cmd_shortcuts(callback: CallbackQuery):
         "subscribe": cmd_subscribe,
         "help": cmd_help,
         "signal": cmd_signal,
+        "funding": handle_funding_command,
         "signalstatus": cmd_signal_status,
         "screener": cmd_screener,
         "backtest": cmd_backtest,
@@ -4077,21 +4082,23 @@ async def cmd_signals_deprecated(message: Message):
 
 # ─── /signal — auto SL/TP recommender ─────────────────────────────────────────
 
-def _signal_explain_keyboard(user_id: int) -> InlineKeyboardMarkup:
-    """Кнопка под `/signal`: «📖 Что значат эти слова?».
+def _signal_explain_keyboard(user_id: int, capital: float = 123.0) -> InlineKeyboardMarkup:
+    """Кнопки под `/signal`: глоссарий + sniper limit levels.
 
     Открывает stateless-глоссарий (всё содержится в `_signal_glossary_text`)
     — поэтому не нужен in-memory кэш SignalSetup'а, как `_plan_table_cache`.
     UID в callback_data чтоб чужой не нажал.
     """
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(
-                text="📖 Что значат эти слова?",
-                callback_data=f"sigexplain:{user_id}",
-            )
-        ],
-    ])
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(
+            text="📖 Что значат эти слова?",
+            callback_data=f"sigexplain:{user_id}",
+        ),
+        InlineKeyboardButton(
+            text="🎯 Снайпинг",
+            callback_data=sniping_callback_data(user_id, capital),
+        ),
+    ]])
 
 
 def _signal_glossary_text() -> str:
@@ -4456,7 +4463,7 @@ async def cmd_signal(message: Message):
             chat_id=message.chat.id,
             message_id=wait_msg.message_id,
             parse_mode="Markdown",
-            reply_markup=_signal_explain_keyboard(user_id),
+            reply_markup=_signal_explain_keyboard(user_id, capital),
         )
     except Exception as e:
         await bot.edit_message_text(
@@ -5553,6 +5560,7 @@ async def cmd_help(message: Message):
         "• `/markets` — живой контекст + сигналы, кнопки подписки\n"
         "• `/help markets` — подробный гайд по цифрам в /markets 📊\n"
         "• `/signal [capital]` — auto SL/TP setup на основе нашего scoring 🎯\n"
+        "• `/funding` — funding по top-10 futures + аномалии contango/short squeeze\n"
         "• `/trackrecord` — история точности (всё)\n"
         "• `/trackrecordglobal` — Global\n"
         "• `/trackrecordrussia` — Россия Edge 🇷🇺\n"
@@ -5729,6 +5737,7 @@ async def set_bot_commands(bot: Bot):
         BotCommand(command="trackrecordrussia", description="🇷🇺 Россия Edge"),
         BotCommand(command="trackrecord", description="📊 Вся статистика"),
         BotCommand(command="markets", description="Рынки + сигналы, подписка"),
+        BotCommand(command="funding", description="💸 Funding top-10 futures"),
         BotCommand(command="status", description="Краткий статус"),
         BotCommand(command="tt", description="🧪 Тест"),
         BotCommand(command="signalstatus", description="📊 Статус трейдера"),
@@ -5755,6 +5764,9 @@ async def main():
     global scheduler
     global bot
     bot = get_bot()
+
+    register_funding_handlers(dp)
+    register_sniping_handlers(dp)
 
     await set_bot_commands(bot)
 

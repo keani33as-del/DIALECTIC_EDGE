@@ -211,6 +211,28 @@ from .admin_handler import (
     setup_admins,
 )
 
+from .funding_handler import (
+    FUNDING_SYMBOLS,
+    FundingRow,
+    classify_funding,
+    fetch_funding_rates,
+    format_funding_report,
+    handle_funding_command,
+    register_funding_handlers,
+)
+
+from .sniping_handler import (
+    SniperPlan,
+    SniperReport,
+    build_sniper_plans_for_asset,
+    format_sniper_report,
+    handle_sniping_callback,
+    handle_sniping_command,
+    parse_sniping_callback_data,
+    register_sniping_handlers,
+    sniping_callback_data,
+)
+
 # Utilities
 from .utils import (
     split_message,
